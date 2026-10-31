@@ -141,7 +141,23 @@ locale_for() {
 }
 
 # ---- 0. 前置检查 ----
-CLASH_DIR="$H/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+# Clash Verge 配置目录:安装方式与版本不同,路径也不同,按目录/特征文件探测,别写死
+detect_clash_dir() {
+    local c
+    [ -n "${CLAUDE_SWITCHER_CLASH_DIR:-}" ] && { printf '%s\n' "$CLAUDE_SWITCHER_CLASH_DIR"; return 0; }
+    for c in \
+        "$H/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev" \
+        "$H/Library/Application Support/clash-verge" \
+        "$H/Library/Application Support/io.github.clash-verge-rev.clash-verge"; do
+        [ -d "$c" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    for c in "$H/Library/Application Support"/*/; do
+        c="${c%/}"
+        [ -f "$c/clash-verge.yaml" ] && [ -d "$c/profiles" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    printf '%s\n' "$H/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+}
+CLASH_DIR="$(detect_clash_dir)"
 FLCLASH_DIR="$H/Library/Application Support/com.follow.clash"
 if [ -d "$CLASH_DIR" ]; then
     MODE="clash-verge"
@@ -267,30 +283,18 @@ LOCALE=$(locale_for "$CTRY")
 echo "✓ 地区识别: 国家=$CTRY 时区=$TZV 来源=$SOURCE"
 echo "✓ 地区格式: $LOCALE"
 
-# 就地编辑:macOS 自带 BSD sed,但不少人 PATH 里装了 GNU sed(gnubin/coreutils),
-# 两者 -i 语法不兼容。BSD 用 `-i ''`,GNU 用 `-i`,混用会冒出
-# "sed: : No such file or directory" 这种吓人但无害的报错。
-sed_inplace() {
-    local f="$1"; shift
-    if sed --version >/dev/null 2>&1; then
-        sed -i "$@" "$f"
-    else
-        sed -i '' "$@" "$f"
-    fi
-}
-
 # ---- 3. 安装文件 ----
 mkdir -p "$H/.local/bin" "$H/.claude-switcher" "$H/Library/Logs"
 cp "$REPO/core/claude-switch.sh" "$H/.local/bin/"
 cp "$REPO/core/stun-probe.py" "$H/.claude-switcher/"
 chmod +x "$H/.local/bin/claude-switch.sh"
-# 写入探测到的客户端/代理组名/地区目标
-sed_inplace "$H/.local/bin/claude-switch.sh" \
-    -e "s|^PROXY_MODE=\".*\"|PROXY_MODE=\"$MODE\"|" \
-    -e "s|^PROXY_GROUP=\".*\"|PROXY_GROUP=\"$GRP\"|" \
-    -e "s|^COUNTRY_TARGET=\".*\"|COUNTRY_TARGET=\"$CTRY\"|" \
-    -e "s|^TZ_TARGET=\".*\"|TZ_TARGET=\"$TZV\"|" \
-    -e "s|^LOCALE_TARGET=\".*\"|LOCALE_TARGET=\"$LOCALE\"|"
+# 写入探测到的客户端/代理组名/地区目标。这些是环境值,写进 env.json 而不是
+# 改写核心脚本——核心脚本必须与发布产物逐字节一致,否则 SHA256 校验和自动更新
+# 都要为「安装时被改过」让步。
+"$H/.local/bin/claude-switch.sh" _support env-set \
+    "proxy_mode=$MODE" "proxy_group=$GRP" "country=$CTRY" \
+    "timezone=$TZV" "locale=$LOCALE" >/dev/null 2>&1 || {
+    echo "✗ 环境配置写入失败($H/.claude-switcher/env.json)"; exit 1; }
 
 # 保镖/时区看门狗脚本:物化到临时目录,由 sudo 段装入 root 所有的系统目录(用户态不可写,防提权)
 STAGE=$(mktemp -d)

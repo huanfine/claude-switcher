@@ -29,6 +29,9 @@ class OptionalLoggingTests(unittest.TestCase):
         self.core = Path(self.tmp.name) / "claude-switch.sh"
         text = SOURCE.read_text(encoding="utf-8")
         text = text.replace('PROXY_MODE="clash-verge"', 'PROXY_MODE="sing-box"', 1)
+        # 这里改的是环境层的保底值(env.json 不存在时生效)。断言替换真的命中,
+        # 否则默认值一改,测试会静默退化成「跑的还是 clash-verge」。
+        self.assertIn('PROXY_MODE="sing-box"', text)
         self.core.write_text(text, encoding="utf-8")
         self.core.chmod(0o755)
         self.bin = Path(self.tmp.name) / "bin"

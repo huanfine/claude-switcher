@@ -255,15 +255,20 @@ write_merge_rules() {
     mkdir -p "$CLASH_DIR/profiles"
     # 置顶规则清单(缩进两格)
     rules=""
-    for d in claude.ai claude.com clau.de anthropic.com claudeusercontent.com \
-             claudemcpclient.com claudemcpcontent.com \
-             cloudflare.com challenges.cloudflare.com \
-             datadoghq.com browser-intake-us5-datadoghq.com \
-             sentry.io statsigapi.net segment.io \
-             stripe.com stripe.network stripecdn.com \
-             intercom.io intercomcdn.com intercomassets.com \
-             anthropic-com.ghost.io servd-anthropic-website.b-cdn.net \
-             cdn.usefathom.com; do
+    # >>> claude-switcher:rules generated >>>
+    # 由 scripts/sync-rules.py 从 data/claude-rules.json 生成,请勿手改。
+    # Claude Code 运行期会访问的域名与 STUN 端口。这是唯一数据源。
+    # 各平台代码里的清单块由 scripts/sync-rules.py 生成,不要手改生成物;
+    # 改完本文件跑一次 `python3 scripts/sync-rules.py`,或 `--check` 只做校验。
+    # 漏配一个域名就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai
+    # 不是同一个,这正是风控最容易抓到的「同一用户来源分裂」。
+    for d in claude.ai claude.com clau.de anthropic.com \
+             claudeusercontent.com claudemcpclient.com claudemcpcontent.com cloudflare.com \
+             challenges.cloudflare.com datadoghq.com browser-intake-us5-datadoghq.com sentry.io \
+             statsigapi.net segment.io stripe.com stripe.network \
+             stripecdn.com intercom.io intercomcdn.com intercomassets.com \
+             anthropic-com.ghost.io servd-anthropic-website.b-cdn.net cdn.usefathom.com; do
+    # <<< claude-switcher:rules generated <<<
         rules="$rules  - DOMAIN-SUFFIX,$d,$PROXY_GROUP
 "
     done

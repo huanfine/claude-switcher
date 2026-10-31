@@ -610,18 +610,23 @@ function Find-ClashVerge {
     return $null
 }
 
-# 切换器管理的 Claude 域名清单(与 core/claude-switch.sh 的 DOMAINS 保持一致)+ STUN 端口
+# >>> claude-switcher:rules generated >>>
+# 由 scripts/sync-rules.py 从 data/claude-rules.json 生成,请勿手改。
+# Claude Code 运行期会访问的域名与 STUN 端口。这是唯一数据源。
+# 各平台代码里的清单块由 scripts/sync-rules.py 生成,不要手改生成物;
+# 改完本文件跑一次 `python3 scripts/sync-rules.py`,或 `--check` 只做校验。
+# 漏配一个域名就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai
+# 不是同一个,这正是风控最容易抓到的「同一用户来源分裂」。
 $CLAUDE_DOMAINS = @(
-    'claude.ai', 'claude.com', 'clau.de', 'anthropic.com', 'claudeusercontent.com',
-    'claudemcpclient.com', 'claudemcpcontent.com',
-    'cloudflare.com', 'challenges.cloudflare.com',
-    'datadoghq.com', 'browser-intake-us5-datadoghq.com',
-    'sentry.io', 'statsigapi.net', 'segment.io',
-    'stripe.com', 'stripe.network', 'stripecdn.com',
-    'intercom.io', 'intercomcdn.com', 'intercomassets.com',
+    'claude.ai', 'claude.com', 'clau.de', 'anthropic.com',
+    'claudeusercontent.com', 'claudemcpclient.com', 'claudemcpcontent.com', 'cloudflare.com',
+    'challenges.cloudflare.com', 'datadoghq.com', 'browser-intake-us5-datadoghq.com', 'sentry.io',
+    'statsigapi.net', 'segment.io', 'stripe.com', 'stripe.network',
+    'stripecdn.com', 'intercom.io', 'intercomcdn.com', 'intercomassets.com',
     'anthropic-com.ghost.io', 'servd-anthropic-website.b-cdn.net', 'cdn.usefathom.com'
 )
 $CLAUDE_PORTS = @('3478', '5349', '19302')
+# <<< claude-switcher:rules generated <<<
 
 # 读取 YAML 中第一个 key: value 标量(用于 clash-verge.yaml / config.yaml / verge.yaml 的顶层字段)
 function Get-YamlScalar([string]$path, [string]$key) {

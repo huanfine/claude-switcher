@@ -6,6 +6,7 @@
 - 旧 Merge 的 16 条规则、--- 多文档与重复顶层键会被清理并备份;
 - 写入后通过内核 /rules 验证,失败回滚 Script.js。
 """
+import json
 import re
 import unittest
 from pathlib import Path
@@ -23,32 +24,16 @@ PS1_FILES = (
     INSTALL,
     WIN / "claude-bodyguard.ps1",
 )
-DOMAINS = (
-    "claude.ai",
-    "claude.com",
-    "clau.de",
-    "anthropic.com",
-    "claudeusercontent.com",
-    "claudemcpclient.com",
-    "claudemcpcontent.com",
-    "cloudflare.com",
-    "challenges.cloudflare.com",
-    "datadoghq.com",
-    "browser-intake-us5-datadoghq.com",
-    "sentry.io",
-    "statsigapi.net",
-    "segment.io",
-    "stripe.com",
-    "stripe.network",
-    "stripecdn.com",
-    "intercom.io",
-    "intercomcdn.com",
-    "intercomassets.com",
-    "anthropic-com.ghost.io",
-    "servd-anthropic-website.b-cdn.net",
-    "cdn.usefathom.com",
-)
-PORTS = ("3478", "5349", "19302")
+
+
+def _load_rules():
+    """清单只认 data/claude-rules.json 这一个来源,测试不再抄一份。"""
+    data = json.loads((ROOT / "data/claude-rules.json").read_text(encoding="utf-8"))
+    return ([d for group in data["domain_groups"] for d in group["domains"]],
+            [str(p) for p in data["ports"]["values"]])
+
+
+DOMAINS, PORTS = _load_rules()
 
 
 def read(path):

@@ -31,6 +31,10 @@ class MenuBarModelTests(unittest.TestCase):
         cls.binary = Path(cls.build.name) / "MenuBarModelTests"
         result = subprocess.run(
             ["swiftc", "-parse-as-library", "-warnings-as-errors", "-D", "CLAUDE_SWITCHER_TESTS",
+             # 新 SDK 的宏插件默认跑在 sandbox 里,受限环境(CI / 沙箱)会
+             # sandbox_apply 失败,连带 @State 宏展开不出来,报成
+             # 「SwiftUIMacros.StateMacro could not be found」。与安装器同一处理。
+             "-Xfrontend", "-disable-sandbox",
              "-target", f"{platform.machine()}-apple-macos13.0",
              "-module-cache-path", str(Path(cls.build.name) / "module-cache"),
              str(PROJECT / "app/main.swift"),

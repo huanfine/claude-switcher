@@ -1,9 +1,13 @@
-"""set-client 回归测试:隔离核心副本,不改动真实安装。"""
+"""set-client 回归测试:隔离核心副本,不改动真实安装。
+
+环境值已从「脚本头部 + sed 改写」迁到 ~/.claude-switcher/env.json,
+所以这里不再有 macOS-only 的 `sed -i ''` 依赖,三平台通用。
+"""
+import json
 import os
 import re
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -12,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "core" / "claude-switch.sh"
 
 
-@unittest.skipUnless(sys.platform == "darwin", "sed -i '' is macOS syntax")
 class SetClientTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -37,10 +40,11 @@ class SetClientTests(unittest.TestCase):
                               env=env, text=True, capture_output=True, timeout=10)
 
     def current_mode(self):
-        for line in self.copy.read_text(encoding="utf-8").splitlines():
-            if line.startswith("PROXY_MODE="):
-                return line.split('"')[1]
-        return ""
+        """环境值在 env.json,不在脚本头部。"""
+        path = self.root / ".claude-switcher" / "env.json"
+        if not path.exists():
+            return ""
+        return json.loads(path.read_text(encoding="utf-8")).get("proxy_mode", "")
 
     def test_switches_mode(self):
         for mode in ("shadowrocket", "sing-box", "flclash", "auto", "clash-verge"):
@@ -114,6 +118,7 @@ class SetClientTests(unittest.TestCase):
 PROXY_MODE="shadowrocket"
 load_check_config() { return 0; }
 COUNTRY_TARGET="US"; TZ_TARGET="America/New_York"; LOCALE_TARGET="en_US"
+FAKE_PREFIX="198.18."
 BASE="$HOME"
 proxy_alive() { return 0; }
 tun_up() { return 0; }

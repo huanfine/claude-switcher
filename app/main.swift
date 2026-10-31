@@ -264,7 +264,10 @@ final class VM: ObservableObject {
                 self.run(["status"], timeout: self.checkTimeout) { status in
                     let statusOK = self.updateStatus(status)
                     if !statusOK {
-                        if !passed || self.banner.isEmpty {
+                        // 只在还没有失败原因时才用「读不到账号状态」兜底。
+                        // 检查超时/脚本失败已经把真正的原因写进 banner,
+                        // 用这条盖掉会让用户看到与事实无关的提示。
+                        if self.banner.isEmpty {
                             self.banner = "无法读取账号状态，请重新检查"
                         }
                         self.lastCheckSummary = "失败"

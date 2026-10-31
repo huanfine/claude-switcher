@@ -153,6 +153,9 @@ class FlClashRepairTests(unittest.TestCase):
         core.write_text(SCRIPT.read_text(encoding="utf-8").replace(
             'PROXY_MODE="clash-verge"', 'PROXY_MODE="flclash"', 1
         ), encoding="utf-8")
+        # 改的是环境层保底值(env.json 不存在时生效);断言替换命中,
+        # 免得默认值一改测试静默失效。
+        self.assertIn('PROXY_MODE="flclash"', core.read_text(encoding="utf-8"))
         (home_dir / ".claude-switcher").mkdir()
         fake_bin = home_dir / "bin"
         fake_bin.mkdir()

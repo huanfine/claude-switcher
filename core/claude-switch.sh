@@ -35,6 +35,78 @@ def paths():
     return home / ".claude-switcher", home / "Library/Logs/claude-switcher/client.log"
 
 
+# ---- 环境层 ----
+# 功能 / 数据 / 环境三层里的环境层。安装器和更新器都不再改写核心脚本,
+# 环境值统一落在 ~/.claude-switcher/env.json,运行期由 shell 侧 load_env 读取。
+# 这样发布产物 = 安装产物,SHA256 可以直接整份比对。
+ENV_SCHEMA = 1
+ENV_KEYS = ("proxy_mode", "proxy_group", "country", "timezone", "locale",
+            "clash_dir", "fake_ip_range")
+
+
+def env_path():
+    return Path.home() / ".claude-switcher/env.json"
+
+
+def env_read():
+    """读已保存的环境值。文件缺失返回空;损坏抛 ValueError,由调用方明确报错。"""
+    path = env_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("env.json")
+    if not isinstance(data, dict) or data.get("schema") != ENV_SCHEMA:
+        raise ValueError("env.json")
+    return {key: data[key] for key in ENV_KEYS
+            if isinstance(data.get(key), str) and data[key].strip()}
+
+
+def env_write(values):
+    """合并写入。只收白名单键;值不能含换行,否则 shell 侧按行解析会串行。"""
+    if not isinstance(values, dict):
+        raise ValueError("env")
+    merged = dict(env_read())
+    for key, value in values.items():
+        if key not in ENV_KEYS or not isinstance(value, str):
+            raise ValueError("env")
+        value = value.strip()
+        if "\n" in value or "\r" in value or len(value) > 512:
+            raise ValueError("env")
+        merged[key] = value
+    merged["schema"] = ENV_SCHEMA
+    base, _ = paths()
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".env-", dir=base)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(merged, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, base / "env.json")
+    except OSError:
+        raise ValueError("env")
+    return merged
+
+
+def env_migrate(script):
+    """老版本把环境值写在脚本头部,升级时把它们搬进 env.json,避免升级后代理组名为空。"""
+    try:
+        text = Path(script).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        raise ValueError("env")
+    found = {}
+    for key, name in (("proxy_mode", "PROXY_MODE"), ("proxy_group", "PROXY_GROUP"),
+                      ("country", "COUNTRY_TARGET"), ("timezone", "TZ_TARGET"),
+                      ("locale", "LOCALE_TARGET")):
+        match = re.search(r'(?m)^' + name + r'="([^"]*)"', text)
+        if match and match.group(1).strip():
+            found[key] = match.group(1)
+    return env_write(found) if found else env_read()
+
+
+
 def validate(value):
     if not isinstance(value, dict) or set(value) - set(DEFAULTS):
         fail()
@@ -192,6 +264,32 @@ def main(args):
             os.replace(temporary, base / "checks.json")
         except OSError:
             fail()
+    elif action == "env" and len(args) == 1:
+        try:
+            values = env_read()
+        except ValueError:
+            fail()
+        for key in ENV_KEYS:
+            if key in values:
+                print(key + "=" + values[key])
+    elif action == "env-set" and len(args) >= 2:
+        updates = {}
+        for item in args[1:]:
+            key, separator, value = item.partition("=")
+            if not separator:
+                fail()
+            updates[key] = value
+        try:
+            env_write(updates)
+        except ValueError:
+            fail()
+        print("OK:环境配置已写入")
+    elif action == "env-migrate" and len(args) == 2:
+        try:
+            env_migrate(args[1])
+        except ValueError:
+            fail()
+        print("OK:环境配置已迁移")
     elif action == "log":
         write_log(args[1:])
     elif action == "export-diagnostics":
@@ -354,32 +452,43 @@ import sys
 from pathlib import Path
 
 
-# Claude Code 运行期会访问的域名。清单对齐 ip.net.coffee/claude/site.html 的
-# 「核心 / CDN / 认证 / 监控 / 客服」五类,再按本项目实测补上支付与埋点。
-# 漏配一个就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai 不是
-# 同一个,这正是风控最容易抓到的「同一用户来源分裂」。
+# >>> claude-switcher:rules generated >>>
+# 由 scripts/sync-rules.py 从 data/claude-rules.json 生成,请勿手改。
+# Claude Code 运行期会访问的域名与 STUN 端口。这是唯一数据源。
+# 各平台代码里的清单块由 scripts/sync-rules.py 生成,不要手改生成物;
+# 改完本文件跑一次 `python3 scripts/sync-rules.py`,或 `--check` 只做校验。
+# 漏配一个域名就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai
+# 不是同一个,这正是风控最容易抓到的「同一用户来源分裂」。
 DOMAINS = (
-    # 核心。clau.de 是重定向短域名,claudemcp* 是 MCP 客户端与内容分发,
-    # 这三个漏了会直接换出口,是本次补全里风险最高的部分。
-    "claude.ai", "claude.com", "clau.de", "anthropic.com",
-    "claudeusercontent.com", "claudemcpclient.com", "claudemcpcontent.com",
-    # cloudflare.com 一并置顶:出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,
-    # 若它被分流到别的策略组,基准值就和受保护流量的真实出口不是同一条链路,
-    # WebRTC/STUN 比对必然失败并误报「暴露非代理出口地址」。
-    "cloudflare.com", "challenges.cloudflare.com",
-    # browser-intake-us5-datadoghq.com 的根域名就是整串(中间是连字符不是点),
-    # DOMAIN-SUFFIX,datadoghq.com 匹配不到它,必须单独列一条精确域名。
-    "datadoghq.com", "browser-intake-us5-datadoghq.com",
-    # 监控与埋点:上报 IP 与 API IP 不一致会触发异常检测
-    "sentry.io", "statsigapi.net", "segment.io",
-    # 支付
-    "stripe.com", "stripe.network", "stripecdn.com",
-    # 客服 widget / 静态资源 / 博客 CMS
-    "intercom.io", "intercomcdn.com", "intercomassets.com",
-    "anthropic-com.ghost.io", "servd-anthropic-website.b-cdn.net",
+    # clau.de 是重定向短域名,claudemcp* 是 MCP 客户端与内容分发;这三个漏了会直接换出口
+    "claude.ai",
+    "claude.com",
+    "clau.de",
+    "anthropic.com",
+    "claudeusercontent.com",
+    "claudemcpclient.com",
+    "claudemcpcontent.com",
+    # 出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,它必须与受保护流量同一条链路
+    "cloudflare.com",
+    "challenges.cloudflare.com",
+    # browser-intake-us5-datadoghq.com 的根域名是整串(中间是连字符不是点),DOMAIN-SUFFIX,datadoghq.com 抓不到它;上报 IP 与 API IP 不一致会触发异常检测
+    "datadoghq.com",
+    "browser-intake-us5-datadoghq.com",
+    "sentry.io",
+    "statsigapi.net",
+    "segment.io",
+    "stripe.com",
+    "stripe.network",
+    "stripecdn.com",
+    "intercom.io",
+    "intercomcdn.com",
+    "intercomassets.com",
+    "anthropic-com.ghost.io",
+    "servd-anthropic-website.b-cdn.net",
     "cdn.usefathom.com",
 )
 PORTS = (3478, 5349, 19302)
+# <<< claude-switcher:rules generated <<<
 REQUIRED_RULE_COLUMNS = {
     "id", "profile_id", "rule_action", "content", "rule_target",
     "rule_provider", "sub_rule", "no_resolve", "src", "order",
@@ -557,32 +666,43 @@ except ValueError:
     pass
 
 
-# Claude Code 运行期会访问的域名。清单对齐 ip.net.coffee/claude/site.html 的
-# 「核心 / CDN / 认证 / 监控 / 客服」五类,再按本项目实测补上支付与埋点。
-# 漏配一个就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai 不是
-# 同一个,这正是风控最容易抓到的「同一用户来源分裂」。
+# >>> claude-switcher:rules generated >>>
+# 由 scripts/sync-rules.py 从 data/claude-rules.json 生成,请勿手改。
+# Claude Code 运行期会访问的域名与 STUN 端口。这是唯一数据源。
+# 各平台代码里的清单块由 scripts/sync-rules.py 生成,不要手改生成物;
+# 改完本文件跑一次 `python3 scripts/sync-rules.py`,或 `--check` 只做校验。
+# 漏配一个域名就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai
+# 不是同一个,这正是风控最容易抓到的「同一用户来源分裂」。
 DOMAINS = (
-    # 核心。clau.de 是重定向短域名,claudemcp* 是 MCP 客户端与内容分发,
-    # 这三个漏了会直接换出口,是本次补全里风险最高的部分。
-    "claude.ai", "claude.com", "clau.de", "anthropic.com",
-    "claudeusercontent.com", "claudemcpclient.com", "claudemcpcontent.com",
-    # cloudflare.com 一并置顶:出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,
-    # 若它被分流到别的策略组,基准值就和受保护流量的真实出口不是同一条链路,
-    # WebRTC/STUN 比对必然失败并误报「暴露非代理出口地址」。
-    "cloudflare.com", "challenges.cloudflare.com",
-    # browser-intake-us5-datadoghq.com 的根域名就是整串(中间是连字符不是点),
-    # DOMAIN-SUFFIX,datadoghq.com 匹配不到它,必须单独列一条精确域名。
-    "datadoghq.com", "browser-intake-us5-datadoghq.com",
-    # 监控与埋点:上报 IP 与 API IP 不一致会触发异常检测
-    "sentry.io", "statsigapi.net", "segment.io",
-    # 支付
-    "stripe.com", "stripe.network", "stripecdn.com",
-    # 客服 widget / 静态资源 / 博客 CMS
-    "intercom.io", "intercomcdn.com", "intercomassets.com",
-    "anthropic-com.ghost.io", "servd-anthropic-website.b-cdn.net",
+    # clau.de 是重定向短域名,claudemcp* 是 MCP 客户端与内容分发;这三个漏了会直接换出口
+    "claude.ai",
+    "claude.com",
+    "clau.de",
+    "anthropic.com",
+    "claudeusercontent.com",
+    "claudemcpclient.com",
+    "claudemcpcontent.com",
+    # 出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,它必须与受保护流量同一条链路
+    "cloudflare.com",
+    "challenges.cloudflare.com",
+    # browser-intake-us5-datadoghq.com 的根域名是整串(中间是连字符不是点),DOMAIN-SUFFIX,datadoghq.com 抓不到它;上报 IP 与 API IP 不一致会触发异常检测
+    "datadoghq.com",
+    "browser-intake-us5-datadoghq.com",
+    "sentry.io",
+    "statsigapi.net",
+    "segment.io",
+    "stripe.com",
+    "stripe.network",
+    "stripecdn.com",
+    "intercom.io",
+    "intercomcdn.com",
+    "intercomassets.com",
+    "anthropic-com.ghost.io",
+    "servd-anthropic-website.b-cdn.net",
     "cdn.usefathom.com",
 )
 PORTS = (3478, 5349, 19302)
+# <<< claude-switcher:rules generated <<<
 SCRIPT_BEGIN = "// >>> claude-switcher managed rules >>>"
 SCRIPT_END = "// <<< claude-switcher managed rules <<<"
 MERGE_BEGIN = "# >>> claude-switcher pinned rules >>>"
@@ -947,21 +1067,111 @@ if __name__ == "__main__":
 PY_CLASH_RULES
 fi
 
-# ============ 安装时可配置项(安装程序会自动改写) ============
+# ============ 环境层(保底值) ============
+# 本文件是发布产物,安装器与更新器都不再改写它。真实环境值一律来自
+# ~/.claude-switcher/env.json,由下面的 load_env 在运行期读取。
+# 这里只是「env.json 不存在或某项缺失」时的保底,不要当配置入口用。
+ENV_FILE="$HOME/.claude-switcher/env.json"
 PROXY_MODE="clash-verge"       # 代理客户端: clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto
-PROXY_GROUP="IpEqual"          # Clash 代理组名(安装时自动探测)
-COUNTRY_TARGET="US"            # 目标出口国家(安装时按出口自动识别)
-TZ_TARGET="America/New_York"   # 锁定时区,应与出口IP所在城市一致
+PROXY_GROUP=""                 # Clash 代理组名(env.json 或探测)
+COUNTRY_TARGET="US"            # 目标出口国家
+TZ_TARGET="America/New_York"   # 锁定时区
 LOCALE_TARGET="en_US"          # 锁定地区格式
-# ============================================================
+CLASH_DIR=""                   # Clash Verge 配置目录(env.json 或探测)
+FAKE_IP_RANGE=""               # fake-ip 网段(env.json 或探测)
+FAKE_PREFIX="198.18."          # 由 FAKE_IP_RANGE 换算,供 case 匹配
+# ==========================================
 
 DATA="$HOME/Library/Application Support/Claude"
 BASE="$HOME/.claude-switcher"
 LOG="$HOME/Library/Logs/claude-switch.log"
-CLASH_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 ROUTE_MISSED=""
 KEEP_STAGED=0
 mkdir -p "$BASE/accounts"
+
+# Clash Verge 配置目录:安装方式与版本不同,路径也不同,不要写死。
+# 优先级:env.json > $CLAUDE_SWITCHER_CLASH_DIR > 已知路径 > 特征文件扫描 > 主路径(便于报错定位)
+detect_clash_dir() {
+    local c
+    [ -n "${CLAUDE_SWITCHER_CLASH_DIR:-}" ] && { printf '%s\n' "$CLAUDE_SWITCHER_CLASH_DIR"; return 0; }
+    for c in \
+        "$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev" \
+        "$HOME/Library/Application Support/clash-verge" \
+        "$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge"; do
+        [ -f "$c/clash-verge.yaml" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    for c in "$HOME/Library/Application Support"/*/; do
+        c="${c%/}"
+        [ -f "$c/clash-verge.yaml" ] && [ -d "$c/profiles" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    printf '%s\n' "$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+}
+
+# fake-ip 网段:内核接口不暴露 DNS 配置,只能从订阅里读。
+# 优先级:env.json > $CLAUDE_SWITCHER_FAKE_IP_RANGE > 当前订阅 > 合并配置 > 默认 198.18.0.0/16
+detect_fake_ip_range() {
+    local dir uid f value
+    [ -n "${CLAUDE_SWITCHER_FAKE_IP_RANGE:-}" ] && { printf '%s\n' "$CLAUDE_SWITCHER_FAKE_IP_RANGE"; return 0; }
+    dir="${1:-}"
+    if [ -n "$dir" ] && [ -f "$dir/profiles.yaml" ]; then
+        uid=$(sed -n 's/^current:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$dir/profiles.yaml" | head -1)
+        [ -n "$uid" ] && [ -f "$dir/profiles/$uid.yaml" ] && f="$dir/profiles/$uid.yaml"
+    fi
+    if [ -z "${f:-}" ] && [ -n "$dir" ] && [ -f "$dir/clash-verge.yaml" ]; then
+        f="$dir/clash-verge.yaml"
+    fi
+    if [ -n "${f:-}" ] && [ -f "$f" ]; then
+        value=$(sed -n 's/^[[:space:]]*fake-ip-range:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$f" | head -1)
+        [ -n "$value" ] && { printf '%s\n' "$value"; return 0; }
+    fi
+    printf '%s\n' "198.18.0.0/16"
+}
+
+# 把 fake-ip 网段换算成 case 能用的前缀:198.18.0.1/16 → "198.18."
+fake_ip_prefix() {
+    local range="${1:-}" a b
+    a="${range%%.*}"
+    b="${range#*.}"; b="${b%%.*}"
+    if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$a.$b."
+    else
+        printf '%s\n' "198.18."
+    fi
+}
+
+# 自调用 _support:一律经当前 shell 重新执行本脚本。
+# 直接 "$0" 调用在脚本没有可执行位时(例如仓库里 `bash core/claude-switch.sh` 跑测试)
+# 会 permission denied,被上层误判成「配置损坏」。
+support() { "${BASH:-/bin/bash}" "$0" _support "$@"; }
+
+# 读取环境层。env.json 缺失 → 用保底值(首次安装与老版本升级都走这条路);
+# env.json 损坏 → 明确报错,不静默降级:环境值错会直接把规则写进错误的代理组。
+load_env() {
+    local dump key value
+    if [ -f "$ENV_FILE" ]; then
+        dump=$(support env 2>/dev/null) || {
+            echo "FAIL:环境配置 $ENV_FILE 无法解析,请运行 claude-switch.sh env-set 或重跑安装器" >&2
+            return 1
+        }
+        while IFS='=' read -r key value; do
+            case "$key" in
+                proxy_mode)    [ -n "$value" ] && PROXY_MODE="$value" ;;
+                proxy_group)   PROXY_GROUP="$value" ;;
+                country)       [ -n "$value" ] && COUNTRY_TARGET="$value" ;;
+                timezone)      [ -n "$value" ] && TZ_TARGET="$value" ;;
+                locale)        [ -n "$value" ] && LOCALE_TARGET="$value" ;;
+                clash_dir)     CLASH_DIR="$value" ;;
+                fake_ip_range) FAKE_IP_RANGE="$value" ;;
+            esac
+        done <<< "$dump"
+    fi
+    [ -z "$CLASH_DIR" ] && CLASH_DIR="$(detect_clash_dir)"
+    [ -z "$FAKE_IP_RANGE" ] && FAKE_IP_RANGE="$(detect_fake_ip_range "$CLASH_DIR")"
+    FAKE_PREFIX="$(fake_ip_prefix "$FAKE_IP_RANGE")"
+    return 0
+}
+
+load_env || exit 1
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >>"$LOG"; }
 
@@ -969,7 +1179,7 @@ CHECKS_DISABLED=""
 ALLOW_OPTIONAL_FAILURES=0
 load_check_config() {
     local config key value
-    config=$("$0" _support config 2>/dev/null) || return 1
+    config=$(support config 2>/dev/null) || return 1
     while IFS='=' read -r key value; do
         case "$key" in
             disabled) CHECKS_DISABLED="$value" ;;
@@ -1065,14 +1275,14 @@ stun_ok() { merge_ok; }
 # 当前 Clash 模式(rule/global/direct);读取失败返回空
 clash_mode() { clash_rules mode 2>/dev/null; }
 
-# 置顶规则行为检测:三个生态域名全部解析到 fake-ip 段(198.18.x.x)即视为已置顶;未命中域名记入 ROUTE_MISSED
+# 置顶规则行为检测:三个生态域名全部解析到 fake-ip 段($FAKE_PREFIX)即视为已置顶;未命中域名记入 ROUTE_MISSED
 route_ok() {
     ROUTE_MISSED=""
     local d a
     for d in claude.ai api.anthropic.com claudeusercontent.com; do
         a=$(dig +short +time=3 +tries=1 "$d" 2>/dev/null | head -1)
         case "$a" in
-            198.18.*) ;;
+            "$FAKE_PREFIX"*) ;;
             *) ROUTE_MISSED="$ROUTE_MISSED $d" ;;
         esac
     done
@@ -1261,7 +1471,7 @@ check() {
     if ! check_disabled "DNS"; then
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
         case "$dnsip" in
-            198.18.*) ;;
+            "$FAKE_PREFIX"*) ;;
             *) optional_failure "DNS未走隧道" ;;
         esac
     fi
@@ -1432,7 +1642,7 @@ checkdetail() {
     else
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
         case "$dnsip" in
-            198.18.*) optional_result "DNS" ok "走隧道" ;;
+            "$FAKE_PREFIX"*) optional_result "DNS" ok "走隧道" ;;
             *) optional_result "DNS" fail "未走隧道(${dnsip:-空})" ;;
         esac
     fi
@@ -1741,9 +1951,10 @@ set_client() {
             target="$0"
         fi
     fi
-    [ -f "$target" ] && [ -w "$target" ] || { echo "FAIL:找不到可写的核心脚本: $target"; return 1; }
-    sed -i '' "s|^PROXY_MODE=\"[^\"]*\"|PROXY_MODE=\"$mode\"|" "$target" || { echo "FAIL:写入失败"; return 1; }
-    grep -q "^PROXY_MODE=\"$mode\"" "$target" || { echo "FAIL:校验失败"; return 1; }
+    # 环境值写 env.json,不再用 sed 改写核心脚本:
+    # 改写会让安装产物 ≠ 发布产物,SHA256 校验与自动更新都得为它让步。
+    "${BASH:-/bin/bash}" "$target" _support env-set "proxy_mode=$mode" >/dev/null 2>&1 || { echo "FAIL:环境配置写入失败($ENV_FILE)"; return 1; }
+    [ "$("${BASH:-/bin/bash}" "$target" _support env 2>/dev/null | sed -n 's/^proxy_mode=//p')" = "$mode" ] || { echo "FAIL:环境配置校验失败($ENV_FILE)"; return 1; }
     PROXY_MODE="$mode"
     echo "OK:代理客户端已设为 $mode"
     guard_state=$(bodyguard_status)
@@ -1789,12 +2000,11 @@ set_region() {
     [ "$src" = "cloudflare" ] && echo "INFO:时区使用国家默认(可手动改)"
     nlocale=$(locale_for "$ctry")
 
-    # 改写脚本自身头部三个配置项
-    sed -i '' \
-        -e "s|^COUNTRY_TARGET=\".*\"|COUNTRY_TARGET=\"$ctry\"|" \
-        -e "s|^TZ_TARGET=\".*\"|TZ_TARGET=\"$ntz\"|" \
-        -e "s|^LOCALE_TARGET=\".*\"|LOCALE_TARGET=\"$nlocale\"|" \
-        "$0"
+    # 地区目标写 env.json(环境层),不再 sed 改写核心脚本本身
+    if ! support env-set "country=$ctry" "timezone=$ntz" "locale=$nlocale" >/dev/null 2>&1; then
+        echo "FAIL:环境配置写入失败($ENV_FILE)"
+        return 1
+    fi
     COUNTRY_TARGET="$ctry"; TZ_TARGET="$ntz"; LOCALE_TARGET="$nlocale"
 
     # 地区格式(用户级,无需密码)
@@ -1874,10 +2084,9 @@ self_update() {
         echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; rm -rf "$tmpd"; return 1
     fi
 
-    # 跳过判断:剔除头部5个配置行后与本地已安装版本比对,无差异即已是最新
-    strip_cfg() { grep -vE '^(PROXY_MODE|PROXY_GROUP|COUNTRY_TARGET|TZ_TARGET|LOCALE_TARGET)="' "$1"; }
+    # 跳过判断:核心脚本是发布产物、不含环境值,直接整份比对即可
     if [ -f "$BIN/claude-switch.sh" ] && \
-       diff <(strip_cfg "$BIN/claude-switch.sh") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
+       diff "$BIN/claude-switch.sh" "$NEW/core/claude-switch.sh" >/dev/null 2>&1; then
         echo "OK:已是最新版本"; rm -rf "$tmpd"; return 0
     fi
 
@@ -1892,18 +2101,19 @@ self_update() {
     # 备份现有核心脚本
     [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
 
-    # 替换核心脚本 + 从 .bak 读出5个配置值注入新脚本
+    # 替换核心脚本。环境值已不在脚本里,不再需要回注;但从老版本(环境值写在
+    # 脚本头部)升级时,必须先把它们迁进 env.json,否则升级后代理组名为空,
+    # 规则会被写进错误的组——这类失败是静默的,只能在写入前挡住。
     cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"
+    chmod +x "$BIN/claude-switch.sh"
     PM=""; PG=""; CT=""; TZV=""; LCT=""
     if [ -f "$BIN/claude-switch.sh.bak" ]; then
-        get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh.bak" | head -1 | cut -d'"' -f2; }
-        PM=$(get_cfg PROXY_MODE); PG=$(get_cfg PROXY_GROUP); CT=$(get_cfg COUNTRY_TARGET)
-        TZV=$(get_cfg TZ_TARGET); LCT=$(get_cfg LOCALE_TARGET)
-        inject_cfg() { grep -q "^$1=\"" "$BIN/claude-switch.sh.bak" && sed -i '' "s|^$1=\".*\"|$1=\"$2\"|" "$BIN/claude-switch.sh"; }
-        inject_cfg PROXY_MODE "$PM"; inject_cfg PROXY_GROUP "$PG"; inject_cfg COUNTRY_TARGET "$CT"
-        inject_cfg TZ_TARGET "$TZV"; inject_cfg LOCALE_TARGET "$LCT"
+        "${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support env-migrate "$BIN/claude-switch.sh.bak" >/dev/null 2>&1 || \
+            echo "WARN:环境配置迁移失败,请运行 claude-switch.sh env-set 手动补齐"
     fi
-    chmod +x "$BIN/claude-switch.sh"
+    envdump=$("${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support env 2>/dev/null)
+    PM=$(printf '%s\n' "$envdump" | sed -n 's/^proxy_mode=//p')
+    TZV=$(printf '%s\n' "$envdump" | sed -n 's/^timezone=//p')
 
     # 守护进程脚本(root 所有,用户态不可写):与远程模板比对,有差异只提示不自动改
     APPDIR="/Library/Application Support/claude-switcher"
