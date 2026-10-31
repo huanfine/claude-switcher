@@ -610,11 +610,16 @@ function Find-ClashVerge {
     return $null
 }
 
-# 切换器管理的 13 个 Claude 域名 + 3 个 STUN 端口
+# 切换器管理的 Claude 域名清单(与 core/claude-switch.sh 的 DOMAINS 保持一致)+ STUN 端口
 $CLAUDE_DOMAINS = @(
-    'claude.ai', 'claude.com', 'anthropic.com', 'claudeusercontent.com',
-    'challenges.cloudflare.com', 'datadoghq.com', 'segment.io', 'stripe.com',
-    'stripe.network', 'stripecdn.com', 'intercom.io', 'intercomcdn.com', 'intercomassets.com'
+    'claude.ai', 'claude.com', 'clau.de', 'anthropic.com', 'claudeusercontent.com',
+    'claudemcpclient.com', 'claudemcpcontent.com',
+    'cloudflare.com', 'challenges.cloudflare.com',
+    'datadoghq.com', 'browser-intake-us5-datadoghq.com',
+    'sentry.io', 'statsigapi.net', 'segment.io',
+    'stripe.com', 'stripe.network', 'stripecdn.com',
+    'intercom.io', 'intercomcdn.com', 'intercomassets.com',
+    'anthropic-com.ghost.io', 'servd-anthropic-website.b-cdn.net', 'cdn.usefathom.com'
 )
 $CLAUDE_PORTS = @('3478', '5349', '19302')
 
@@ -725,10 +730,13 @@ function Get-ClashRules {
     return @{ available = $true; rules = @($probe.data.rules); reason = '' }
 }
 
-# 内核前 16 条必须包含 13 个域名 + 3 个端口;兼容 DOMAIN-SUFFIX/DomainSuffix 与 AND(...DST-PORT...) 形式
+# 内核前 N 条必须包含全部域名 + 全部端口;N 由清单长度推导,不要写死条数——
+# 域名清单扩过两次,写死会让验证窗口切掉尾部域名而误判「规则置顶」失败。
+# 兼容 DOMAIN-SUFFIX/DomainSuffix 与 AND(...DST-PORT...) 两种写法。
 function Test-PinnedRules($rules) {
-    $head = @($rules | Select-Object -First 16)
-    if ($head.Count -lt 16) { return $false }
+    $expected = $CLAUDE_DOMAINS.Count + $CLAUDE_PORTS.Count
+    $head = @($rules | Select-Object -First $expected)
+    if ($head.Count -lt $expected) { return $false }
     $domainHits = @($head | Where-Object {
         (([string]$_.type).ToLowerInvariant() -replace '[-_]', '') -eq 'domainsuffix' -and
         ($CLAUDE_DOMAINS -contains [string]$_.payload)

@@ -255,7 +255,15 @@ write_merge_rules() {
     mkdir -p "$CLASH_DIR/profiles"
     # 置顶规则清单(缩进两格)
     rules=""
-    for d in claude.ai claude.com anthropic.com claudeusercontent.com challenges.cloudflare.com datadoghq.com segment.io stripe.com stripe.network stripecdn.com intercom.io intercomcdn.com intercomassets.com; do
+    for d in claude.ai claude.com clau.de anthropic.com claudeusercontent.com \
+             claudemcpclient.com claudemcpcontent.com \
+             cloudflare.com challenges.cloudflare.com \
+             datadoghq.com browser-intake-us5-datadoghq.com \
+             sentry.io statsigapi.net segment.io \
+             stripe.com stripe.network stripecdn.com \
+             intercom.io intercomcdn.com intercomassets.com \
+             anthropic-com.ghost.io servd-anthropic-website.b-cdn.net \
+             cdn.usefathom.com; do
         rules="$rules  - DOMAIN-SUFFIX,$d,$PROXY_GROUP
 "
     done

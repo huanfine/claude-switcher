@@ -354,14 +354,30 @@ import sys
 from pathlib import Path
 
 
+# Claude Code 运行期会访问的域名。清单对齐 ip.net.coffee/claude/site.html 的
+# 「核心 / CDN / 认证 / 监控 / 客服」五类,再按本项目实测补上支付与埋点。
+# 漏配一个就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai 不是
+# 同一个,这正是风控最容易抓到的「同一用户来源分裂」。
 DOMAINS = (
-    "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
+    # 核心。clau.de 是重定向短域名,claudemcp* 是 MCP 客户端与内容分发,
+    # 这三个漏了会直接换出口,是本次补全里风险最高的部分。
+    "claude.ai", "claude.com", "clau.de", "anthropic.com",
+    "claudeusercontent.com", "claudemcpclient.com", "claudemcpcontent.com",
     # cloudflare.com 一并置顶:出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,
     # 若它被分流到别的策略组,基准值就和受保护流量的真实出口不是同一条链路,
     # WebRTC/STUN 比对必然失败并误报「暴露非代理出口地址」。
-    "cloudflare.com", "challenges.cloudflare.com", "datadoghq.com",
-    "segment.io", "stripe.com", "stripe.network", "stripecdn.com",
+    "cloudflare.com", "challenges.cloudflare.com",
+    # browser-intake-us5-datadoghq.com 的根域名就是整串(中间是连字符不是点),
+    # DOMAIN-SUFFIX,datadoghq.com 匹配不到它,必须单独列一条精确域名。
+    "datadoghq.com", "browser-intake-us5-datadoghq.com",
+    # 监控与埋点:上报 IP 与 API IP 不一致会触发异常检测
+    "sentry.io", "statsigapi.net", "segment.io",
+    # 支付
+    "stripe.com", "stripe.network", "stripecdn.com",
+    # 客服 widget / 静态资源 / 博客 CMS
     "intercom.io", "intercomcdn.com", "intercomassets.com",
+    "anthropic-com.ghost.io", "servd-anthropic-website.b-cdn.net",
+    "cdn.usefathom.com",
 )
 PORTS = (3478, 5349, 19302)
 REQUIRED_RULE_COLUMNS = {
@@ -541,14 +557,30 @@ except ValueError:
     pass
 
 
+# Claude Code 运行期会访问的域名。清单对齐 ip.net.coffee/claude/site.html 的
+# 「核心 / CDN / 认证 / 监控 / 客服」五类,再按本项目实测补上支付与埋点。
+# 漏配一个就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai 不是
+# 同一个,这正是风控最容易抓到的「同一用户来源分裂」。
 DOMAINS = (
-    "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
+    # 核心。clau.de 是重定向短域名,claudemcp* 是 MCP 客户端与内容分发,
+    # 这三个漏了会直接换出口,是本次补全里风险最高的部分。
+    "claude.ai", "claude.com", "clau.de", "anthropic.com",
+    "claudeusercontent.com", "claudemcpclient.com", "claudemcpcontent.com",
     # cloudflare.com 一并置顶:出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,
     # 若它被分流到别的策略组,基准值就和受保护流量的真实出口不是同一条链路,
     # WebRTC/STUN 比对必然失败并误报「暴露非代理出口地址」。
-    "cloudflare.com", "challenges.cloudflare.com", "datadoghq.com",
-    "segment.io", "stripe.com", "stripe.network", "stripecdn.com",
+    "cloudflare.com", "challenges.cloudflare.com",
+    # browser-intake-us5-datadoghq.com 的根域名就是整串(中间是连字符不是点),
+    # DOMAIN-SUFFIX,datadoghq.com 匹配不到它,必须单独列一条精确域名。
+    "datadoghq.com", "browser-intake-us5-datadoghq.com",
+    # 监控与埋点:上报 IP 与 API IP 不一致会触发异常检测
+    "sentry.io", "statsigapi.net", "segment.io",
+    # 支付
+    "stripe.com", "stripe.network", "stripecdn.com",
+    # 客服 widget / 静态资源 / 博客 CMS
     "intercom.io", "intercomcdn.com", "intercomassets.com",
+    "anthropic-com.ghost.io", "servd-anthropic-website.b-cdn.net",
+    "cdn.usefathom.com",
 )
 PORTS = (3478, 5349, 19302)
 SCRIPT_BEGIN = "// >>> claude-switcher managed rules >>>"

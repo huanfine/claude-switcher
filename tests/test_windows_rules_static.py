@@ -26,10 +26,17 @@ PS1_FILES = (
 DOMAINS = (
     "claude.ai",
     "claude.com",
+    "clau.de",
     "anthropic.com",
     "claudeusercontent.com",
+    "claudemcpclient.com",
+    "claudemcpcontent.com",
+    "cloudflare.com",
     "challenges.cloudflare.com",
     "datadoghq.com",
+    "browser-intake-us5-datadoghq.com",
+    "sentry.io",
+    "statsigapi.net",
     "segment.io",
     "stripe.com",
     "stripe.network",
@@ -37,6 +44,9 @@ DOMAINS = (
     "intercom.io",
     "intercomcdn.com",
     "intercomassets.com",
+    "anthropic-com.ghost.io",
+    "servd-anthropic-website.b-cdn.net",
+    "cdn.usefathom.com",
 )
 PORTS = ("3478", "5349", "19302")
 
@@ -210,7 +220,11 @@ class WindowsRulesStaticTests(unittest.TestCase):
         self.assertIn("/rules", rules_body)
         self.assertIn("Invoke-ClashApi '/rules' 8", rules_body)
         pinned_body = between(text, "function Test-PinnedRules", "function Write-ClashScriptRules")
-        self.assertIn("Select-Object -First 16", pinned_body)
+        # 验证窗口必须由清单长度推导:写死条数会在域名清单扩容后切掉尾部域名,
+        # 让「规则置顶」对全部 Windows 用户误报失败。
+        self.assertIn("$CLAUDE_DOMAINS.Count + $CLAUDE_PORTS.Count", pinned_body)
+        self.assertIn("Select-Object -First $expected", pinned_body)
+        self.assertNotIn("Select-Object -First 16", pinned_body)
         self.assertIn("DST-PORT", pinned_body)
         self.assertIn("domainsuffix", pinned_body)
         self.assertIn("dstport", pinned_body)

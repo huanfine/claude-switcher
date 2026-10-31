@@ -20,10 +20,15 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "core/claude-switch.sh"
-DOMAINS = ("claude.ai claude.com anthropic.com claudeusercontent.com "
-           "cloudflare.com challenges.cloudflare.com datadoghq.com segment.io "
-           "stripe.com stripe.network stripecdn.com intercom.io intercomcdn.com "
-           "intercomassets.com").split()
+DOMAINS = ("claude.ai claude.com clau.de anthropic.com claudeusercontent.com "
+           "claudemcpclient.com claudemcpcontent.com "
+           "cloudflare.com challenges.cloudflare.com "
+           "datadoghq.com browser-intake-us5-datadoghq.com "
+           "sentry.io statsigapi.net segment.io "
+           "stripe.com stripe.network stripecdn.com "
+           "intercom.io intercomcdn.com intercomassets.com "
+           "anthropic-com.ghost.io servd-anthropic-website.b-cdn.net "
+           "cdn.usefathom.com").split()
 PORTS = (3478, 5349, 19302)
 
 
@@ -253,8 +258,8 @@ class WebRTCRulesTests(unittest.TestCase):
             self.assertNotEqual(self.run_helper().returncode, 0)
 
     def test_runtime_domain_preserves_meaningful_characters(self):
-        rule = self.responses["/rules"]["rules"][6]
-        self.assertEqual(rule["payload"], "claudeusercontent.com")
+        rules = self.responses["/rules"]["rules"]
+        rule = next(r for r in rules if r["payload"] == "claudeusercontent.com")
         for payload in ("claudeuser-content.com", "claudeuser_content.com"):
             with self.subTest(payload=payload):
                 rule["payload"] = payload

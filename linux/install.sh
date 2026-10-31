@@ -289,7 +289,15 @@ if [ "$MODE" = "clash-verge" ]; then
 else
     echo ""
     echo "请在你的代理客户端中添加以下 DOMAIN-SUFFIX 置顶规则(优先级高于国内规则集):"
-    for d in claude.ai claude.com anthropic.com claudeusercontent.com challenges.cloudflare.com datadoghq.com segment.io stripe.com stripe.network stripecdn.com intercom.io intercomcdn.com intercomassets.com; do
+    for d in claude.ai claude.com clau.de anthropic.com claudeusercontent.com \
+             claudemcpclient.com claudemcpcontent.com \
+             cloudflare.com challenges.cloudflare.com \
+             datadoghq.com browser-intake-us5-datadoghq.com \
+             sentry.io statsigapi.net segment.io \
+             stripe.com stripe.network stripecdn.com \
+             intercom.io intercomcdn.com intercomassets.com \
+             anthropic-com.ghost.io servd-anthropic-website.b-cdn.net \
+             cdn.usefathom.com; do
         echo "  - DOMAIN-SUFFIX,$d,$GRP"
     done
 fi
