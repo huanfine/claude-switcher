@@ -264,6 +264,90 @@ def main(args):
             os.replace(temporary, base / "checks.json")
         except OSError:
             fail()
+    elif action == "verdict" and len(args) in (1, 2):
+        # 离线复核:只读已有报告,不再探测。意义是事后能回答「当时到底过没过」,
+        # 而不是只剩一条被后续日志刷掉的输出。口径与在线检查一致。
+        path = Path(args[1]) if len(args) == 2 and args[1] else paths()[0] / "last-check.txt"
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            fail()
+        items, order = {}, []
+        for line in text.splitlines():
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, rest = line.partition("=")
+            status, _, detail = rest.partition(":")
+            status = status.strip()
+            if status not in ("ok", "warn", "fail", "skip"):
+                continue
+            name = name.strip()
+            if not name:
+                continue
+            if name not in items:
+                order.append(name)
+            items[name] = (status, detail.strip())
+        if not order:
+            fail()
+        blockers = [n for n in order if items[n][0] == "fail"]
+        advisories = [n for n in order if items[n][0] == "warn"]
+        skipped = [n for n in order if items[n][0] == "skip"]
+        # 三态判定:有 fail 即 violated;没有 fail 才 established;无可用项是 incomplete。
+        # 关键点是 warn/unknown 不会被提升成 pass——和在线检查的 fail-closed 同一口径。
+        print("VERDICT:" + ("violated" if blockers else "established"))
+        print("items=" + ",".join(order))
+        print("blockers=" + ",".join(blockers))
+        print("advisories=" + ",".join(advisories))
+        print("skipped=" + ",".join(skipped))
+    elif action == "evidence" and len(args) == 2:
+        # 证据落盘:把最近一次检查写成 JSON,含时间、主机、环境、逐项状态与判定。
+        # 只新建、不覆盖:证据被覆盖就失去追溯意义,要留新的就换个文件名。
+        base, _ = paths()
+        try:
+            text = (base / "last-check.txt").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            fail()
+        items, order = {}, []
+        for line in text.splitlines():
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, rest = line.partition("=")
+            status, _, detail = rest.partition(":")
+            status = status.strip()
+            if status not in ("ok", "warn", "fail", "skip"):
+                continue
+            name = name.strip()
+            if not name:
+                continue
+            if name not in items:
+                order.append(name)
+            items[name] = {"status": status, "detail": detail.strip()}
+        if not order:
+            fail()
+        try:
+            env = env_read()
+        except ValueError:
+            env = {}
+        doc = {
+            "schema_version": "claude-switcher-evidence/0.1",
+            "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "host": platform.node(),
+            "environment": {key: env.get(key) for key in
+                            ("country", "timezone", "locale", "proxy_mode", "proxy_group")},
+            "verdict": "violated" if any(v["status"] == "fail" for v in items.values())
+                       else "established",
+            "items": items,
+            "source": str(base / "last-check.txt"),
+        }
+        out = Path(args[1])
+        try:
+            fd = os.open(str(out), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError:
+            print("目标已存在或不可写,未覆盖:" + str(out), file=sys.stderr)
+            raise SystemExit(2)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(doc, ensure_ascii=False, indent=2) + "\n")
+        print("OK:" + str(out))
     elif action == "env" and len(args) == 1:
         try:
             values = env_read()
@@ -1432,6 +1516,31 @@ iphist_count() {
     awk '{print $1}' "$HIST" | sort -u | wc -l | tr -d ' '
 }
 
+# ---------- 出口采样 ----------
+# 同一出口域名连采多次,只有全部一致才算 ok。两条理由,都是实测踩出来的:
+#   1. 单次 curl 空返回会把网络抖动判成「出口IP异常」,进而拦住 Claude 启动;
+#   2. 节点在多个出口之间漂移时,单次采样看不出来,而这正是账号画像最怕的状态。
+# 结果:ok(全部一致) / unstable(采样间漂移) / unknown(一次都没取到)。
+PROBE_IP=""; PROBE_LOC=""; PROBE_STATUS="unknown"; PROBE_SEEN=""
+probe_egress() {
+    local n="${1:-3}" i trace ip loc seen=""
+    PROBE_IP=""; PROBE_LOC=""; PROBE_STATUS="unknown"; PROBE_SEEN=""
+    for i in $(seq 1 "$n"); do
+        trace=$(curl -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        ip=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -1)
+        loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -1)
+        [ -z "$ip" ] && continue
+        seen="$seen $ip"
+        if [ -z "$PROBE_IP" ]; then PROBE_IP="$ip"; PROBE_LOC="$loc"; fi
+    done
+    PROBE_SEEN="${seen# }"
+    [ -z "$PROBE_SEEN" ] && { PROBE_STATUS="unknown"; return 1; }
+    if [ "$(printf '%s\n' $PROBE_SEEN | sort -u | wc -l | tr -d ' ')" -gt 1 ]; then
+        PROBE_STATUS="unstable"; return 1
+    fi
+    PROBE_STATUS="ok"; return 0
+}
+
 # ---------- 安全检查 ----------
 check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
@@ -1440,11 +1549,21 @@ check() {
     proxy_alive || fails="$fails;代理内核未运行"
     tun_up || fails="$fails;TUN网卡不在线"
 
-    trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-    ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
-    loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
-    [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP异常(${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET)"
+    # 多采样取出口。全空时再取一轮:一次全空多半是抖动,连续两轮全空才算真的取不到。
+    probe_egress 3
+    [ "$PROBE_STATUS" = "unknown" ] && probe_egress 3
+    ip="$PROBE_IP"; loc="$PROBE_LOC"
     ipwarn=""
+    case "$PROBE_STATUS" in
+        unstable)
+            # 采样间出口不一致 = 节点在漂移,比单点异常更危险:同一账号的来源在变。
+            fails="$fails;出口IP在多次采样间漂移(${PROBE_SEEN// /\/})" ;;
+        unknown)
+            # 取不到 ≠ 出口错。不判 fail(否则网络抖动会拦住启动),但必须显式告知未确认。
+            ipwarn="注意:多次采样均未取到出口IP,本次出口未确认" ;;
+        *)
+            [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP异常(${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET)" ;;
+    esac
     if ! check_disabled "IP一致"; then
         lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
         if [ -n "$ip" ] && [ -n "$lastip" ] && [ "$ip" != "$lastip" ]; then
@@ -1512,8 +1631,91 @@ check() {
         echo "FAIL:${fails#;}"
         return 1
     fi
-    echo "OK:$ip${ipwarn:+|$ipwarn}"
+    echo "OK:${ip:-未确认}${ipwarn:+|$ipwarn}"
     return 0
+}
+
+# ---------- 故障演练(fail-closed 验证) ----------
+# 平时的检查只能证明「流量走了代理」,证明不了「代理挂了会不会直连」。这一项必须
+# 真的停掉内核才能验:停核后本机应当完全断网,任何一条通路还能出去就是漏。
+# 停核由用户手动做——停核需要 sudo,而且断网时机不该由脚本替用户决定。
+# 内核停着的时候一定要能恢复,所以全程挂着提醒恢复的 trap。
+drill() {
+    local baseline answer waited leaked out i result
+    answer=""
+    [ "${1:-}" = "--yes" ] && answer="yes"
+
+    proxy_alive || { echo "FAIL:代理内核未运行,先启动再演练"; return 1; }
+    tun_up || { echo "FAIL:TUN网卡不在线,先修复再演练"; return 1; }
+    probe_egress 3
+    [ "$PROBE_STATUS" = "ok" ] || { echo "FAIL:当前出口无法采样($PROBE_STATUS),先修复再演练"; return 1; }
+    baseline="$PROBE_IP"
+
+    echo "INFO:演练基准出口 $baseline"
+    echo "INFO:接下来需要你手动停掉代理内核,停核期间本机将完全断网。"
+    echo "INFO:停核——在 Clash Verge 里退出内核,或关闭 TUN 与系统代理。"
+    echo "INFO:恢复——重新打开 Clash Verge 并确认 TUN 已开启。"
+    if [ -z "$answer" ]; then
+        printf '继续? 输入 yes 回车: '
+        read -r answer
+        [ "$answer" = "yes" ] || { echo "已取消,未做任何改动"; return 2; }
+    fi
+
+    # 把用户留在断网状态是最坏的结果,所以不管从哪条路退出都要提醒恢复。
+    trap 'echo "WARN:演练未正常结束,请确认 Clash Verge 已重新启动并开启 TUN"' EXIT INT TERM
+
+    printf '停掉内核后回车(最多等 90 秒): '
+    read -r answer
+    waited=0
+    while proxy_alive; do
+        if [ "$waited" -ge 90 ]; then
+            echo "FAIL:90 秒内内核仍在运行,演练未开始(未做任何改动)"
+            trap - EXIT INT TERM
+            return 1
+        fi
+        sleep 3; waited=$((waited + 3))
+    done
+
+    # 同时测域名与裸 IP:域名可能被 fake-ip 接住而"看起来"正常,裸 IP 绕不过去。
+    echo "INFO:内核已停,开始探测直连通路(域名与裸 IP 各 3 次)"
+    leaked=""
+    for i in 1 2 3; do
+        out=$(curl -s --max-time 4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+        [ -n "$out" ] && leaked="$leaked $out"
+        out=$(curl -s --max-time 4 http://1.1.1.1/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+        [ -n "$out" ] && leaked="$leaked $out"
+    done
+    if [ -n "$leaked" ]; then
+        leaked=$(printf '%s\n' $leaked | sort -u | tr '\n' ' ')
+        leaked="${leaked% }"
+        echo "FAIL:fail-closed 不成立——内核已停,仍有直连出口: $leaked"
+        result="violated:${leaked// /,}"
+    else
+        echo "OK:fail-closed 成立——内核已停,所有探测均无响应"
+        result="established"
+    fi
+
+    printf '重新启动内核并开启 TUN 后回车: '
+    read -r answer
+    waited=0
+    while ! proxy_alive; do
+        if [ "$waited" -ge 120 ]; then
+            echo "FAIL:内核未恢复,请手动启动 Clash Verge 并开启 TUN"
+            trap - EXIT INT TERM
+            return 1
+        fi
+        sleep 3; waited=$((waited + 3))
+    done
+    probe_egress 3
+    [ "$PROBE_STATUS" = "ok" ] || echo "WARN:内核已起但出口未恢复采样($PROBE_STATUS),请人工确认"
+    if [ -n "$PROBE_IP" ] && [ "$PROBE_IP" != "$baseline" ]; then
+        echo "WARN:恢复后出口与基准不同($baseline -> $PROBE_IP),节点可能已切换"
+    fi
+    trap - EXIT INT TERM
+
+    echo "出口IP=${PROBE_IP:-未确认} 演练=$result"
+    [ -n "$BASE" ] && echo "$(date +%s) baseline=$baseline after=${PROBE_IP:-none} result=$result" >> "$BASE/drill.log"
+    [ "${result%%:*}" = "established" ]
 }
 
 # WebRTC/STUN 探测:返回 RESULT:ip,ip 或 RESULT:NONE 或空
@@ -2653,6 +2855,9 @@ started_at=$(date +%s)
 summary=""
 case "$operation" in
     check)  check ;;
+    drill)  drill "${2:-}" ;;  # fail-closed 演练:需用户手动停核,见函数注释
+    verdict) support verdict "${2:-}" ;;
+    evidence) support evidence "${2:-}" ;;
     checkdetail)
         OUT_FILE="$BASE/last-check.txt"
         {
@@ -2681,7 +2886,7 @@ case "$operation" in
     set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|drill [--yes]|verdict [报告]|evidence <file>|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
 rc=$?
 case "$operation" in

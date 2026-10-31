@@ -67,6 +67,14 @@
 
 隔离回归：`python3 -m unittest discover -s tests -v`。测试使用本机假 curl 和隔离 HOME，不使用真实登录资料或代理。
 
+## 出口多采样、故障演练与离线复核
+
+出口判定不再取单次样本。`check` 对同一域名连采 3 次，全部一致才判 `ok`；采样间不一致判 `fail`（节点在漂移，同一账号的来源在变，比单点异常更危险）；一次都没取到判 `unknown`，只出警告、不拦启动。放宽的前提是连采两轮、共 6 次全空才认 `unknown`——单次空返回多半是网络抖动，之前正是它把抖动误判成「出口IP异常」并拦住 Claude 启动。
+
+`drill [--yes]` 是 fail-closed 演练。平时的检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。它先记录基准出口，请用户手动停掉内核，然后同时用域名和裸 IP 各探 3 次：任何一条还能出去就是漏，判 `violated` 并报出直连 IP；全部无响应才算 `established`。停核需要 sudo，断网时机也不该由脚本替用户决定，所以内核一律由用户手动停；全程挂着提醒恢复的 trap，结果追加到 `~/.claude-switcher/drill.log`。
+
+`verdict [报告]` 离线复核 `last-check.txt`（或指定报告），只读不探测，输出 `VERDICT:established|violated` 与 blockers/advisories/skipped 三行。`warn` 与 `skip` 既不会被提升成 pass，也不会被当成 fail。`evidence <file>` 把最近一次检查写成 JSON（时间、主机、环境、逐项状态、判定），权限 0600，只新建不覆盖——证据被覆盖就失去追溯意义。
+
 ## 验收标准（全部满足才算装完）
 
 - 终端执行 `~/.local/bin/claude-switch.sh checkdetail` 输出完整 14 行；硬性安全项全部 `=ok`，非关键项只能是 `=ok`、既有警告，或用户显式配置的 `=skip`/降级警告

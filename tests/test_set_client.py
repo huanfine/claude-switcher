@@ -122,6 +122,8 @@ FAKE_PREFIX="198.18."
 BASE="$HOME"
 proxy_alive() { return 0; }
 tun_up() { return 0; }
+# check() 现在走多采样出口;这里只需给出确定结果,本用例只关心保镖门禁。
+probe_egress() { PROBE_IP="198.51.100.2"; PROBE_LOC="US"; PROBE_STATUS="ok"; PROBE_SEEN="$PROBE_IP"; return 0; }
 curl() { case "$*" in *cdn-cgi/trace*) printf 'ip=198.51.100.2\nloc=US\n' ;; *) printf '403' ;; esac; }
 iphist_count() { echo 0; }
 readlink() { echo /var/db/timezone/zoneinfo/America/New_York; }
