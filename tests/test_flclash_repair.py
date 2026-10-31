@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -11,6 +12,20 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "core" / "claude-switch.sh"
+
+
+def _pinned_rule_count():
+    """从脚本里读置顶域名条数,再加 3 条 STUN 端口规则。
+
+    直接写死数字会在每次调整 DOMAINS 时失效,这里改为从源码解析。
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"^DOMAINS = \((.*?)^\)", text, re.S | re.M)
+    domains = re.findall(r'"([^"]+)"', match.group(1)) if match else []
+    return len(domains) + 3
+
+
+RULE_COUNT = _pinned_rule_count()
 
 
 class FlClashRepairTests(unittest.TestCase):
@@ -75,13 +90,13 @@ class FlClashRepairTests(unittest.TestCase):
     def test_repair_inserts_domain_and_stun_rules_once(self):
         self.repair()
         rows = self.rule_rows()
-        self.assertEqual(len(rows), 16)
+        self.assertEqual(len(rows), RULE_COUNT)
         self.assertEqual({row[0] for row in rows}, {123})
         self.assertIn((123, "DOMAIN_SUFFIX", "claude.ai", "IpEqual"), rows)
         for port in (3478, 5349, 19302):
             self.assertIn((123, "DST_PORT", str(port), "IpEqual"), rows)
         self.repair()
-        self.assertEqual(len(self.rule_rows()), 16)
+        self.assertEqual(len(self.rule_rows()), RULE_COUNT)
 
     def test_rollback_restores_original_database(self):
         self.repair()
@@ -167,7 +182,7 @@ class FlClashRepairTests(unittest.TestCase):
     def test_full_fix_applies_and_verifies_rules(self):
         result = self.run_full_fix()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(self.rule_rows()), 16)
+        self.assertEqual(len(self.rule_rows()), RULE_COUNT)
         self.assertIn("FlClash 域名与 STUN 规则已生效", result.stdout)
 
     def test_full_fix_rolls_back_when_stun_leaks(self):

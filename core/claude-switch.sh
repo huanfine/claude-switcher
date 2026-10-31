@@ -356,9 +356,12 @@ from pathlib import Path
 
 DOMAINS = (
     "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
-    "challenges.cloudflare.com", "datadoghq.com", "segment.io", "stripe.com",
-    "stripe.network", "stripecdn.com", "intercom.io", "intercomcdn.com",
-    "intercomassets.com",
+    # cloudflare.com 一并置顶:出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,
+    # 若它被分流到别的策略组,基准值就和受保护流量的真实出口不是同一条链路,
+    # WebRTC/STUN 比对必然失败并误报「暴露非代理出口地址」。
+    "cloudflare.com", "challenges.cloudflare.com", "datadoghq.com",
+    "segment.io", "stripe.com", "stripe.network", "stripecdn.com",
+    "intercom.io", "intercomcdn.com", "intercomassets.com",
 )
 PORTS = (3478, 5349, 19302)
 REQUIRED_RULE_COLUMNS = {
@@ -524,11 +527,28 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+# 内核控制接口限制。大规则集订阅(1 万条以上)的 /rules 响应可达数 MB,
+# 原先 2MB 的硬上限会让规则校验直接失败,进而把「规则置顶」判成 fail,
+# 而它是硬性检查项,最终表现为 App 拦住 Claude 启动。
+# 默认放宽到 32MB;可用 CLAUDE_SWITCHER_API_MAX_BYTES(字节)覆盖。
+API_TIMEOUT = 20
+API_MAX_BYTES = 32 * 1024 * 1024
+try:
+    _api_max_env = int(os.environ.get("CLAUDE_SWITCHER_API_MAX_BYTES", ""))
+    if _api_max_env > 0:
+        API_MAX_BYTES = _api_max_env
+except ValueError:
+    pass
+
+
 DOMAINS = (
     "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
-    "challenges.cloudflare.com", "datadoghq.com", "segment.io", "stripe.com",
-    "stripe.network", "stripecdn.com", "intercom.io", "intercomcdn.com",
-    "intercomassets.com",
+    # cloudflare.com 一并置顶:出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,
+    # 若它被分流到别的策略组,基准值就和受保护流量的真实出口不是同一条链路,
+    # WebRTC/STUN 比对必然失败并误报「暴露非代理出口地址」。
+    "cloudflare.com", "challenges.cloudflare.com", "datadoghq.com",
+    "segment.io", "stripe.com", "stripe.network", "stripecdn.com",
+    "intercom.io", "intercomcdn.com", "intercomassets.com",
 )
 PORTS = (3478, 5349, 19302)
 SCRIPT_BEGIN = "// >>> claude-switcher managed rules >>>"
@@ -618,21 +638,22 @@ def api_get(endpoint, secret, path):
     connection = None
     try:
         if scheme == "unix":
-            connection = http.client.HTTPConnection("localhost", timeout=2)
+            connection = http.client.HTTPConnection("localhost", timeout=API_TIMEOUT)
             connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            connection.sock.settimeout(2)
+            connection.sock.settimeout(API_TIMEOUT)
             connection.sock.connect(host)
         else:
             cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-            connection = cls(host, port, timeout=2)
+            connection = cls(host, port, timeout=API_TIMEOUT)
         # http.client connects directly; inherited proxy variables are never used.
         connection.request("GET", path, headers=headers)
         response = connection.getresponse()
         if response.status != 200:
             fail("Clash 内核接口未返回成功状态")
-        data = response.read(2 * 1024 * 1024 + 1)
-        if len(data) > 2 * 1024 * 1024:
-            fail("Clash 内核接口响应过大")
+        data = response.read(API_MAX_BYTES + 1)
+        if len(data) > API_MAX_BYTES:
+            fail("Clash 内核接口响应过大(超过 %d MB,可用 CLAUDE_SWITCHER_API_MAX_BYTES 放宽)"
+                 % (API_MAX_BYTES // (1024 * 1024)))
         value = json.loads(data.decode("utf-8"))
         if not isinstance(value, dict):
             fail("Clash 内核接口返回格式异常")
@@ -1426,7 +1447,14 @@ checkdetail() {
     if check_disabled "ASN属性"; then
         optional_result "ASN属性" ok
     else
-        org=$(curl -s --max-time 6 https://ipinfo.io/json 2>/dev/null | grep '"org"' | cut -d'"' -f4)
+        # 必须查「实际出口 IP」的 ASN。直接查 ipinfo.io/json 取的是访问 ipinfo 自身
+        # 那条链路的出口,在分流配置下可能与受保护流量的出口不是同一个 IP,
+        # 从而报出不相干的 ASN(例如受保护出口是机房 A,却报成 Cloudflare)。
+        if [ -n "$ip" ]; then
+            org=$(curl -s --max-time 6 "https://ipinfo.io/${ip}/json" 2>/dev/null | grep '"org"' | cut -d'"' -f4)
+        else
+            org=""
+        fi
         case "$org" in
             '') optional_result "ASN属性" warn "未获取" ;;
             *Comcast*|*AT\&T*|*Verizon*|*Spectrum*|*Charter*|*Cox*|*T-Mobile*|*Cable*|*esidential*|\
@@ -1781,8 +1809,15 @@ self_update() {
         echo "# $(date '+%F %T') update --auto 开始"
     fi
 
+    # 更新源。本仓库是 YOURSJEYO/claude-switcher 的 fork(MIT 许可),默认指向本 fork,
+    # 否则自动更新会把上游版本盖回来、本地改动全部丢失。
+    # 可用 CLAUDE_SWITCHER_UPDATE_REPO=owner/name 临时改指其他仓库(例如临时对比上游)。
+    UPD_REPO="${CLAUDE_SWITCHER_UPDATE_REPO:-huanfine/claude-switcher}"
+    UPD_ZIP="https://codeload.github.com/$UPD_REPO/zip/refs/heads/main"
+    UPD_SUMS="https://raw.githubusercontent.com/$UPD_REPO/main/SHA256SUMS"
+
     tmpd=$(mktemp -d)
-    if ! curl -sL --max-time 30 "https://codeload.github.com/YOURSJEYO/claude-switcher/zip/refs/heads/main" -o "$tmpd/main.zip" \
+    if ! curl -sL --max-time 30 "$UPD_ZIP" -o "$tmpd/main.zip" \
         || ! unzip -q "$tmpd/main.zip" -d "$tmpd" 2>/dev/null; then
         echo "FAIL:下载或解压失败(网络问题,稍后再试)"; rm -rf "$tmpd"; return 1
     fi
@@ -1792,7 +1827,7 @@ self_update() {
     fi
 
     # 工件完整性校验:逐项比对仓库 SHA256SUMS,任一不符即中止(防传输篡改;信任根为 GitHub 仓库本身)
-    if ! curl -sL --max-time 15 "https://raw.githubusercontent.com/YOURSJEYO/claude-switcher/main/SHA256SUMS" -o "$tmpd/SHA256SUMS" \
+    if ! curl -sL --max-time 15 "$UPD_SUMS" -o "$tmpd/SHA256SUMS" \
         || [ ! -s "$tmpd/SHA256SUMS" ]; then
         echo "FAIL:无法获取校验清单(SHA256SUMS),已中止"; rm -rf "$tmpd"; return 1
     fi

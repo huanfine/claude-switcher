@@ -267,19 +267,30 @@ LOCALE=$(locale_for "$CTRY")
 echo "✓ 地区识别: 国家=$CTRY 时区=$TZV 来源=$SOURCE"
 echo "✓ 地区格式: $LOCALE"
 
+# 就地编辑:macOS 自带 BSD sed,但不少人 PATH 里装了 GNU sed(gnubin/coreutils),
+# 两者 -i 语法不兼容。BSD 用 `-i ''`,GNU 用 `-i`,混用会冒出
+# "sed: : No such file or directory" 这种吓人但无害的报错。
+sed_inplace() {
+    local f="$1"; shift
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$@" "$f"
+    else
+        sed -i '' "$@" "$f"
+    fi
+}
+
 # ---- 3. 安装文件 ----
 mkdir -p "$H/.local/bin" "$H/.claude-switcher" "$H/Library/Logs"
 cp "$REPO/core/claude-switch.sh" "$H/.local/bin/"
 cp "$REPO/core/stun-probe.py" "$H/.claude-switcher/"
 chmod +x "$H/.local/bin/claude-switch.sh"
 # 写入探测到的客户端/代理组名/地区目标
-sed -i '' \
+sed_inplace "$H/.local/bin/claude-switch.sh" \
     -e "s|^PROXY_MODE=\".*\"|PROXY_MODE=\"$MODE\"|" \
     -e "s|^PROXY_GROUP=\".*\"|PROXY_GROUP=\"$GRP\"|" \
     -e "s|^COUNTRY_TARGET=\".*\"|COUNTRY_TARGET=\"$CTRY\"|" \
     -e "s|^TZ_TARGET=\".*\"|TZ_TARGET=\"$TZV\"|" \
-    -e "s|^LOCALE_TARGET=\".*\"|LOCALE_TARGET=\"$LOCALE\"|" \
-    "$H/.local/bin/claude-switch.sh"
+    -e "s|^LOCALE_TARGET=\".*\"|LOCALE_TARGET=\"$LOCALE\"|"
 
 # 保镖/时区看门狗脚本:物化到临时目录,由 sudo 段装入 root 所有的系统目录(用户态不可写,防提权)
 STAGE=$(mktemp -d)
@@ -304,7 +315,7 @@ pkill -x ClaudeSwitcher 2>/dev/null
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # 必须带 -target,否则新 SDK 编出的二进制在老系统被拒启动
-if swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+if swiftc -O -parse-as-library -Xfrontend -disable-sandbox -target "$(uname -m)-apple-macos13.0" \
     "$REPO/app/main.swift" -o "$APP/Contents/MacOS/ClaudeSwitcher" \
     -framework SwiftUI -framework AppKit; then
     echo "✓ App 编译完成"

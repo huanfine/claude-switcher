@@ -21,8 +21,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "core/claude-switch.sh"
 DOMAINS = ("claude.ai claude.com anthropic.com claudeusercontent.com "
-           "challenges.cloudflare.com datadoghq.com segment.io stripe.com "
-           "stripe.network stripecdn.com intercom.io intercomcdn.com "
+           "cloudflare.com challenges.cloudflare.com datadoghq.com segment.io "
+           "stripe.com stripe.network stripecdn.com intercom.io intercomcdn.com "
            "intercomassets.com").split()
 PORTS = (3478, 5349, 19302)
 
@@ -347,6 +347,20 @@ class WebRTCRulesTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertFalse((self.base / "accounts").exists())
 
+    def test_large_rules_payload_is_accepted(self):
+        """大规则集订阅(响应超过旧的 2MB 硬上限)不应把校验判成失败。
+
+        真实场景:1.7 万条规则的订阅,/rules 响应约 3.9MB。旧实现按 2MB 截断,
+        直接 fail,导致「规则置顶」这个硬性检查项失败并拦住 Claude 启动。
+        """
+        filler = [{"type": "DomainSuffix", "payload": "filler%d.test" % i,
+                   "proxy": self.group} for i in range(40000)]
+        self.responses["/rules"] = {"rules": expected_rules(self.group) + filler}
+        payload_size = len(json.dumps(self.responses["/rules"]).encode())
+        self.assertGreater(payload_size, 2 * 1024 * 1024)
+        run = self.run_helper("verify")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
 
 class ShellWebRTCTests(unittest.TestCase):
     def test_invalid_policy_stops_fix_before_any_repair(self):
@@ -405,7 +419,6 @@ webrtc_test() { echo probe-called >&2; printf '%s' "$PROBE_RESULT"; return "$PRO
     def test_nonzero_probe_exit_is_forwarded_to_assessment(self):
         run = self.run_status(probe_rc=7)
         self.assertIn(":7", run.stdout)
-
 
 if __name__ == "__main__":
     unittest.main()
