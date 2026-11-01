@@ -10,6 +10,9 @@ struct CheckRow: Identifiable {
     let id = UUID()
     let name: String
     let icon: String
+    /// 用户能不能在设置里关掉这一项。8 项硬性检查不可关闭;6 项可关闭的默认也拦启动,
+    /// 只是允许显式关闭或降级为警告。分组就是按这个分的,别把「可关闭」当成「不拦」。
+    let canDisable: Bool
     var state: RowState = .pending
     var detail: String = ""
 }
@@ -48,20 +51,20 @@ private final class ProcessDeadline {
 
 final class VM: ObservableObject {
     @Published var rows: [CheckRow] = [
-        CheckRow(name: "代理内核", icon: "cpu"),
-        CheckRow(name: "TUN 网卡", icon: "cable.connector"),
-        CheckRow(name: "出口 IP", icon: "globe.americas"),
-        CheckRow(name: "IP 与上次一致", icon: "checkmark.seal"),
-        CheckRow(name: "时区", icon: "clock"),
-        CheckRow(name: "地区", icon: "flag"),
-        CheckRow(name: "IPv6 关闭", icon: "6.circle"),
-        CheckRow(name: "DNS 走隧道", icon: "magnifyingglass"),
-        CheckRow(name: "WebRTC", icon: "eye.slash"),
-        CheckRow(name: "保镖在线", icon: "hand.raised"),
-        CheckRow(name: "规则置顶", icon: "list.number"),
-        CheckRow(name: "客户端语言", icon: "abc"),
-        CheckRow(name: "ASN 属性", icon: "building.columns"),
-        CheckRow(name: "生态可达性", icon: "antenna.radiowaves.left.and.right"),
+        CheckRow(name: "代理内核", icon: "cpu", canDisable: false),
+        CheckRow(name: "TUN 网卡", icon: "cable.connector", canDisable: false),
+        CheckRow(name: "出口 IP", icon: "globe.americas", canDisable: false),
+        CheckRow(name: "IP 与上次一致", icon: "checkmark.seal", canDisable: true),
+        CheckRow(name: "时区", icon: "clock", canDisable: false),
+        CheckRow(name: "地区", icon: "flag", canDisable: false),
+        CheckRow(name: "IPv6 关闭", icon: "6.circle", canDisable: false),
+        CheckRow(name: "DNS 走隧道", icon: "magnifyingglass", canDisable: true),
+        CheckRow(name: "WebRTC", icon: "eye.slash", canDisable: true),
+        CheckRow(name: "保镖在线", icon: "hand.raised", canDisable: false),
+        CheckRow(name: "规则置顶", icon: "list.number", canDisable: false),
+        CheckRow(name: "客户端语言", icon: "abc", canDisable: true),
+        CheckRow(name: "ASN 属性", icon: "building.columns", canDisable: true),
+        CheckRow(name: "生态可达性", icon: "antenna.radiowaves.left.and.right", canDisable: true),
     ]
     @Published var phase: Phase = .checking
     @Published var current = "?"
@@ -781,49 +784,15 @@ struct ContentView: View {
 
     var checksCard: some View {
         VStack(spacing: 0) {
-            ForEach(Array(vm.rows.enumerated()), id: \.element.id) { idx, row in
-                HStack(spacing: 10) {
-                    // 左侧图标容器
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(ClaudeTheme.iconWell)
-                            .frame(width: 24, height: 24)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(ClaudeTheme.divider, lineWidth: 0.5)
-                            )
-                        Image(systemName: row.icon)
-                            .font(.system(size: 11.5, weight: .medium))
-                            .foregroundColor(ClaudeTheme.muted)
-                    }
-
-                    Text(row.name)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(ClaudeTheme.ink)
-
-                    Spacer(minLength: 8)
-
-                    if !row.detail.isEmpty {
-                        Text(row.detail)
-                            .font(.system(size: 11.5, weight: .regular, design: isMonospace(row.detail) ? .monospaced : .default))
-                            .foregroundColor(row.state == .warn ? ClaudeTheme.warning
-                                             : (row.state == .config ? ClaudeTheme.terracotta : ClaudeTheme.muted))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-
-                    stateIcon(row.state)
-                }
-                .padding(.vertical, 5.5)
-                .padding(.horizontal, 12)
-
-                if idx < vm.rows.count - 1 {
-                    Divider()
-                        .overlay(ClaudeTheme.divider)
-                        .padding(.leading, 46)
-                }
-            }
+            sectionHeader("必须通过 · 不可关闭", rows: hardRows)
+            rowGroup(hardRows)
+            Divider()
+                .overlay(ClaudeTheme.divider)
+                .padding(.top, 6)
+            sectionHeader("可关闭 · 默认仍拦启动", rows: softRows)
+            rowGroup(softRows)
         }
+        .padding(.bottom, 7)
         .background(ClaudeTheme.card)
         .clipShape(RoundedRectangle(cornerRadius: 13))
         .overlay(
@@ -831,6 +800,78 @@ struct ContentView: View {
                 .stroke(ClaudeTheme.cardBorder, lineWidth: 1)
         )
         .shadow(color: Color(red: 0.2, green: 0.16, blue: 0.12).opacity(0.035), radius: 6, x: 0, y: 2)
+    }
+
+    /// 8 项硬性检查不可关闭;其余 6 项可在设置里关闭或降级为警告。
+    /// 分组的意义:失败时用户能立刻看出「这项我能不能关掉」,不用去设置页试。
+    private var hardRows: [CheckRow] { vm.rows.filter { !$0.canDisable } }
+    private var softRows: [CheckRow] { vm.rows.filter { $0.canDisable } }
+
+    /// 组标题带「未通过/总数」,扫一眼就知道哪一组在拖后腿。
+    private func sectionHeader(_ title: String, rows: [CheckRow]) -> some View {
+        let bad = rows.filter { $0.state == .fail || $0.state == .config }.count
+        return HStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundColor(ClaudeTheme.muted)
+            Text(bad > 0 ? "\(bad)/\(rows.count) 未通过" : "\(rows.count) 项")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(bad > 0 ? ClaudeTheme.error : ClaudeTheme.muted.opacity(0.7))
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 9)
+        .padding(.bottom, 3)
+    }
+
+    private func rowGroup(_ rows: [CheckRow]) -> some View {
+        VStack(spacing: 0) {
+            ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
+                checkRow(row)
+                if idx < rows.count - 1 {
+                    Divider()
+                        .overlay(ClaudeTheme.divider)
+                        .padding(.leading, 46)
+                }
+            }
+        }
+    }
+
+    private func checkRow(_ row: CheckRow) -> some View {
+        HStack(spacing: 10) {
+            // 左侧图标容器
+            ZStack {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(ClaudeTheme.iconWell)
+                    .frame(width: 24, height: 24)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(ClaudeTheme.divider, lineWidth: 0.5)
+                    )
+                Image(systemName: row.icon)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(ClaudeTheme.muted)
+            }
+
+            Text(row.name)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(ClaudeTheme.ink)
+
+            Spacer(minLength: 8)
+
+            if !row.detail.isEmpty {
+                Text(row.detail)
+                    .font(.system(size: 11.5, weight: .regular, design: isMonospace(row.detail) ? .monospaced : .default))
+                    .foregroundColor(row.state == .warn ? ClaudeTheme.warning
+                                     : (row.state == .config ? ClaudeTheme.terracotta : ClaudeTheme.muted))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            stateIcon(row.state)
+        }
+        .padding(.vertical, 5.5)
+        .padding(.horizontal, 12)
     }
 
     private func isMonospace(_ str: String) -> Bool {
@@ -1038,7 +1079,7 @@ struct ContentView: View {
     var footer: some View {
         HStack(spacing: 10) {
             Image(systemName: "lock.shield").font(.caption2)
-            Text("硬性安全项必须通过；灰色跳过不表示检查通过").font(.caption2)
+            Text("必须通过项不可关闭；可关闭项也要在设置里显式关掉才不拦；灰色跳过不表示通过").font(.caption2)
             Spacer()
             Button {
                 vm.checkUpdate()

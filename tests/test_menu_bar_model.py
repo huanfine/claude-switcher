@@ -10,7 +10,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 SCENARIOS = (
     "startup_once", "multi_account_status", "first_use_cd_note", "legacy_status_fallback",
     "invalid_multi_account_status", "warnings_allowed", "skipped_optional_allowed", "settings_round_trip", "local_status_refresh", "fresh_audit", "failed_check",
-    "config_only_failure", "config_and_fail",
+    "config_only_failure", "config_and_fail", "check_grouping",
     "incomplete_check", "duplicate_check", "duplicate_overwrite", "empty_check",
     "unknown_check_code", "empty_check_code", "nonzero_check", "timeout_check",
     "invalid_status", "nonzero_status", "switch_note_then_failure", "empty_switch",

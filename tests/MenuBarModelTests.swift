@@ -183,6 +183,16 @@ struct MenuBarModelTests {
             case "failed_check":
                 try f.audit(["WebRTC": "fail:演示失败"])
                 try f.deniedSwitch(f.vm())
+            case "check_grouping":
+                // 界面上按「不可关闭 / 可关闭」分成两组。分组依据必须和设置页的
+                // 6 个可关闭项完全一致,否则用户会看到「这项关不掉」或「关了还拦」。
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.rows.count == 14, "检查项应为 14 项")
+                let soft = Set(vm.rows.filter { $0.canDisable }.map { $0.name })
+                let expected = Set(VM.optionalChecks.map { $0.label })
+                try expect(soft == expected, "可关闭项与设置页不一致:\(soft.sorted()) vs \(expected.sorted())")
+                try expect(vm.rows.filter { !$0.canDisable }.count == 8, "硬性项应为 8 项")
             case "config_only_failure":
                 // 环境层没配好 ≠ 不安全。仍然拦启动(没验证过不能当通过),
                 // 但提示语必须指向「补配置」,不能让用户去排查安全问题。

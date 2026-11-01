@@ -1621,23 +1621,39 @@ iphist_count() {
 #   1. 单次 curl 空返回会把网络抖动判成「出口IP异常」,进而拦住 Claude 启动;
 #   2. 节点在多个出口之间漂移时,单次采样看不出来,而这正是账号画像最怕的状态。
 # 结果:ok(全部一致) / unstable(采样间漂移) / unknown(一次都没取到)。
+#
+# 预算(第 2 个参数,秒)是这个函数存在的另一半理由:curl --max-time 6 × 采样次数
+# 在网络半死时会把 check 拖到 30 秒以上,而 App 的检查超时是 45 秒 —— 一旦被吃满,
+# 用户看到的是「操作超时」,真实原因只是网络在抖。所以:
+#   · 采样间一旦不一致就立刻返回,再采不会让结论变好,只会更慢;
+#   · 总耗时封顶在预算内,剩下的时间留给后面的检查项。
+# 取不到时会在预算内继续重采,替代原来「整轮再跑一遍」的写法。
 PROBE_IP=""; PROBE_LOC=""; PROBE_STATUS="unknown"; PROBE_SEEN=""
 probe_egress() {
-    local n="${1:-3}" i trace ip loc seen=""
+    local want="${1:-3}" budget="${2:-10}" start elapsed per trace ip loc n=0
     PROBE_IP=""; PROBE_LOC=""; PROBE_STATUS="unknown"; PROBE_SEEN=""
-    for i in $(seq 1 "$n"); do
-        trace=$(curl -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    start=$(date +%s)
+    while [ "$n" -lt "$want" ]; do
+        elapsed=$(( $(date +%s) - start ))
+        [ "$elapsed" -ge "$budget" ] && break
+        # 单次上限 6 秒,但不超过剩余预算 —— 否则最后一次采样会突破总预算。
+        per=$(( budget - elapsed )); [ "$per" -gt 6 ] && per=6
+        trace=$(curl -s --max-time "$per" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        n=$((n + 1))
         ip=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -1)
-        loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -1)
         [ -z "$ip" ] && continue
-        seen="$seen $ip"
-        if [ -z "$PROBE_IP" ]; then PROBE_IP="$ip"; PROBE_LOC="$loc"; fi
+        loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -1)
+        if [ -z "$PROBE_IP" ]; then
+            PROBE_IP="$ip"; PROBE_LOC="$loc"
+        elif [ "$ip" != "$PROBE_IP" ]; then
+            # 采样间出口不一致 = 节点在漂移。立刻停:再采只会更慢,结论不会变好。
+            PROBE_SEEN="$PROBE_IP $ip"
+            PROBE_STATUS="unstable"
+            return 1
+        fi
+        PROBE_SEEN="${PROBE_SEEN:+$PROBE_SEEN }$ip"
     done
-    PROBE_SEEN="${seen# }"
-    [ -z "$PROBE_SEEN" ] && { PROBE_STATUS="unknown"; return 1; }
-    if [ "$(printf '%s\n' $PROBE_SEEN | sort -u | wc -l | tr -d ' ')" -gt 1 ]; then
-        PROBE_STATUS="unstable"; return 1
-    fi
+    [ -z "$PROBE_IP" ] && { PROBE_STATUS="unknown"; return 1; }
     PROBE_STATUS="ok"; return 0
 }
 
@@ -1649,9 +1665,11 @@ check() {
     proxy_alive || fails="$fails;代理内核未运行($(proxy_name))"
     tun_up || fails="$fails;TUN网卡不在线(在客户端开启 TUN 模式)"
 
-    # 多采样取出口。全空时再取一轮:一次全空多半是抖动,连续两轮全空才算真的取不到。
-    probe_egress 3
-    [ "$PROBE_STATUS" = "unknown" ] && probe_egress 3
+    # 出口采样:3 次一致才算 ok,总预算 10 秒。
+    # 原来这里是「采 3 次,全空再整轮采 3 次」,网络半死时最坏 6×6=36 秒,
+    # 直接吃掉 App 的 45 秒超时,用户看到的是「操作超时」而不是「网络在抖」。
+    # 现在取不到会在同一个预算内继续重采,不必整轮重跑。
+    probe_egress 3 10
     ip="$PROBE_IP"; loc="$PROBE_LOC"
     ipwarn=""
     case "$PROBE_STATUS" in

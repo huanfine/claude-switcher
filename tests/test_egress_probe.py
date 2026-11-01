@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -54,12 +55,13 @@ check_disabled() { return 1; }
 
 
 class ProbeEgressTests(unittest.TestCase):
-    def run_probe(self, curl_body, count=3):
+    def run_probe(self, curl_body, count=3, budget=10):
         with tempfile.TemporaryDirectory() as tmp:
-            src = "curl() { %s; }\n%s\nprobe_egress %d\necho \"status=$PROBE_STATUS\"\n" \
-                  "echo \"ip=$PROBE_IP\"\necho \"seen=$PROBE_SEEN\"\n" % (curl_body, PROBE_FN, count)
+            src = "curl() { %s; }\n%s\nprobe_egress %d %d\necho \"status=$PROBE_STATUS\"\n" \
+                  "echo \"ip=$PROBE_IP\"\necho \"seen=$PROBE_SEEN\"\n" % (
+                      curl_body, PROBE_FN, count, budget)
             run = subprocess.run(["/bin/bash", "-c", src], cwd=tmp, text=True,
-                                 capture_output=True, timeout=20)
+                                 capture_output=True, timeout=30)
         return run
 
     def test_stable_exit_is_ok(self):
@@ -85,6 +87,27 @@ class ProbeEgressTests(unittest.TestCase):
             "c=$(cat ctr 2>/dev/null || echo 0); c=$((c+1)); echo $c > ctr; "
             "[ \"$c\" = 2 ] && printf 'ip=198.51.100.2\\nloc=US\\n'; true")
         self.assertIn("status=ok", run.stdout)
+
+    def test_drift_stops_sampling_immediately(self):
+        # 采样间不一致就立刻返回:再采只会更慢,结论不会变好。
+        with tempfile.TemporaryDirectory() as tmp:
+            src = ("curl() { c=$(cat ctr 2>/dev/null || echo 0); c=$((c+1)); echo $c > ctr; "
+                   "printf 'ip=198.51.100.%s\\nloc=US\\n' \"$c\"; }\n"
+                   + PROBE_FN + "\nprobe_egress 6 10\n"
+                   "echo \"status=$PROBE_STATUS\"\necho \"calls=$(cat ctr)\"\n")
+            run = subprocess.run(["/bin/bash", "-c", src], cwd=tmp, text=True,
+                                 capture_output=True, timeout=30)
+        self.assertIn("status=unstable", run.stdout)
+        self.assertIn("calls=2", run.stdout, "第 2 次就不一致,不该继续采到第 6 次")
+
+    def test_budget_caps_total_time(self):
+        # 网络半死:每次 curl 都卡满 2 秒。总耗时必须封顶在预算内,否则会把 App 的
+        # 45 秒检查超时吃光,用户看到的是「操作超时」而不是「网络在抖」。
+        start = time.time()
+        run = self.run_probe("sleep 2; true", count=6, budget=3)
+        elapsed = time.time() - start
+        self.assertIn("status=unknown", run.stdout)
+        self.assertLess(elapsed, 7.0, "预算 3 秒不该跑到 %.1f 秒" % elapsed)
 
 
 class CheckEgressGateTests(unittest.TestCase):
