@@ -1291,7 +1291,9 @@ log_result() {
 }
 
 # TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管(兼容各种 TUN 设备名)
-tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
+# TUN 是否在线:看是否有一块网卡拿到了 fake-ip 段的地址。
+# 前缀跟着实际 fake-ip-range 走,不再写死 198.18. —— 用户改过网段就会误判成"TUN 没起"。
+tun_up() { ifconfig 2>/dev/null | grep -q "inet ${FAKE_PREFIX:-198.18.}"; }
 
 # 代理客户端显示名(供检查细节输出)
 proxy_name() {
@@ -1637,13 +1639,63 @@ check() {
 
 # ---------- 故障演练(fail-closed 验证) ----------
 # 平时的检查只能证明「流量走了代理」,证明不了「代理挂了会不会直连」。这一项必须
-# 真的停掉内核才能验:停核后本机应当完全断网,任何一条通路还能出去就是漏。
-# 停核由用户手动做——停核需要 sudo,而且断网时机不该由脚本替用户决定。
-# 内核停着的时候一定要能恢复,所以全程挂着提醒恢复的 trap。
+# 真的把内核链路断掉才能验:断掉后本机应当完全断网,任何一条通路还能出去就是漏。
+# 断链路有两种办法:auto 走内核接口关 TUN(不需要 sudo,可精确恢复);manual 由用户
+# 手动停核(需要 sudo,断网时机由用户决定)。两条路都必须能恢复,所以全程挂着 trap。
+# 内核控制接口的 Unix socket。Clash Verge 服务模式下 socket 在 /var/run 下,走它不需要
+# sudo;配置里记的可能是重启后已失效的临时路径,所以两个都试。
+clash_sock() {
+    local cfg="$CLASH_DIR/clash-verge.yaml" s=""
+    if [ -f "$cfg" ]; then
+        s=$(sed -n 's/^external-controller-unix:[[:space:]]*//p' "$cfg" | tr -d '"' | head -1)
+    fi
+    if [ -n "$s" ] && [ -S "$s" ]; then printf '%s\n' "$s"; return 0; fi
+    s="/var/run/clash-verge-service/users/$(id -u)/verge-mihomo.sock"
+    [ -S "$s" ] && { printf '%s\n' "$s"; return 0; }
+    return 1
+}
+
+# 当前 TUN 开关状态:true / false / unknown
+# 不用 sed 的 \| 交替:macOS 自带 BSD sed 和这台机器上的 toybox sed 都不支持,
+# 写了也只会静默返回空值,把"已关闭"误判成"没关掉"。
+tun_state() {
+    local sock json tun
+    sock=$(clash_sock) || { echo "unknown"; return 1; }
+    json=$(curl -s --max-time 8 --unix-socket "$sock" http://localhost/configs 2>/dev/null)
+    [ -n "$json" ] || { echo "unknown"; return 1; }
+    tun=$(printf '%s' "$json" | tr -d '[:space:]' | sed 's/.*"tun":{//; s/}.*//')
+    case "$tun" in
+        *'"enable":true'*)  echo "true" ;;
+        *'"enable":false'*) echo "false" ;;
+        *) echo "unknown"; return 1 ;;
+    esac
+}
+
+# 运行时开关 TUN。PATCH 只改内存不落盘,重启内核即回到配置文件里的值。
+tun_set() {
+    local sock code
+    sock=$(clash_sock) || { echo "FAIL:找不到内核控制接口,无法自动开关 TUN"; return 1; }
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --unix-socket "$sock" \
+        -X PATCH -H 'Content-Type: application/json' \
+        -d "{\"tun\":{\"enable\":$1}}" http://localhost/configs 2>/dev/null)
+    case "$code" in
+        200|204) return 0 ;;
+        *) echo "FAIL:内核拒绝修改 TUN(HTTP ${code:-000})"; return 1 ;;
+    esac
+}
+
+# fail-closed 演练:平时检查只能证明"流量走了代理",证明不了"代理挂了会不会直连"。
+# 默认 auto —— 通过内核接口关掉 TUN,效果等价于核死时路由被撤销,但可以精确恢复,
+# 不需要 sudo,也不会把用户留在断网状态。--manual 保留原来的手动停核路径。
 drill() {
-    local baseline answer waited leaked out i result
-    answer=""
-    [ "${1:-}" = "--yes" ] && answer="yes"
+    local mode="auto" answer="" baseline after leaked out code result waited i arg
+    for arg in "$@"; do
+        case "$arg" in
+            --manual) mode="manual" ;;
+            --auto)   mode="auto" ;;
+            --yes)    answer="yes" ;;
+        esac
+    done
 
     proxy_alive || { echo "FAIL:代理内核未运行,先启动再演练"; return 1; }
     tun_up || { echo "FAIL:TUN网卡不在线,先修复再演练"; return 1; }
@@ -1651,39 +1703,67 @@ drill() {
     [ "$PROBE_STATUS" = "ok" ] || { echo "FAIL:当前出口无法采样($PROBE_STATUS),先修复再演练"; return 1; }
     baseline="$PROBE_IP"
 
+    if [ "$mode" = "auto" ] && [ -z "$(clash_sock)" ]; then
+        echo "INFO:找不到内核控制接口,退回手动停核"
+        mode="manual"
+    fi
+
     echo "INFO:演练基准出口 $baseline"
-    echo "INFO:接下来需要你手动停掉代理内核,停核期间本机将完全断网。"
-    echo "INFO:停核——在 Clash Verge 里退出内核,或关闭 TUN 与系统代理。"
-    echo "INFO:恢复——重新打开 Clash Verge 并确认 TUN 已开启。"
+    if [ "$mode" = "auto" ]; then
+        echo "INFO:方式=自动关 TUN(走内核接口,不需要 sudo,结束自动恢复)"
+    else
+        echo "INFO:方式=手动停核(在 Clash Verge 里退出内核)"
+        echo "INFO:恢复——重新打开 Clash Verge 并确认 TUN 已开启"
+    fi
     if [ -z "$answer" ]; then
         printf '继续? 输入 yes 回车: '
         read -r answer
         [ "$answer" = "yes" ] || { echo "已取消,未做任何改动"; return 2; }
     fi
 
-    # 把用户留在断网状态是最坏的结果,所以不管从哪条路退出都要提醒恢复。
-    trap 'echo "WARN:演练未正常结束,请确认 Clash Verge 已重新启动并开启 TUN"' EXIT INT TERM
+    # 把用户留在断网状态是最坏的结果:不管从哪条路退出都要恢复。
+    trap 'echo "WARN:演练未正常结束,正在尝试恢复 TUN"; tun_set true >/dev/null 2>&1; echo "WARN:请确认 Clash Verge 里 TUN 已开启"' EXIT INT TERM
 
-    printf '停掉内核后回车(最多等 90 秒): '
-    read -r answer
-    waited=0
-    while proxy_alive; do
-        if [ "$waited" -ge 90 ]; then
-            echo "FAIL:90 秒内内核仍在运行,演练未开始(未做任何改动)"
+    if [ "$mode" = "auto" ]; then
+        tun_set false || { trap - EXIT INT TERM; return 1; }
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            [ "$(tun_state)" = "false" ] && break
+            sleep 1
+        done
+        if [ "$(tun_state)" != "false" ]; then
+            echo "FAIL:TUN 未真正关闭,演练无效(已尝试恢复)"
+            tun_set true >/dev/null 2>&1
             trap - EXIT INT TERM
             return 1
         fi
-        sleep 3; waited=$((waited + 3))
-    done
+    else
+        printf '停掉内核后回车(最多等 90 秒): '
+        read -r answer
+        waited=0
+        while proxy_alive; do
+            if [ "$waited" -ge 90 ]; then
+                echo "FAIL:90 秒内内核仍在运行,演练未开始(未做任何改动)"
+                trap - EXIT INT TERM
+                return 1
+            fi
+            sleep 3; waited=$((waited + 3))
+        done
+    fi
 
     # 同时测域名与裸 IP:域名可能被 fake-ip 接住而"看起来"正常,裸 IP 绕不过去。
-    echo "INFO:内核已停,开始探测直连通路(域名与裸 IP 各 3 次)"
+    # 裸 IP 用 HTTP 响应码判定,不解析响应内容:http://1.1.1.1/cdn-cgi/trace 会被
+    # 301 到 https,而 https://1.1.1.1 的证书是 *.cloudflare-dns.com,校验必失败,
+    # 按内容判定会让这一路永远取不到值——真漏了也会被误判成"没漏"。
+    # 只要拿到任何响应码(含 4xx/5xx),就证明这条通路是活的。
+    # 全程 --noproxy:演练要测的是内核链路,不是 HTTPS_PROXY 指向的那个端口;
+    # 否则核停后代理端口一起死,会得出"没漏"的假结论。
+    echo "INFO:内核链路已断开,开始探测直连通路(域名与裸 IP 各 3 次)"
     leaked=""
     for i in 1 2 3; do
-        out=$(curl -s --max-time 4 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+        out=$(curl -s --max-time 4 --noproxy '*' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
         [ -n "$out" ] && leaked="$leaked $out"
-        out=$(curl -s --max-time 4 http://1.1.1.1/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
-        [ -n "$out" ] && leaked="$leaked $out"
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 --noproxy '*' http://1.1.1.1/ 2>/dev/null)
+        [ -n "$code" ] && [ "$code" != "000" ] && leaked="$leaked bare-ip-http-$code"
     done
     if [ -n "$leaked" ]; then
         leaked=$(printf '%s\n' $leaked | sort -u | tr '\n' ' ')
@@ -1695,17 +1775,27 @@ drill() {
         result="established"
     fi
 
-    printf '重新启动内核并开启 TUN 后回车: '
-    read -r answer
-    waited=0
-    while ! proxy_alive; do
-        if [ "$waited" -ge 120 ]; then
-            echo "FAIL:内核未恢复,请手动启动 Clash Verge 并开启 TUN"
-            trap - EXIT INT TERM
-            return 1
-        fi
-        sleep 3; waited=$((waited + 3))
-    done
+    if [ "$mode" = "auto" ]; then
+        echo "INFO:恢复 TUN"
+        tun_set true || { echo "FAIL:恢复 TUN 失败,请在 Clash Verge 里手动开启"; return 1; }
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            [ "$(tun_state)" = "true" ] && break
+            sleep 1
+        done
+        [ "$(tun_state)" = "true" ] || { echo "FAIL:恢复 TUN 失败,请在 Clash Verge 里手动开启"; return 1; }
+    else
+        printf '重新启动内核并开启 TUN 后回车: '
+        read -r answer
+        waited=0
+        while ! proxy_alive; do
+            if [ "$waited" -ge 120 ]; then
+                echo "FAIL:内核未恢复,请手动启动 Clash Verge 并开启 TUN"
+                trap - EXIT INT TERM
+                return 1
+            fi
+            sleep 3; waited=$((waited + 3))
+        done
+    fi
     probe_egress 3
     [ "$PROBE_STATUS" = "ok" ] || echo "WARN:内核已起但出口未恢复采样($PROBE_STATUS),请人工确认"
     if [ -n "$PROBE_IP" ] && [ "$PROBE_IP" != "$baseline" ]; then
@@ -2855,7 +2945,7 @@ started_at=$(date +%s)
 summary=""
 case "$operation" in
     check)  check ;;
-    drill)  drill "${2:-}" ;;  # fail-closed 演练:需用户手动停核,见函数注释
+    drill)  drill "${@:2}" ;;  # fail-closed 演练:默认自动关 TUN,--manual 走手动停核
     verdict) support verdict "${2:-}" ;;
     evidence) support evidence "${2:-}" ;;
     checkdetail)
@@ -2886,7 +2976,7 @@ case "$operation" in
     set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|drill [--yes]|verdict [报告]|evidence <file>|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|drill [--auto|--manual] [--yes]|verdict [报告]|evidence <file>|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
 rc=$?
 case "$operation" in

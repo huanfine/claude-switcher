@@ -182,5 +182,44 @@ class EvidenceTests(unittest.TestCase):
             self.assertIn("未覆盖", second.stderr)
 
 
+TUN_STATE_FN = extract("tun_state")
+
+
+class TunStateTests(unittest.TestCase):
+    """tun_state 对内核 /configs 的解析。
+
+    踩过的坑:最初用 sed 的 \\| 交替写 (true\\|false),macOS 自带 BSD sed 和这台
+    机器上的 toybox sed 都不支持 —— 静默返回空值,演练就把「TUN 已关」误判成
+    「没关掉」,直接判演练无效。这里用真实内核返回的 JSON 形状做回归。
+    """
+
+    def run_state(self, payload):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "configs.json"
+            cfg.write_text(payload, encoding="utf-8")
+            src = ("clash_sock() { echo %s; }\n" % (Path(tmp) / "s.sock")) + \
+                TUN_STATE_FN + "\n" + \
+                "curl() { cat '%s'; }\n" % cfg + \
+                "tun_state\n"
+            return subprocess.run(["/bin/bash", "-c", src], cwd=tmp, text=True,
+                                  capture_output=True, timeout=20)
+
+    def test_enabled(self):
+        # 真实形状:enable 后面还挂着一串键,JSON 里带空格
+        run = self.run_state('{"mode": "rule", "tun": {"enable": true, '
+                             '"device": "utun1024", "stack": "Mixed", '
+                             '"auto-route": true}, "ipv6": false}')
+        self.assertEqual(run.stdout.strip(), "true")
+
+    def test_disabled(self):
+        run = self.run_state('{"mode": "rule", "tun": {"enable": false, '
+                             '"device": "utun1024"}}')
+        self.assertEqual(run.stdout.strip(), "false")
+
+    def test_missing_tun_is_unknown(self):
+        run = self.run_state('{"mode": "rule", "ipv6": false}')
+        self.assertEqual(run.stdout.strip(), "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()
