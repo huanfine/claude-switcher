@@ -97,7 +97,10 @@ class SetClientTests(unittest.TestCase):
         core = self.copy.read_text(encoding="utf-8")
         match = re.search(r"(?ms)^bodyguard_status\(\) \{\n.*?^\}", core)
         self.assertIsNotNone(match, "bodyguard status needs current installed MODE validation")
-        self.assertIn('echo "保镖=$(bodyguard_status)"', core)
+        # checkdetail 里保镖一行改成 case 映射(未安装要带动作),但必须仍由
+        # bodyguard_status 供给状态,不能退化成写死文案。
+        self.assertIn("guard=$(bodyguard_status)", core)
+        self.assertIn('echo "保镖=$guard"', core)
         cmd = match.group(0) + '\nlaunchctl() { return 0; }\nPROXY_MODE="shadowrocket"\nbodyguard_status\n'
         env = dict(os.environ, HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
         run = subprocess.run(["/bin/bash", "-c", cmd], cwd=self.root, env=env,

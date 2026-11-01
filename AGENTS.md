@@ -78,6 +78,7 @@
 ## 验收标准（全部满足才算装完）
 
 - 终端执行 `~/.local/bin/claude-switch.sh checkdetail` 输出完整 14 行；硬性安全项全部 `=ok`，非关键项只能是 `=ok`、既有警告，或用户显式配置的 `=skip`/降级警告
+- 每行结论只允许 `ok` / `fail` / `config` / `warn` / `skip` 五种。`fail` 与 `config` 都拦启动，但语义不同：`fail` 是实测不达标（去修环境），`config` 是环境层没就绪、无从判定（去补配置）。文案必须带「当前值 vs 期望值 + 一条动作」，禁止只写「未生效」「异常」这类无动作的结论
 - 双击桌面 App，无红色硬性安全项，能正常启动 Claude；灰色 `skip` 不得当成绿色通过
 - `launchctl print system/local.claude-bodyguard`、`system/local.tz-watchdog` 与 `gui/$(id -u)/local.claude-update` 均能查到（服务已注册）
 - `/Library/Application Support/claude-switcher/` 下两个守护脚本属 root:wheel、权限 755，当前用户不可写
@@ -94,7 +95,7 @@
 | headless Chrome 做 WebRTC 检测无结果 | headless 模式 ICE 子系统不产出候选 | 不要走浏览器路线，用本项目的纯 Python STUN 探针 |
 | 代理节点报错但流量没泄漏 | 节点被重置时隧道内请求失败≠泄漏；Fail-Closed 下流量只断不绕 | 换线路即可 |
 | 切换账号报「存在待恢复快照，拒绝覆盖」 | 上次归档被中断，`~/.claude-switcher/accounts/<账号>.new` 或 `.previous` 残留（可能是唯一副本） | 先确认 `<账号>/` 是否完整；若有 `.previous` 且正式目录缺失，用它恢复；确认无价值后再删除 `.new`/`.previous` 重试 |
-| 规则置顶显示「未生效」/检查提示运行规则未验证 | Clash 处于 global 模式时规则本不生效(正常);rule 模式下多为 Script.js 未启用、代理组不存在或控制 socket 失效 | 全局模式无需处理;rule 模式先确认全局扩展脚本启用与代理组名,再跑 `fix`;控制接口失联时会自动回退服务 socket |
+| 规则置顶显示「内核缺少 Claude 域名」/「环境层未就绪」 | 前者是 rule 模式下 Script.js 未启用或规则被覆盖；后者是代理组名没取到，环境层（`env.json`）不完整，与规则本身无关 | 前者跑 `fix` 写全局扩展脚本；后者先跑 `fix` 让它反查内核补出代理组，再看提示重试。global 模式下规则本不生效（正常），显示为 ok |
 | WebRTC 检测失败但 TUN 正常 | STUN 被国内直连规则匹配、全局脚本未启用、代理组或节点 UDP 能力不符 | Clash Verge 运行 `fix` 写入全局 Script.js；FlClash 运行 `fix` 备份并在当前 Profile 事务写入域名与 UDP 3478/5349/19302 规则，重启验证，失败回滚。默认 proxy；`WEBRTC_POLICY=reject claude-switch.sh fix` 可切换并持久化拒绝策略（影响部分通话）。不要再向全局 Merge.yaml 手写 prepend-rules，不要把无 STUN 响应视为零暴露 |
 | 安装器未能识别出口国家 | 只探测 ipinfo.io，代理规则判直连/被墙/限流时国家为空直接退出 | 已改为 ipinfo → ipapi → ifconfig → Cloudflare trace 多源自动兜底；仍失败时检查代理规则是否把这些域名判直连，或 `FORCE=1` + 手动选地区 |
 | Windows 地区检查误红（非美国用户） | `$LOCALE_TARGET` 与系统「区域格式」不一致；旧版曾写死 `en-US` | 运行 `claude-switch.ps1 set-region`；或在「设置 → 时间和语言 → 语言和区域 → 区域格式」中改成目标 locale，并确认 `$LOCALE_TARGET` |

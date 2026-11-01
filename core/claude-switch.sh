@@ -1342,6 +1342,18 @@ optional_result() {
         echo "$name=$state${detail:+:$detail}"
     fi
 }
+
+# 检查项不合格有三种性质,不能都揉成一个 fail:
+#   config —— 环境层没配好(代理组/目标值缺失),系统根本无从判定安全性。用户该做的是
+#             重新配置,不是去查规则。以前这种情况也报 fail,于是「没配置」看起来像
+#             「不安全」,用户照着提示去修规则,越修越远。
+#   fail   —— 已配置,但实测不达标。这才是真的安全问题,必须拦启动。
+#   warn   —— 非硬性项不达标,只提示(见 optional_result)。
+# 三者都拦启动(config 拦是因为「没验证过」不能当「验证通过」),区别在于提示语和动作。
+config_result() {
+    local name="$1" detail="${2:-}"
+    echo "$name=config${detail:+:$detail}"
+}
 log_result() {
     local started="$1" command="$2" rc="$3" summary="${4:-}"
     "$0" _support log "$command" "$rc" "$(( ($(date +%s) - started) * 1000 ))" "$summary" >/dev/null 2>&1 || true
@@ -1415,6 +1427,35 @@ clash_rules() {
 # 只接受运行中内核加载的规则，不再用配置文本或 fake-ip 代替。
 merge_ok() { clash_rules verify >/dev/null 2>&1; }
 stun_ok() { merge_ok; }
+
+# 把内核校验的失败原因翻成「缺什么 + 点哪里」。
+# verify 在第一个不匹配处就退出,只能报出首个缺失项,所以别在这里写条数
+# (域名清单会长,写死的数字很快就会过期)。
+rule_fix_hint() {
+    local msg="${1%%$'\n'*}"
+    case "$msg" in
+        *未按策略置顶:UDP/*)
+            printf 'UDP %s 规则没置顶 · 点「一键修复」' "${msg##*:UDP/}" ;;
+        *未按策略置顶:*)
+            printf '内核缺少 Claude 域名(%s 等) · 点「一键修复」' "${msg##*:}" ;;
+        *不是*rule*模式*)
+            printf '客户端不在规则模式 · 切到「规则」后重新检查' ;;
+        *代理组不存在*|*实际的代理组*)
+            printf '配置的代理组在客户端里不存在 · 点「一键修复」重新选择' ;;
+        *没有可用的当前节点*|*直连或拒绝*)
+            printf '代理组当前节点是直连或拒绝 · 换一个代理节点' ;;
+        *UDP*)
+            printf '节点未确认支持 UDP · 换节点或改用拒绝策略' ;;
+        *数量不足*)
+            printf '内核规则条数不足 · 点「一键修复」' ;;
+        *接口不可用*)
+            printf '读不到内核控制接口 · 确认客户端已启动后重新检查' ;;
+        "")
+            printf '规则校验未通过 · 点「一键修复」' ;;
+        *)
+            printf '%s · 点「一键修复」' "$msg" ;;
+    esac
+}
 # 当前 Clash 模式(rule/global/direct);读取失败返回空
 clash_mode() { clash_rules mode 2>/dev/null; }
 
@@ -1605,8 +1646,8 @@ check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
     fails=""
 
-    proxy_alive || fails="$fails;代理内核未运行"
-    tun_up || fails="$fails;TUN网卡不在线"
+    proxy_alive || fails="$fails;代理内核未运行($(proxy_name))"
+    tun_up || fails="$fails;TUN网卡不在线(在客户端开启 TUN 模式)"
 
     # 多采样取出口。全空时再取一轮:一次全空多半是抖动,连续两轮全空才算真的取不到。
     probe_egress 3
@@ -1621,7 +1662,7 @@ check() {
             # 取不到 ≠ 出口错。不判 fail(否则网络抖动会拦住启动),但必须显式告知未确认。
             ipwarn="注意:多次采样均未取到出口IP,本次出口未确认" ;;
         *)
-            [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP异常(${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET)" ;;
+            [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP不符(当前 ${ip:-无}/${loc:-未知},期望 $COUNTRY_TARGET)" ;;
     esac
     if ! check_disabled "IP一致"; then
         lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
@@ -1637,11 +1678,21 @@ check() {
         fi
     fi
 
-    tz=$(readlink /etc/localtime 2>/dev/null)
-    [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ] || fails="$fails;时区异常($tz)"
+    # 时区/地区/目标国家缺失是环境层没配好,不是实测不达标 —— 提示语必须分开,
+    # 否则用户会拿着「时区异常」去改时区,而真正错的是目标值。
+    tz=$(readlink /etc/localtime 2>/dev/null); tz=${tz##*/zoneinfo/}
+    if [ -z "$TZ_TARGET" ]; then
+        fails="$fails;环境未配置(时区目标缺失,点一键修复)"
+    elif [ "$tz" != "$TZ_TARGET" ]; then
+        fails="$fails;时区不符(当前 ${tz:-未知},期望 $TZ_TARGET)"
+    fi
 
     locale=$(defaults read -g AppleLocale 2>/dev/null)
-    [ "$locale" = "$LOCALE_TARGET" ] || fails="$fails;地区异常($locale)"
+    if [ -z "$LOCALE_TARGET" ]; then
+        fails="$fails;环境未配置(地区目标缺失,点一键修复)"
+    elif [ "$locale" != "$LOCALE_TARGET" ]; then
+        fails="$fails;地区不符(当前 ${locale:-未知},期望 $LOCALE_TARGET)"
+    fi
 
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
     echo "$v6" | grep -qi 'off' || fails="$fails;IPv6未关闭"
@@ -1662,15 +1713,22 @@ check() {
     guard_state=$(bodyguard_status)
     case "$guard_state" in
         ok:*) ;;
+        fail:未安装*) fails="$fails;保镖未安装(点一键修复)" ;;
         fail:*) fails="$fails;保镖:${guard_state#fail:}" ;;
         *) fails="$fails;保镖:状态无法验证" ;;
     esac
 
     # 置顶规则:Clash Verge 验证运行内核;全局模式下全部流量走代理,规则不适用;其他客户端只看行为检测
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        [ "$(clash_mode)" = "global" ] || merge_ok || fails="$fails;运行中置顶规则未验证"
+        if [ "$(clash_mode)" = "global" ]; then
+            :
+        elif [ -z "$PROXY_GROUP" ]; then
+            fails="$fails;环境未配置(代理组缺失,点一键修复)"
+        elif ! rule_err=$(clash_rules verify 2>&1 >/dev/null); then
+            fails="$fails;规则置顶未生效($(rule_fix_hint "${rule_err#FAIL:}"))"
+        fi
     else
-        route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
+        route_ok || fails="$fails;规则置顶缺失(这些域名没走隧道:${ROUTE_MISSED# })"
     fi
 
     if ! check_disabled "客户端语言"; then
@@ -1885,7 +1943,9 @@ webrtc_status() {
             return
         fi
         if ! verified=$(clash_rules verify 2>&1); then
-            echo "fail:运行规则未验证:${verified#FAIL:}"
+            # 原样抛 verify 的错误会得到「WebRTC:运行规则未验证:运行规则未按策略置顶:clau.de」
+            # —— 三层冒号、一个术语、零个动作。翻成一句话 + 动作再往上抛。
+            echo "fail:$(rule_fix_hint "${verified#FAIL:}")"
             return
         fi
     fi
@@ -1939,13 +1999,20 @@ checkdetail() {
             *) echo "代理内核=ok:$(proxy_name) 运行中" ;;
         esac
     else
-        echo "代理内核=fail:$(proxy_name) 未运行"
+        # 客户端没开是「还没开始」,不是「不安全」;动作只有一步。
+        echo "代理内核=fail:$(proxy_name) 未运行 · 启动后重新检查"
     fi
-    if tun_up; then echo 'TUN网卡=ok'; else echo 'TUN网卡=fail:不在线'; fi
+    if tun_up; then echo 'TUN网卡=ok'; else echo 'TUN网卡=fail:不在线 · 在客户端里开启 TUN 模式'; fi
     trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
-    if [ "$loc" = "$COUNTRY_TARGET" ]; then echo "出口IP=ok:$ip/$loc"; else echo "出口IP=fail:${ip:-无}/${loc:-未知}(期望$COUNTRY_TARGET)"; fi
+    if [ "$loc" = "$COUNTRY_TARGET" ]; then
+        echo "出口IP=ok:$ip/$loc"
+    elif [ -z "$COUNTRY_TARGET" ]; then
+        config_result "出口IP" "环境层未就绪(未取到目标国家) · 点「一键修复」"
+    else
+        echo "出口IP=fail:当前 ${ip:-无}/${loc:-未知},期望 $COUNTRY_TARGET · 换到 $COUNTRY_TARGET 节点"
+    fi
     if check_disabled "IP一致"; then
         optional_result "IP一致" ok
     else
@@ -1967,12 +2034,27 @@ checkdetail() {
         fi
         optional_result "IP一致" "$ipst" "$ipdt"
     fi
-    tz=$(readlink /etc/localtime 2>/dev/null)
-    if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo '时区=ok'; else echo "时区=fail:$tz"; fi
+    # 时区/地区:报「当前值 vs 期望值」,不报 readlink 的完整路径。
+    # 原来直接打印 /var/db/timezone/zoneinfo/America/Los_Angeles,看起来像系统坏了,
+    # 实际只是目标值和当前值不一致 —— 用户看不出该改哪一边。
+    tz=$(readlink /etc/localtime 2>/dev/null); tz=${tz##*/zoneinfo/}
+    if [ -z "$TZ_TARGET" ]; then
+        config_result "时区" "环境层未就绪(未取到时区目标) · 点「一键修复」"
+    elif [ "$tz" = "$TZ_TARGET" ]; then
+        echo '时区=ok'
+    else
+        echo "时区=fail:当前 ${tz:-未知},期望 $TZ_TARGET · 点「一键修复」对齐"
+    fi
     locale=$(defaults read -g AppleLocale 2>/dev/null)
-    if [ "$locale" = "$LOCALE_TARGET" ]; then echo '地区=ok'; else echo "地区=fail:$locale"; fi
+    if [ -z "$LOCALE_TARGET" ]; then
+        config_result "地区" "环境层未就绪(未取到地区目标) · 点「一键修复」"
+    elif [ "$locale" = "$LOCALE_TARGET" ]; then
+        echo '地区=ok'
+    else
+        echo "地区=fail:当前 ${locale:-未知},期望 $LOCALE_TARGET · 点「一键修复」对齐"
+    fi
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭'; fi
+    if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭 · 点「一键修复」'; fi
     if check_disabled "DNS"; then
         optional_result "DNS" ok
     else
@@ -1990,21 +2072,32 @@ checkdetail() {
         case "$wr" in *:*) wrdt=${wr#*:} ;; esac
         optional_result "WebRTC" "$wrst" "$wrdt"
     fi
-    echo "保镖=$(bodyguard_status)"
+    guard=$(bodyguard_status)
+    case "$guard" in
+        ok:*) echo "保镖=$guard" ;;
+        # 没装 ≠ 没工作:装一下就好,别让用户去排查安全配置。
+        fail:未安装*) echo '保镖=fail:未安装 · 点「一键修复」(需一次管理员授权)' ;;
+        fail:*) echo "保镖=fail:${guard#fail:}" ;;
+        *) echo '保镖=fail:状态无法验证 · 重新运行检查' ;;
+    esac
     # 置顶规则:Clash Verge 验证运行内核;全局模式下规则不适用(全部流量已走代理)
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         if [ "$(clash_mode)" = "global" ]; then
             echo '规则置顶=ok:全局模式(全部流量走代理)'
-        elif merge_ok; then
+        elif [ -z "$PROXY_GROUP" ]; then
+            # 代理组没取到 = 环境层没就绪,规则校验根本无从谈起。以前这里报
+            # 「未生效」,把用户引去查规则;他真正要做的是把环境层补齐。
+            config_result "规则置顶" "环境层未就绪(未取到代理组) · 点「一键修复」"
+        elif rule_err=$(clash_rules verify 2>&1 >/dev/null); then
             echo '规则置顶=ok'
         else
-            echo '规则置顶=fail:未生效'
+            echo "规则置顶=fail:$(rule_fix_hint "${rule_err#FAIL:}")"
         fi
     else
         if route_ok; then
             echo '规则置顶=ok:行为检测通过'
         else
-            echo "规则置顶=fail:未命中(${ROUTE_MISSED# }),请在 $(proxy_name) 中自行加置顶规则"
+            echo "规则置顶=fail:这些域名没走隧道(${ROUTE_MISSED# }) · 在 $(proxy_name) 里置顶 Claude 域名"
         fi
     fi
     # 12. Claude 客户端语言(单独设为英文,或系统首选语言为英文均可;防止 JS 层读出中文)
@@ -2018,7 +2111,7 @@ checkdetail() {
         elif [[ "$syslang" == en* ]]; then
             optional_result "客户端语言" ok "跟随系统(英文)"
         else
-            optional_result "客户端语言" fail "跟随系统(中文)"
+            optional_result "客户端语言" fail "当前中文 · 点「一键修复」设为英文"
         fi
     fi
     # 13. ASN 网络属性(住宅宽带 vs 机房,按目标地区收录主流运营商)
@@ -2042,7 +2135,7 @@ checkdetail() {
             *HKT*|*PCCW*|*HKBN*|*HGC*|\
             *BT*|*Sky*|*Virgin*|*TalkTalk*|*Vodafone*|\
             *Deutsche\ Telekom*|*1\&1*|*O2*) optional_result "ASN属性" ok "$org" ;;
-            *) optional_result "ASN属性" warn "疑似机房($org)" ;;
+            *) optional_result "ASN属性" warn "疑似机房($org) · 建议换住宅节点" ;;
         esac
     fi
     # 14. Anthropic 生态可达性
@@ -2054,7 +2147,7 @@ checkdetail() {
         if [ "$r1" != "000" ] && [ "$r2" != "000" ]; then
             optional_result "生态可达性" ok "claude.ai:$r1 api:$r2"
         else
-            optional_result "生态可达性" fail "claude.ai:$r1 api:$r2"
+            optional_result "生态可达性" fail "claude.ai:$r1 api:$r2 · 换条线路后重新检查"
         fi
     fi
 }

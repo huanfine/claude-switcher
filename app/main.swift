@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 // MARK: - 模型
 
-enum RowState { case pending, ok, warn, fail, skip }
+enum RowState { case pending, ok, warn, fail, skip, config }
 
 struct CheckRow: Identifiable {
     let id = UUID()
@@ -120,6 +120,14 @@ final class VM: ObservableObject {
 
     var canQuit: Bool { !switchRequested && phase != .fixing && phase != .switching }
 
+    /// 只因为「没配好」而不通过,没有真正的安全项失败。两者提示语必须分开:
+    /// 混成一句「存在未通过项」,用户会去排查安全问题,而实际只要补齐配置。
+    var configOnlyFailure: Bool {
+        phase == .failed
+            && rows.contains { $0.state == .config }
+            && !rows.contains { $0.state == .fail }
+    }
+
     func start() {
         guard !started else { return }
         started = true
@@ -220,6 +228,10 @@ final class VM: ObservableObject {
             var allOk = result.succeeded
             var matched = Set<Int>()
             var duplicated = false
+            // 「没配好」和「不安全」要分开说:两者都拦启动(没验证过不能当验证通过),
+            // 但用户该做的事完全不同 —— 前者去补配置,后者去修环境。
+            var configRows: [String] = []
+            var failedRows: [String] = []
             let keyMap: [String: String] = [
                 "代理内核": "代理内核", "TUN网卡": "TUN 网卡", "出口IP": "出口 IP",
                 "IP一致": "IP 与上次一致", "时区": "时区", "地区": "地区",
@@ -238,7 +250,15 @@ final class VM: ObservableObject {
                 case "ok": self.rows[idx].state = .ok
                 case "warn": self.rows[idx].state = .warn
                 case "skip": self.rows[idx].state = .skip
-                default: self.rows[idx].state = .fail; allOk = false
+                case "config":
+                    // 环境层没配好。仍然算未通过,但归到「待配置」而不是「不安全」。
+                    self.rows[idx].state = .config
+                    allOk = false
+                    configRows.append(self.rows[idx].name)
+                default:
+                    self.rows[idx].state = .fail
+                    allOk = false
+                    failedRows.append(self.rows[idx].name)
                 }
                 self.rows[idx].detail = status.count > 1 ? status[1] : ""
             }
@@ -252,13 +272,19 @@ final class VM: ObservableObject {
                 self.banner = "检测输出存在重复项，请重新检查"
             } else if matched.count != self.rows.count {
                 self.banner = "检测输出不完整(\(matched.count)/\(self.rows.count))，请点重新检查"
+            } else if !failedRows.isEmpty {
+                // 真正的安全项不达标:说清是哪几项,再给唯一的下一步。
+                self.banner = "未通过：\(failedRows.joined(separator: "、"))。按行内提示处理后重试"
+            } else if !configRows.isEmpty {
+                // 配置没就绪:不要说成「不安全」,否则用户会去修环境而不是补配置。
+                self.banner = "环境没配好：\(configRows.joined(separator: "、"))。点「一键修复」补齐后重新检查"
             }
             let passed = allOk && matched.count == self.rows.count
             self.lastCheckSummary = passed
                 ? (self.rows.contains { $0.state == .warn }
                     ? "有警告"
                     : (self.rows.contains { $0.state == .skip } ? "通过（含跳过）" : "通过"))
-                : "失败"
+                : (failedRows.isEmpty && !configRows.isEmpty ? "待配置" : "失败")
             self.run(["get-client"], timeout: self.checkTimeout) { clientResult in
                 self.updateClient(clientResult)
                 self.run(["status"], timeout: self.checkTimeout) { status in
@@ -780,7 +806,8 @@ struct ContentView: View {
                     if !row.detail.isEmpty {
                         Text(row.detail)
                             .font(.system(size: 11.5, weight: .regular, design: isMonospace(row.detail) ? .monospaced : .default))
-                            .foregroundColor(row.state == .warn ? ClaudeTheme.warning : ClaudeTheme.muted)
+                            .foregroundColor(row.state == .warn ? ClaudeTheme.warning
+                                             : (row.state == .config ? ClaudeTheme.terracotta : ClaudeTheme.muted))
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
@@ -853,6 +880,7 @@ struct ContentView: View {
             case .ok: Image(systemName: "checkmark.circle.fill").foregroundColor(ClaudeTheme.success)
             case .warn: Image(systemName: "exclamationmark.triangle.fill").foregroundColor(ClaudeTheme.warning)
             case .fail: Image(systemName: "xmark.octagon.fill").foregroundColor(ClaudeTheme.error)
+            case .config: Image(systemName: "wrench.and.screwdriver.fill").foregroundColor(ClaudeTheme.terracotta)
             case .skip: Image(systemName: "minus.circle").foregroundColor(ClaudeTheme.muted)
             }
         }
@@ -974,7 +1002,8 @@ struct ContentView: View {
                 if !vm.banner.isEmpty {
                     Text(vm.banner).font(.callout).foregroundColor(ClaudeTheme.error).multilineTextAlignment(.center)
                 }
-                Text("存在未通过项，可一键修复或手动处理后重试").font(.caption).foregroundColor(ClaudeTheme.muted)
+                Text(vm.configOnlyFailure ? "环境没配好，补齐配置即可通过" : "存在未通过项，可一键修复或手动处理后重试")
+                    .font(.caption).foregroundColor(ClaudeTheme.muted)
                 HStack(spacing: 10) {
                     Button { vm.fixAll() } label: {
                         Label("一键修复", systemImage: "wand.and.stars")

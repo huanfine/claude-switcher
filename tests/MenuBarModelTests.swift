@@ -183,6 +183,27 @@ struct MenuBarModelTests {
             case "failed_check":
                 try f.audit(["WebRTC": "fail:演示失败"])
                 try f.deniedSwitch(f.vm())
+            case "config_only_failure":
+                // 环境层没配好 ≠ 不安全。仍然拦启动(没验证过不能当通过),
+                // 但提示语必须指向「补配置」,不能让用户去排查安全问题。
+                try f.audit(["规则置顶": "config:环境层未就绪(未取到代理组) · 点「一键修复」"])
+                let vm = f.vm()
+                try f.deniedSwitch(vm)
+                try expect(vm.rows.first { $0.name == "规则置顶" }?.state == .config, "行状态应为 config")
+                try expect(vm.configOnlyFailure, "只缺配置时应识别为待配置")
+                try expect(vm.lastCheckSummary == "待配置", "摘要应写待配置,不是失败")
+                try expect(vm.banner.contains("环境没配好"), "提示语不能说成不安全")
+            case "config_and_fail":
+                // 真实失败优先:有安全项不达标时,不能只说「待配置」。
+                try f.audit(["规则置顶": "config:环境层未就绪 · 点「一键修复」",
+                             "出口IP": "fail:当前 1.2.3.4/JP,期望 US · 换到 US 节点"])
+                let vm = f.vm()
+                try f.deniedSwitch(vm)
+                try expect(!vm.configOnlyFailure, "有真实失败时不能只说待配置")
+                try expect(vm.lastCheckSummary == "失败", "有真实失败时摘要应为失败")
+                try expect(vm.banner.contains("未通过") && vm.banner.contains("出口 IP"),
+                           "应点名真实失败项")
+                try expect(!vm.banner.contains("环境没配好"), "真实失败不应被配置问题盖住")
             case "incomplete_check":
                 try f.write("audit", auditKeys.dropLast().map { "\($0)=ok" }.joined(separator: "\n"))
                 try f.deniedSwitch(f.vm())

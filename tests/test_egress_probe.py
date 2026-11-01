@@ -116,7 +116,8 @@ class CheckEgressGateTests(unittest.TestCase):
     def test_wrong_country_still_blocks(self):
         run = self.run_check("printf 'ip=198.51.100.2\\nloc=JP\\n'")
         self.assertNotEqual(run.returncode, 0, run.stdout)
-        self.assertIn("出口IP异常", run.stdout)
+        # 文案要同时给出当前值与期望值:只说「异常」用户不知道该改哪边。
+        self.assertIn("出口IP不符(当前 198.51.100.2/JP,期望 US)", run.stdout)
 
 
 class VerdictTests(unittest.TestCase):
