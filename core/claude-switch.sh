@@ -1228,10 +1228,56 @@ fake_ip_prefix() {
 # 会 permission denied,被上层误判成「配置损坏」。
 support() { "${BASH:-/bin/bash}" "$0" _support "$@"; }
 
+# 内核控制接口的 Unix socket。Clash Verge 服务模式下 socket 在 /var/run 下,走它不需要
+# sudo;配置里记的可能是重启后已失效的临时路径,所以两个都试。
+# 定义在 load_env 之前:load_env 在脚本顶层就被调用,那时后面的定义还没执行。
+clash_sock() {
+    local cfg="$CLASH_DIR/clash-verge.yaml" s=""
+    if [ -f "$cfg" ]; then
+        s=$(sed -n 's/^external-controller-unix:[[:space:]]*//p' "$cfg" | tr -d '"' | head -1)
+    fi
+    if [ -n "$s" ] && [ -S "$s" ]; then printf '%s\n' "$s"; return 0; fi
+    s="/var/run/clash-verge-service/users/$(id -u)/verge-mihomo.sock"
+    [ -S "$s" ] && { printf '%s\n' "$s"; return 0; }
+    return 1
+}
+
+# 从运行中的内核规则反查代理组名:置顶规则的第一条就是我们的域名,它的 proxy 字段
+# 就是组名。这样不用另存一份域名清单,也不会和实际生效的规则脱节。
+detect_proxy_group() {
+    local sock json group
+    # 没有 Clash 配置目录就说明这台机器不是我们要管的环境(隔离测试、临时 HOME)。
+    # 不加这道守卫会退到 /var/run 下真实内核的 socket,把测试拖进真实系统里。
+    [ -f "$CLASH_DIR/clash-verge.yaml" ] || return 1
+    sock=$(clash_sock 2>/dev/null) || return 1
+    json=$(curl -s --max-time 10 --unix-socket "$sock" http://localhost/rules 2>/dev/null)
+    [ -n "$json" ] || return 1
+    group=$(printf '%s' "$json" | "${CLAUDE_SWITCHER_PYTHON:-python3}" -c '
+import json, sys
+try:
+    rules = json.load(sys.stdin).get("rules") or []
+except Exception:
+    sys.exit(0)
+for rule in rules:
+    kind = str(rule.get("type") or "").lower()
+    proxy = str(rule.get("proxy") or "")
+    if kind in ("domainsuffix", "domain", "domainkeyword", "domainregex") and proxy:
+        print(proxy)
+        break
+' 2>/dev/null)
+    [ -n "$group" ] && printf '%s\n' "$group"
+}
+
 # 读取环境层。env.json 缺失 → 用保底值(首次安装与老版本升级都走这条路);
 # env.json 损坏 → 明确报错,不静默降级:环境值错会直接把规则写进错误的代理组。
 load_env() {
     local dump key value
+    # env.json 只有安装器跑过才存在。从仓库直接跑、或升级时迁移没跑成,都会没有它 ——
+    # 这时头部 PROXY_GROUP 是空的,规则校验会直接 fail 并把 Claude 拦在门外,
+    # 比不检查更糟。所以缺失时先自愈:从已安装脚本头部迁移一次(升级路径)。
+    if [ ! -f "$ENV_FILE" ] && [ -f "$HOME/.local/bin/claude-switch.sh" ]; then
+        support env-migrate "$HOME/.local/bin/claude-switch.sh" >/dev/null 2>&1 || true
+    fi
     if [ -f "$ENV_FILE" ]; then
         dump=$(support env 2>/dev/null) || {
             echo "FAIL:环境配置 $ENV_FILE 无法解析,请运行 claude-switch.sh env-set 或重跑安装器" >&2
@@ -1252,6 +1298,17 @@ load_env() {
     [ -z "$CLASH_DIR" ] && CLASH_DIR="$(detect_clash_dir)"
     [ -z "$FAKE_IP_RANGE" ] && FAKE_IP_RANGE="$(detect_fake_ip_range "$CLASH_DIR")"
     FAKE_PREFIX="$(fake_ip_prefix "$FAKE_IP_RANGE")"
+    # 迁移没带出代理组(已安装脚本本身就是新架构、头部为空)时,从运行中的内核规则
+    # 反查一次,并把结果落进 env.json,避免每次启动都重新拉 4MB 规则。
+    if [ -z "$PROXY_GROUP" ]; then
+        PROXY_GROUP="$(detect_proxy_group)"
+        [ -n "$PROXY_GROUP" ] && support env-set "proxy_group=$PROXY_GROUP" >/dev/null 2>&1
+    fi
+    # 到这里仍然没有环境层:说明既没有安装记录也探测不到代理组,后面的规则校验
+    # 必然 fail。把原因说出来,别让用户对着「规则置顶未生效」猜。
+    if [ ! -f "$ENV_FILE" ] || [ -z "$PROXY_GROUP" ]; then
+        echo "WARN:环境层缺失($ENV_FILE),环境值在用保底值;请重跑安装器或执行 claude-switch.sh env-set 补齐" >&2
+    fi
     return 0
 }
 
@@ -1642,19 +1699,6 @@ check() {
 # 真的把内核链路断掉才能验:断掉后本机应当完全断网,任何一条通路还能出去就是漏。
 # 断链路有两种办法:auto 走内核接口关 TUN(不需要 sudo,可精确恢复);manual 由用户
 # 手动停核(需要 sudo,断网时机由用户决定)。两条路都必须能恢复,所以全程挂着 trap。
-# 内核控制接口的 Unix socket。Clash Verge 服务模式下 socket 在 /var/run 下,走它不需要
-# sudo;配置里记的可能是重启后已失效的临时路径,所以两个都试。
-clash_sock() {
-    local cfg="$CLASH_DIR/clash-verge.yaml" s=""
-    if [ -f "$cfg" ]; then
-        s=$(sed -n 's/^external-controller-unix:[[:space:]]*//p' "$cfg" | tr -d '"' | head -1)
-    fi
-    if [ -n "$s" ] && [ -S "$s" ]; then printf '%s\n' "$s"; return 0; fi
-    s="/var/run/clash-verge-service/users/$(id -u)/verge-mihomo.sock"
-    [ -S "$s" ] && { printf '%s\n' "$s"; return 0; }
-    return 1
-}
-
 # 当前 TUN 开关状态:true / false / unknown
 # 不用 sed 的 \| 交替:macOS 自带 BSD sed 和这台机器上的 toybox sed 都不支持,
 # 写了也只会静默返回空值,把"已关闭"误判成"没关掉"。
