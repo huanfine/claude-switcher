@@ -32,7 +32,9 @@ class CheckSemanticsTests(unittest.TestCase):
         self.bin.mkdir()
         self.env = dict(os.environ, HOME=str(self.home),
                         PATH=str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
-                        CLAUDE_SWITCHER_PYTHON=sys.executable, PYTHONUTF8="1")
+                        CLAUDE_SWITCHER_PYTHON=sys.executable, PYTHONUTF8="1",
+                        # 默认指向不存在的文件:断言不能随开发机上真实的看门狗状态飘
+                        TZ_WATCHDOG_FILE=str(Path(self.tmp.name) / "no-watchdog.sh"))
         self.stub("pgrep", "exit 0")
         self.stub("ifconfig", "echo 'inet 198.18.0.1'")
         self.stub("curl", '''case "$*" in
@@ -94,6 +96,45 @@ esac''')
         self.assertIn("当前 America/Los_Angeles", value)
         self.assertIn("期望 America/New_York", value)
         self.assertNotIn("/var/db/timezone/zoneinfo", value, "路径前缀对用户没有意义")
+
+    def test_watchdog_holding_old_target_is_warn_not_ok(self):
+        """当前时区对了还不够:看门狗若守着别的目标,几分钟内就会改回去。
+
+        这正是「一键修复没生效」的真实成因 —— 修完一小时内被看门狗改回旧值,
+        而检查项只看系统时区,一句话都没提。
+        """
+        wd = Path(self.tmp.name) / "tz-watchdog.sh"
+        wd.write_text('TARGET="America/Los_Angeles"\n', encoding="utf-8")
+        env = dict(self.env, TZ_WATCHDOG_FILE=str(wd))
+        run = subprocess.run(["/bin/bash", str(self.core()), "checkdetail"], text=True,
+                             capture_output=True, env=env, timeout=60)
+        value = self.line(run.stdout, "时区")
+        self.assertTrue((value or "").startswith("warn:"), value)
+        self.assertIn("America/Los_Angeles", value)
+        self.assertIn("改回去", value)
+        self.assertIn("一键修复", value, "只说有问题不给下一步,用户不知道点哪")
+
+    def test_watchdog_target_parsing_accepts_both_quote_styles(self):
+        """安装器写 TARGET="x",set-region 同步写 TARGET=x —— 两种都得认。"""
+        for body in ('TARGET="Asia/Tokyo"\n', "TARGET=Asia/Tokyo\n"):
+            with self.subTest(body=body.strip()):
+                wd = Path(self.tmp.name) / "wd-quote.sh"
+                wd.write_text(body, encoding="utf-8")
+                env = dict(self.env, TZ_WATCHDOG_FILE=str(wd))
+                run = subprocess.run(["/bin/bash", str(self.core()), "checkdetail"], text=True,
+                                     capture_output=True, env=env, timeout=60)
+                value = self.line(run.stdout, "时区")
+                self.assertTrue((value or "").startswith("warn:"), value)
+                self.assertIn("Asia/Tokyo", value)
+
+    def test_watchdog_on_same_target_keeps_ok(self):
+        """看门狗和期望一致时不该多话 —— 全部 ok 的场景不要凭空冒出 warn。"""
+        wd = Path(self.tmp.name) / "tz-watchdog-ok.sh"
+        wd.write_text('TARGET="America/New_York"\n', encoding="utf-8")
+        env = dict(self.env, TZ_WATCHDOG_FILE=str(wd))
+        run = subprocess.run(["/bin/bash", str(self.core()), "checkdetail"], text=True,
+                             capture_output=True, env=env, timeout=60)
+        self.assertEqual(self.line(run.stdout, "时区"), "ok", run.stdout + run.stderr)
 
     def test_check_failure_names_both_values(self):
         """check 的 FAIL 串是用户唯一能看到的失败原因,同样要带两边取值。"""

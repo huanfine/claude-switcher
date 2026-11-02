@@ -4,6 +4,8 @@
 <plist version="1.0"><dict>
 	<key>Label</key><string>local.tz-watchdog</string>
 	<key>ProgramArguments</key><array><string>/bin/bash</string><string>/Library/Application Support/claude-switcher/tz-watchdog.sh</string></array>
-	<key>StartInterval</key><integer>3600</integer>
+	<!-- 5 分钟一次:macOS 的「按定位自动设置时区」随时会把 /etc/localtime 改回去,
+	     一小时一次的窗口意味着用户可能整小时都顶着错误的时区在用 Claude -->
+	<key>StartInterval</key><integer>300</integer>
 	<key>RunAtLoad</key><true/>
 </dict></plist>

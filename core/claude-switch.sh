@@ -2250,6 +2250,17 @@ bodyguard_status() {
     echo "ok:${lastkill:-待命}"
 }
 
+# 已安装的时区看门狗守着哪个目标值(读不到就输出空)。
+# 老安装件写的是 TARGET="America/New_York",set-region 同步时写的是不带引号的
+# TARGET=America/New_York,两种都得认,所以剥引号而不是匹配引号。
+tz_watchdog_target() {
+    # TZ_WATCHDOG_FILE 只为测试留口:默认读系统安装位置,测试指向临时文件,
+    # 否则「看门狗守错目标」这条断言会随开发机的真实安装状态飘。
+    local f="${1:-${TZ_WATCHDOG_FILE:-/Library/Application Support/claude-switcher/tz-watchdog.sh}}"
+    [ -r "$f" ] || return 0
+    sed -n 's/^TARGET=//p' "$f" 2>/dev/null | head -1 | tr -d '"'
+}
+
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
@@ -2325,10 +2336,17 @@ checkdetail() {
     tz=$(readlink /etc/localtime 2>/dev/null); tz=${tz##*/zoneinfo/}
     if [ -z "$TZ_TARGET" ]; then
         config_result "时区" "环境层未就绪(未取到时区目标) · 点「一键修复」"
-    elif [ "$tz" = "$TZ_TARGET" ]; then
-        echo '时区=ok'
-    else
+    elif [ "$tz" != "$TZ_TARGET" ]; then
         echo "时区=fail:当前 ${tz:-未知},期望 $TZ_TARGET · 点「一键修复」对齐"
+    else
+        # 时区对了还不够:看门狗若守着别的目标,会在 5 分钟内把它改回去,
+        # 用户只会看到「修好了又坏了」。这一条以前从来没检查过。
+        wt=$(tz_watchdog_target)
+        if [ -n "$wt" ] && [ "$wt" != "$TZ_TARGET" ]; then
+            echo "时区=warn:当前值正确,但看门狗仍守着 $wt · 会自己改回去,点「一键修复」同步"
+        else
+            echo '时区=ok'
+        fi
     fi
     locale=$(defaults read -g AppleLocale 2>/dev/null)
     if [ -z "$LOCALE_TARGET" ]; then
@@ -2561,6 +2579,16 @@ fix() {
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
     adminCmds=""
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
+    # 看门狗是「修完能留住」的唯一保障。它守着旧目标时,上面这行改完 5 分钟内就被改回去,
+    # 用户看到的就是「一键修复没生效」——所以必须和系统时区在同一次授权里一起对齐。
+    wt=$(tz_watchdog_target)
+    if [ -n "$wt" ] && [ "$wt" != "$TZ_TARGET" ]; then
+        adminCmds="${adminCmds}/usr/bin/sed -i '' 's|^TARGET=.*|TARGET=$TZ_TARGET|' '/Library/Application Support/claude-switcher/tz-watchdog.sh'; "
+    fi
+    # 装了 plist 却没 bootstrap(重装/系统升级后常见)时,看门狗是死的,一并拉起来
+    if [ -f /Library/LaunchDaemons/local.tz-watchdog.plist ] && ! launchctl print system/local.tz-watchdog >/dev/null 2>&1; then
+        adminCmds="${adminCmds}launchctl bootstrap system /Library/LaunchDaemons/local.tz-watchdog.plist; "
+    fi
     echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         adminCmds="${adminCmds}cp $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ && chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist && launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist; "
