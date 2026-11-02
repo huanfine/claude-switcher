@@ -2261,6 +2261,42 @@ tz_watchdog_target() {
     sed -n 's/^TARGET=//p' "$f" 2>/dev/null | head -1 | tr -d '"'
 }
 
+# 内核实际在用的上游解析器(只取 nameserver / default-nameserver / fallback 三个块)。
+# nameserver-policy 里的按域名策略不算 —— 那只影响个别域名,报出来是噪音。
+dns_upstream_resolvers() {
+    local f="$CLASH_DIR/clash-verge.yaml"
+    [ -r "$f" ] || return 0
+    awk '
+        /^dns:[[:space:]]*$/ { d = 1; key = ""; next }
+        d && /^[^[:space:]]/  { d = 0 }
+        d && /^  [a-zA-Z-]+:/ { key = $1; sub(/:$/, "", key); next }
+        d && /^  - / && (key == "nameserver" || key == "default-nameserver" || key == "fallback") {
+            v = $2; gsub(/"/, "", v); print v
+        }
+    ' "$f" | sort -u
+}
+
+# 哪些上游是「从国内发起查询」的。命中就说明解析路径和出口地域不一致:
+# 权威 DNS 会通过 ECS 看到发起地网段,而 TCP 却从海外出口出去。
+# 实测过:nameserver 用 alidns 时,edns.ip-api.com 报回来的 ECS 是中国移动的网段。
+dns_cn_resolvers() {
+    local v out="" n=0 shown=0
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        case "$v" in
+            *223.5.5.5*|*223.6.6.6*|*119.29.29.29*|*114.114.114.114*|*180.76.76.76*|\
+            *doh.pub*|*alidns.com*|*dnspod*|*360.cn*dns*|*baidu.com*)
+                n=$((n + 1))
+                if [ "$shown" -lt 3 ]; then
+                    out="$out ${v#*//}"
+                    shown=$((shown + 1))
+                fi ;;
+        esac
+    done <<< "$(dns_upstream_resolvers)"
+    [ "$n" -gt "$shown" ] && out="$out 等${n}个"
+    printf '%s' "${out# }"
+}
+
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
@@ -2363,7 +2399,16 @@ checkdetail() {
     else
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
         case "$dnsip" in
-            "$FAKE_PREFIX"*) optional_result "DNS" ok "走隧道" ;;
+            "$FAKE_PREFIX"*)
+                # fake-ip 只证明「本机解析被接管了」,证明不了 mihomo 的上游从哪出去。
+                # 上游要是国内 DoH,查询就从国内发起,ECS 会把发起地网段带给权威 DNS ——
+                # 于是「连接从美国出去、解析从中国发起」,正是风控看的地域矛盾。
+                cnres=$(dns_cn_resolvers)
+                if [ -n "$cnres" ]; then
+                    optional_result "DNS" warn "本机已接管,但上游解析器在国内(${cnres}) · 解析与出口地域不一致"
+                else
+                    optional_result "DNS" ok "走隧道"
+                fi ;;
             *) optional_result "DNS" fail "未走隧道(${dnsip:-空})" ;;
         esac
     fi

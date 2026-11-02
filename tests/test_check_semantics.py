@@ -157,6 +157,41 @@ esac''')
         self.assertNotEqual(check.returncode, 0)
         self.assertIn("环境未配置(时区目标缺失", check.stdout)
 
+    def test_cn_upstream_resolver_is_warn_not_ok(self):
+        """fake-ip 只能证明「本机解析被接管」,证明不了 mihomo 的上游从哪出去。
+
+        上游是国内 DoH 时,查询从国内发起,ECS 会把发起地网段带给权威 DNS ——
+        连接从海外出去、解析从国内发起,正是风控看的地域矛盾。
+        """
+        value = self.dns_line("dns:\n  nameserver:\n  - https://dns.alidns.com/dns-query\n"
+                              "  default-nameserver:\n  - 223.5.5.5\n")
+        self.assertTrue(value.startswith("warn:"), value)
+        self.assertIn("alidns", value)
+        self.assertIn("地域不一致", value)
+
+    def test_foreign_upstream_resolver_stays_ok(self):
+        value = self.dns_line("dns:\n  nameserver:\n  - https://dns.google/dns-query\n"
+                              "  - 1.1.1.1\n")
+        self.assertEqual(value, "ok:走隧道", value)
+
+    def test_per_domain_policy_is_not_counted(self):
+        """nameserver-policy 只影响个别域名,报出来是噪音,不该让整项变黄。"""
+        value = self.dns_line("dns:\n  nameserver:\n  - https://dns.google/dns-query\n"
+                              "  nameserver-policy:\n    inter-90v.pages.dev:\n"
+                              "    - https://dns.alidns.com/dns-query\n")
+        self.assertEqual(value, "ok:走隧道", value)
+
+    def dns_line(self, dns_yaml):
+        clash = Path(self.tmp.name) / "clash"
+        clash.mkdir(exist_ok=True)
+        (clash / "clash-verge.yaml").write_text(dns_yaml + "proxies:\n- name: x\n", encoding="utf-8")
+        env = dict(self.env, CLAUDE_SWITCHER_CLASH_DIR=str(clash))
+        run = subprocess.run(["/bin/bash", str(self.core()), "checkdetail"], text=True,
+                             capture_output=True, env=env, timeout=60)
+        value = self.line(run.stdout, "DNS")
+        self.assertIsNotNone(value, run.stdout + run.stderr)
+        return value
+
     def test_rule_hint_turns_kernel_errors_into_actions(self):
         """内核校验的错误要翻成「缺什么 + 点哪里」,而不是原样抛给用户。"""
         text = SOURCE.read_text(encoding="utf-8")
