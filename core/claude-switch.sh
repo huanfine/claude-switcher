@@ -1869,11 +1869,18 @@ check() {
         { [ "$r1" = "000" ] || [ "$r2" = "000" ]; } && optional_failure "Anthropic生态不可达($r1/$r2)"
     fi
 
+    # 关掉某项防护是用户自己的选择,但不能是「悄悄没了」:门禁输出里必须留痕。
+    # 命令行、日志、自动化这些看不到界面的地方,靠这一句才知道本次判定是降级过的。
+    degrade=""
+    if [ -n "${CHECKS_DISABLED:-}" ]; then
+        degrade="防护降级:${CHECKS_DISABLED//,/、} 已关闭,未参与本次判定"
+    fi
+
     if [ -n "$fails" ]; then
         echo "FAIL:${fails#;}"
         return 1
     fi
-    echo "OK:${ip:-未确认}${ipwarn:+|$ipwarn}"
+    echo "OK:${ip:-未确认}${ipwarn:+|$ipwarn}${degrade:+|$degrade}"
     return 0
 }
 

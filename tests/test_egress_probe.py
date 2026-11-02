@@ -196,10 +196,18 @@ class IpIdentityTests(unittest.TestCase):
 class CheckEgressGateTests(unittest.TestCase):
     """check() 面对 unknown 与 unstable 的两种不同处理。"""
 
-    def run_check(self, curl_body):
+    def run_check(self, curl_body, disabled=""):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "Library" / "Logs").mkdir(parents=True, exist_ok=True)
-            src = CHECK_HARNESS + "\ncurl() { %s; }\n" % curl_body + \
+            # 需要模拟「用户关掉了某项」时,把 check_disabled 换成真读 CHECKS_DISABLED 的版本
+            # (后面定义的同名函数覆盖 harness 里的桩)。
+            override = ""
+            if disabled:
+                override = (
+                    'CHECKS_DISABLED="%s"\n'
+                    'check_disabled() { case ",$CHECKS_DISABLED," in *",$1,"*) return 0 ;; '
+                    '*) return 1 ;; esac; }\n' % disabled)
+            src = CHECK_HARNESS + "\ncurl() { %s; }\n" % curl_body + override + \
                 IP_HELPERS + "\n" + PROBE_FN + "\n" + CHECK_FN + "\ncheck\n"
             env = dict(os.environ, HOME=tmp)
             return subprocess.run(["/bin/bash", "-c", src], env=env, cwd=tmp,
@@ -218,6 +226,21 @@ class CheckEgressGateTests(unittest.TestCase):
                                  text=True, capture_output=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertNotIn("与上次不同", run.stdout)
+
+    def test_disabled_checks_are_named_in_the_gate_output(self):
+        # 关掉某项防护是用户的选择,但不能是「悄悄没了」:门禁输出里必须留痕,
+        # 否则命令行、日志、自动化这些看不到界面的地方就完全无从判断。
+        run = self.run_check("printf 'ip=198.51.100.2\\nloc=US\\n'",
+                             disabled="WebRTC,客户端语言")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("防护降级", run.stdout)
+        self.assertIn("WebRTC", run.stdout)
+        self.assertIn("客户端语言", run.stdout)
+
+    def test_no_degradation_note_when_nothing_is_disabled(self):
+        run = self.run_check("printf 'ip=198.51.100.2\\nloc=US\\n'")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("防护降级", run.stdout)
 
     def test_unknown_does_not_block_launch(self):
         # 抖动导致的取不到,不该拦住 Claude 启动;但必须写明「未确认」。

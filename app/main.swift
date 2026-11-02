@@ -784,13 +784,9 @@ struct ContentView: View {
 
     var checksCard: some View {
         VStack(spacing: 0) {
-            sectionHeader("必须通过 · 不可关闭", rows: hardRows)
-            rowGroup(hardRows)
-            Divider()
-                .overlay(ClaudeTheme.divider)
-                .padding(.top, 6)
-            sectionHeader("可关闭 · 默认仍拦启动", rows: softRows)
-            rowGroup(softRows)
+            sectionHeader()
+            rowGroup(vm.rows)
+            if !vm.disabledChecks.isEmpty { degradationStrip }
         }
         .padding(.bottom, 7)
         .background(ClaudeTheme.card)
@@ -802,19 +798,16 @@ struct ContentView: View {
         .shadow(color: Color(red: 0.2, green: 0.16, blue: 0.12).opacity(0.035), radius: 6, x: 0, y: 2)
     }
 
-    /// 8 项硬性检查不可关闭;其余 6 项可在设置里关闭或降级为警告。
-    /// 分组的意义:失败时用户能立刻看出「这项我能不能关掉」,不用去设置页试。
-    private var hardRows: [CheckRow] { vm.rows.filter { !$0.canDisable } }
-    private var softRows: [CheckRow] { vm.rows.filter { $0.canDisable } }
-
-    /// 组标题带「未通过/总数」,扫一眼就知道哪一组在拖后腿。
-    private func sectionHeader(_ title: String, rows: [CheckRow]) -> some View {
-        let bad = rows.filter { $0.state == .fail || $0.state == .config }.count
+    /// 14 项默认全部拦启动,所以不分组。原来按「能不能关」分成两组,结果是主界面上
+    /// 出现了「可关闭」四个字 —— 一个安全工具不该主动告诉用户哪些防护可以关掉。
+    /// 能关这件事只体现在设置页,而且要在界面上显式承认「已经降级」。
+    private func sectionHeader() -> some View {
+        let bad = vm.rows.filter { $0.state == .fail || $0.state == .config }.count
         return HStack(spacing: 6) {
-            Text(title)
+            Text("环境审计")
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundColor(ClaudeTheme.muted)
-            Text(bad > 0 ? "\(bad)/\(rows.count) 未通过" : "\(rows.count) 项")
+            Text(bad > 0 ? "\(bad)/\(vm.rows.count) 未通过" : "\(vm.rows.count) 项")
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundColor(bad > 0 ? ClaudeTheme.error : ClaudeTheme.muted.opacity(0.7))
             Spacer()
@@ -822,6 +815,25 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.top, 9)
         .padding(.bottom, 3)
+    }
+
+    /// 被主动关掉的防护项。一旦有就常驻显示 —— 关掉是用户的选择,
+    /// 但不能是「悄悄没了」:下次看到「全部通过」时必须知道它是不完整的。
+    private var degradationStrip: some View {
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10))
+                .foregroundColor(ClaudeTheme.warning)
+                .padding(.top, 1)
+            Text("防护已降级：\(vm.disabledChecks.sorted().joined(separator: "、")) 已关闭，这几项不再拦截启动")
+                .font(.system(size: 10.5))
+                .foregroundColor(ClaudeTheme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(ClaudeTheme.warning.opacity(0.10))
     }
 
     private func rowGroup(_ rows: [CheckRow]) -> some View {
@@ -1079,7 +1091,7 @@ struct ContentView: View {
     var footer: some View {
         HStack(spacing: 10) {
             Image(systemName: "lock.shield").font(.caption2)
-            Text("必须通过项不可关闭；可关闭项也要在设置里显式关掉才不拦；灰色跳过不表示通过").font(.caption2)
+            Text("14 项全部参与拦截；灰色「已跳过」= 你在设置里关掉了这项防护，不代表通过").font(.caption2)
             Spacer()
             Button {
                 vm.checkUpdate()
@@ -1125,18 +1137,25 @@ struct CheckSettingsView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        GroupBox("可自定义的非关键检查") {
+                        GroupBox("降级防护（不推荐）") {
                             VStack(alignment: .leading, spacing: 10) {
                                 ForEach(VM.optionalChecks, id: \.key) { item in
-                                    Toggle(item.label, isOn: Binding(
-                                        get: { !vm.disabledChecks.contains(item.key) },
-                                        set: { enabled in
-                                            if enabled { vm.disabledChecks.remove(item.key) }
-                                            else { vm.disabledChecks.insert(item.key) }
+                                    HStack(spacing: 8) {
+                                        Toggle(item.label, isOn: Binding(
+                                            get: { !vm.disabledChecks.contains(item.key) },
+                                            set: { enabled in
+                                                if enabled { vm.disabledChecks.remove(item.key) }
+                                                else { vm.disabledChecks.insert(item.key) }
+                                            }
+                                        ))
+                                        if vm.disabledChecks.contains(item.key) {
+                                            Text("已关闭 · 不再拦截启动")
+                                                .font(.caption2)
+                                                .foregroundColor(ClaudeTheme.warning)
                                         }
-                                    ))
+                                    }
                                 }
-                                Text("关闭后会真正跳过对应探测，并以灰色“已跳过”显示。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。")
+                                Text("默认 14 项全部拦截启动。这里关掉的项会真正跳过探测，并以灰色「已跳过」显示 —— 那不叫通过，叫放弃验证。只在本机环境确实造成误报时才关。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。")
                                     .font(.caption2).foregroundColor(ClaudeTheme.muted)
                             }
                             .padding(.vertical, 6)
@@ -1144,8 +1163,8 @@ struct CheckSettingsView: View {
 
                         GroupBox("失败处理与日志") {
                             VStack(alignment: .leading, spacing: 10) {
-                                Toggle("将上述非关键项的失败降为警告", isOn: $vm.allowOptionalFailures)
-                                Text("只影响这 6 项；不会放宽任何硬性安全项，也不会自动关闭检测。")
+                                Toggle("把上述 6 项的失败降为警告", isOn: $vm.allowOptionalFailures)
+                                Text("降级后这些项仍然会跑、仍然会报，只是不再拦住启动。只影响这 6 项；不会放宽任何硬性安全项，也不会自动关闭检测。")
                                     .font(.caption2).foregroundColor(ClaudeTheme.muted)
                                 Toggle("记录脱敏客户端日志", isOn: $vm.loggingEnabled)
                                 Text("仅记录版本、命令、退出码、耗时和检查状态，不记录 IP、凭据或账号内容。")
