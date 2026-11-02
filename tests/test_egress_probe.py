@@ -34,7 +34,8 @@ CHECK_FN = extract("check")
 
 # 出口身份归一:check() 与 probe_egress() 都靠它,隔离环境里必须一起带上。
 IP_HELPERS = "\n".join(extract(n) for n in (
-    "ip_key", "ip_show", "ip_key_migrate", "last_seen", "last_save"))
+    "ip_key", "ip_show", "ip_key_migrate", "ip_org", "ip_class",
+    "last_seen", "last_save"))
 
 # check() 依赖的一整套外部命令。curl 由各用例按需覆盖,用来模拟三种出口状态。
 CHECK_HARNESS = r"""
@@ -196,9 +197,11 @@ class IpIdentityTests(unittest.TestCase):
 class CheckEgressGateTests(unittest.TestCase):
     """check() 面对 unknown 与 unstable 的两种不同处理。"""
 
-    def run_check(self, curl_body, disabled=""):
+    def run_check(self, curl_body, disabled="", lastip=None):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "Library" / "Logs").mkdir(parents=True, exist_ok=True)
+            if lastip:
+                (Path(tmp) / "lastip").write_text(lastip, encoding="utf-8")
             # 需要模拟「用户关掉了某项」时,把 check_disabled 换成真读 CHECKS_DISABLED 的版本
             # (后面定义的同名函数覆盖 harness 里的桩)。
             override = ""
@@ -226,6 +229,26 @@ class CheckEgressGateTests(unittest.TestCase):
                                  text=True, capture_output=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertNotIn("与上次不同", run.stdout)
+
+    def test_hosting_ip_change_is_flagged(self):
+        # 机房 IP 变动是明确的风控信号:固定出口是硬要求。
+        run = self.run_check(
+            'case "$*" in *ipinfo.io*) printf \'{"org":"AS14956 RouterHosting LLC"}\' ;; '
+            '*) printf \'ip=198.51.100.2\\nloc=US\\n\' ;; esac',
+            lastip="203.0.113.9")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("机房 IP 发生变动", run.stdout)
+
+    def test_residential_ip_change_is_not_flagged(self):
+        # 家宽 IP 定期轮换是正常网络行为。拿机房的标准套家宽,只会制造假警报,
+        # 最后用户学会忽略这条提示 —— 那比不提示更糟。
+        run = self.run_check(
+            'case "$*" in *ipinfo.io*) printf \'{"org":"AS7922 Comcast Cable Communications"}\' ;; '
+            '*) printf \'ip=198.51.100.2\\nloc=US\\n\' ;; esac',
+            lastip="203.0.113.9")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("与上次不同", run.stdout)
+        self.assertNotIn("机房", run.stdout)
 
     def test_disabled_checks_are_named_in_the_gate_output(self):
         # 关掉某项防护是用户的选择,但不能是「悄悄没了」:门禁输出里必须留痕,
@@ -291,6 +314,29 @@ class VerdictTests(unittest.TestCase):
             run = self.call("verdict", home=tmp)
         self.assertIn("VERDICT:violated", run.stdout)
         self.assertIn("blockers=规则置顶", run.stdout)
+
+    def test_config_is_a_blocker_not_a_pass(self):
+        # config = 环境层没就绪,它和 fail 一样拦启动。早先解析只认 ok/warn/fail/skip,
+        # config 行被直接丢掉 —— 离线复核会把「没配好」判成 established。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / ".claude-switcher"
+            base.mkdir()
+            (base / "last-check.txt").write_text(
+                "代理内核=ok:x\n规则置顶=config:环境层未就绪(未取到代理组) · 点「一键修复」\n",
+                encoding="utf-8")
+            run = self.call("verdict", home=tmp)
+        self.assertIn("VERDICT:violated", run.stdout)
+        self.assertIn("blockers=规则置顶", run.stdout)
+
+    def test_all_skipped_is_incomplete_not_established(self):
+        # 检查项全关掉之后,「没有失败」不等于「验过了」。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / ".claude-switcher"
+            base.mkdir()
+            (base / "last-check.txt").write_text(
+                "WebRTC=skip:用户已禁用\nDNS=skip:用户已禁用\n", encoding="utf-8")
+            run = self.call("verdict", home=tmp)
+        self.assertIn("VERDICT:incomplete", run.stdout)
 
     def test_empty_report_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

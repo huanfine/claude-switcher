@@ -279,7 +279,10 @@ def main(args):
             name, _, rest = line.partition("=")
             status, _, detail = rest.partition(":")
             status = status.strip()
-            if status not in ("ok", "warn", "fail", "skip"):
+            # config = 环境层没就绪(代理组/目标值缺失)。它和 fail 一样拦启动,
+            # 所以必须计入 blockers —— 早先这里只认 ok/warn/fail/skip,config 行被
+            # 直接丢掉,离线复核会把「没配好」判成 established。
+            if status not in ("ok", "warn", "fail", "skip", "config"):
                 continue
             name = name.strip()
             if not name:
@@ -289,12 +292,20 @@ def main(args):
             items[name] = (status, detail.strip())
         if not order:
             fail()
-        blockers = [n for n in order if items[n][0] == "fail"]
+        blockers = [n for n in order if items[n][0] in ("fail", "config")]
         advisories = [n for n in order if items[n][0] == "warn"]
         skipped = [n for n in order if items[n][0] == "skip"]
-        # 三态判定:有 fail 即 violated;没有 fail 才 established;无可用项是 incomplete。
-        # 关键点是 warn/unknown 不会被提升成 pass——和在线检查的 fail-closed 同一口径。
-        print("VERDICT:" + ("violated" if blockers else "established"))
+        verified = [n for n in order if items[n][0] in ("ok", "warn")]
+        # 三态:有 fail/config 即 violated;一项都没真正验证是 incomplete;否则 established。
+        # 关键点是 warn/skip 不会被提升成 pass——和在线检查的 fail-closed 同一口径。
+        # incomplete 这一档是必要的:把检查项全关掉之后,「没有失败」不等于「验过了」。
+        if blockers:
+            verdict = "violated"
+        elif not verified:
+            verdict = "incomplete"
+        else:
+            verdict = "established"
+        print("VERDICT:" + verdict)
         print("items=" + ",".join(order))
         print("blockers=" + ",".join(blockers))
         print("advisories=" + ",".join(advisories))
@@ -1657,6 +1668,54 @@ ip_key_migrate() {
     esac
 }
 
+# 出口 ASN / 运营商。一次检查里只查一次:出口变了要判类型、ASN 检查项也要用它,
+# 查两次纯属浪费,而且两次之间出口可能正好在飘。
+IP_ORG=""; IP_ORG_LOOKED="0"
+ip_org() {
+    [ "$IP_ORG_LOOKED" = "1" ] && { printf '%s' "$IP_ORG"; return 0; }
+    IP_ORG_LOOKED="1"
+    [ -z "${1:-}" ] && return 0
+    # 必须查「实际出口 IP」的 ASN。直接查 ipinfo.io/json 取的是访问 ipinfo 自身
+    # 那条链路的出口,在分流配置下可能与受保护流量的出口不是同一个 IP,
+    # 从而报出不相干的 ASN(例如受保护出口是机房 A,却报成 Cloudflare)。
+    IP_ORG=$(curl -s --max-time 6 "https://ipinfo.io/$1/json" 2>/dev/null | grep '"org"' | cut -d'"' -f4)
+    printf '%s' "$IP_ORG"
+}
+
+# 出口类型:residential(运营商宽带) / hosting(机房) / unknown。
+# 参考 net.coffee 的 Claude Code 指南第 2 条:家宽 IP 定期变动是正常网络行为,
+# 机房 IP 变动才是风控信号。所以「IP 变了」这件事不能一律同等对待 ——
+# 拿同一个阈值套两种出口,结果就是家宽用户天天看到假警报、机房用户没被提醒。
+ip_class() {
+    local o
+    # 先把 org 串归一:转小写、去掉空格和逗号。
+    # 两个原因:(1) ipinfo 的 org 大小写不统一("Korea Telecom" / "KOREA TELECOM");
+    # (2) case 的模式是「词」,里面的空格和 & 会终止词、直接触发语法错误,
+    #     归一之后模式里就不需要任何转义,也不用担心哪天名单里多个空格就崩。
+    o=$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z' | tr -d ' ,')
+    case "$o" in
+        '') printf 'unknown' ;;
+        # 名单按 set-region 支持的目标地区收:US/JP/KR/TW/SG/HK/GB/DE/CA/AU。
+        # 误判成 residential 的方向更危险 —— 那会让真正的机房出口免于告警,
+        # 所以宁可少收录,也不要用 *bt* / *m1* 这种会撞上无关公司的短词。
+        # 同理不收录 1&1:ipinfo 报的是 "1&1 IONOS SE",那是它的云主机业务。
+        # (模式列表里不能夹注释 —— 反斜杠续行会把注释并进同一条命令,直接语法错。)
+        *comcast*|*at\&t*|*verizon*|*spectrum*|*charter*|*cox*|*t-mobile*|*cable*|*esidential*|\
+        *centurylink*|*frontier*|*windstream*|*mediacom*|*suddenlink*|\
+        *ntt*|*kddi*|*softbank*|*iij*|*ocn*|*so-net*|\
+        *koreatelecom*|*ktcorp*|*skbroadband*|*sktelecom*|*lgu+*|*lgpowercomm*|*dacom*|\
+        *hinet*|*chunghwa*|*kbro*|*taiwan*|*fareastone*|*datacommunication*|\
+        *singtel*|*starhub*|*m1limited*|\
+        *hkt*|*pccw*|*hkbn*|*hgc*|\
+        *britishtelecom*|*btgroup*|*skybroadband*|*virginmedia*|*talktalk*|*vodafone*|\
+        *deutschetelekom*|*telefonicagermany*|*o2germany*|\
+        *bellcanada*|*rogers*|*telus*|*shawcommunications*|\
+        *telstra*|*optus*|*tpg*|*iinet*) printf 'residential' ;;
+        *) printf 'hosting' ;;
+    esac
+}
+
+
 # IP 审查:记录出口IP并统计最近48h内不同出口个数(账号画像风险指标)
 iphist_count() {
     [ -z "$1" ] && { echo 0; return; }
@@ -1790,16 +1849,38 @@ check() {
         curkey=""; [ -n "$ip" ] && curkey=$(ip_key "$ip")
         if [ -n "$curkey" ]; then
             lastip=$(last_seen "${curkey%%:*}")
-            if [ -n "$lastip" ] && [ "$curkey" != "$lastip" ]; then
-                ipwarn="注意:出口IP与上次不同($(ip_show "$lastip") -> $(ip_show "$curkey"))"
-            fi
-            last_save "$curkey"
-        fi
+            changed=""
+            [ -n "$lastip" ] && [ "$curkey" != "$lastip" ] && changed="1"
 
-        # IP 审查:48h 内出口 IP 变化 ≥3 次追加警告(只 warn 不 fail)
-        ipn=$(iphist_count "$ip")
-        if [ "$ipn" -ge 3 ] 2>/dev/null; then
-            ipwarn="${ipwarn:+$ipwarn; }注意:48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
+            # IP 审查:48h 内不同出口个数(账号画像风险指标)
+            ipn=$(iphist_count "$curkey")
+
+            # 只有「变了」或「次数到了」才去查 ASN —— 正常路径不多付一次网络请求。
+            need_org=""
+            [ -n "$changed" ] && need_org="1"
+            case "${ipn:-0}" in ''|*[!0-9]*) ;; *) [ "$ipn" -ge 3 ] && need_org="1" ;; esac
+            klass=""
+            [ -n "$need_org" ] && klass=$(ip_class "$(ip_org "$ip")")
+
+            case "$klass" in
+                residential)
+                    # 家宽换 IP 是运营商在正常轮换,不告警;次数多也不代表风控风险。
+                    ;;
+                hosting)
+                    if [ -n "$changed" ]; then
+                        ipwarn="注意:机房 IP 发生变动($(ip_show "$lastip") -> $(ip_show "$curkey")) · 机房出口应固定一个长期使用"
+                    elif [ "${ipn:-0}" -ge 3 ] 2>/dev/null; then
+                        ipwarn="注意:48h内机房出口变动${ipn}次 · 机房 IP 漂移是明确的风控信号,固定一个出口"
+                    fi ;;
+                *)
+                    # 类型未知时按原来的保守口径:变了就提示,不猜它是家宽还是机房。
+                    if [ -n "$changed" ]; then
+                        ipwarn="注意:出口IP与上次不同($(ip_show "$lastip") -> $(ip_show "$curkey"))"
+                    elif [ "${ipn:-0}" -ge 3 ] 2>/dev/null; then
+                        ipwarn="注意:48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
+                    fi ;;
+            esac
+            last_save "$curkey"
         fi
     fi
 
@@ -2172,19 +2253,33 @@ checkdetail() {
         if [ -z "$ip" ]; then ipst="fail"; ipdt="未获取到出口IP · 检查网络后重新检查"
         else
             lastip=$(last_seen "${curkey%%:*}")
+            # IP 审查:48h 内不同出口个数(账号画像风险指标)
+            ipn=$(iphist_count "$curkey")
+            changed=""; [ -n "$lastip" ] && [ "$curkey" != "$lastip" ] && changed="1"
+            need_org=""
+            [ -n "$changed" ] && need_org="1"
+            case "${ipn:-0}" in ''|*[!0-9]*) ;; *) [ "$ipn" -ge 3 ] && need_org="1" ;; esac
+            klass=""
+            [ -n "$need_org" ] && klass=$(ip_class "$(ip_org "$ip")")
+
             if [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
-            elif [ "$curkey" = "$lastip" ]; then ipst="ok"
-            else ipst="warn"; ipdt="$(ip_show "$lastip") → $(ip_show "$curkey")"; fi
-            last_save "$curkey"
-        fi
-        # IP 审查:48h 内出口 IP 变化 ≥3 次提示账号画像风险(只 warn 不 fail)
-        ipn=$(iphist_count "$ip")
-        if [ "$ipn" -ge 3 ] 2>/dev/null; then
-            if [ "$ipst" = "ok" ]; then
-                ipst="warn"; ipdt="48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
+            elif [ -z "$changed" ]; then ipst="ok"
             else
-                ipdt="$ipdt;48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
+                case "$klass" in
+                    residential) ipst="ok"; ipdt="住宅 IP 变动 · 运营商正常轮换,不算风险" ;;
+                    hosting) ipst="warn"; ipdt="机房 IP 变动:$(ip_show "$lastip") → $(ip_show "$curkey") · 机房出口应固定一个" ;;
+                    *) ipst="warn"; ipdt="$(ip_show "$lastip") → $(ip_show "$curkey")" ;;
+                esac
             fi
+            # 次数阈值同样分类型:家宽轮换再多次也不构成风险信号。
+            if [ "${ipn:-0}" -ge 3 ] 2>/dev/null && [ "$klass" != "residential" ]; then
+                if [ "$ipst" = "ok" ]; then
+                    ipst="warn"; ipdt="48h内出口变动${ipn}次,建议固定节点"
+                else
+                    ipdt="$ipdt;48h内出口变动${ipn}次"
+                fi
+            fi
+            last_save "$curkey"
         fi
         optional_result "IP一致" "$ipst" "$ipdt"
     fi
@@ -2272,36 +2367,33 @@ checkdetail() {
     if check_disabled "ASN属性"; then
         optional_result "ASN属性" ok
     else
-        # 必须查「实际出口 IP」的 ASN。直接查 ipinfo.io/json 取的是访问 ipinfo 自身
-        # 那条链路的出口,在分流配置下可能与受保护流量的出口不是同一个 IP,
-        # 从而报出不相干的 ASN(例如受保护出口是机房 A,却报成 Cloudflare)。
-        if [ -n "$ip" ]; then
-            org=$(curl -s --max-time 6 "https://ipinfo.io/${ip}/json" 2>/dev/null | grep '"org"' | cut -d'"' -f4)
-        else
-            org=""
-        fi
-        case "$org" in
-            '') optional_result "ASN属性" warn "未获取" ;;
-            *Comcast*|*AT\&T*|*Verizon*|*Spectrum*|*Charter*|*Cox*|*T-Mobile*|*Cable*|*esidential*|\
-            *NTT*|*KDDI*|*SoftBank*|*IIJ*|*OCN*|*So-net*|\
-            *HiNet*|*Chunghwa*|*CHT*|*kbro*|*Taiwan*|*FarEasTone*|*Data\ Communication*|\
-            *Singtel*|*StarHub*|*M1*|\
-            *HKT*|*PCCW*|*HKBN*|*HGC*|\
-            *BT*|*Sky*|*Virgin*|*TalkTalk*|*Vodafone*|\
-            *Deutsche\ Telekom*|*1\&1*|*O2*) optional_result "ASN属性" ok "$org" ;;
-            *) optional_result "ASN属性" warn "疑似机房($org) · 建议换住宅节点" ;;
+        # 出口 ASN 只查一次(ip_org 有缓存),类型判定与「IP 一致」共用同一套口径。
+        org=$(ip_org "$ip")
+        case "$(ip_class "$org")" in
+            residential) optional_result "ASN属性" ok "$org" ;;
+            hosting)     optional_result "ASN属性" warn "疑似机房($org) · 建议换住宅节点" ;;
+            *)           optional_result "ASN属性" warn "未获取" ;;
         esac
     fi
     # 14. Anthropic 生态可达性
     if check_disabled "生态可达性"; then
         optional_result "生态可达性" ok
     else
-        r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://claude.ai/ 2>/dev/null)
-        r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models 2>/dev/null)
-        if [ "$r1" != "000" ] && [ "$r2" != "000" ]; then
-            optional_result "生态可达性" ok "claude.ai:$r1 api:$r2"
+        # 首包时间顺手带上:参考里的「路径要短且干净」是一条,但我们只能观测、不能判断,
+        # 所以只报数字,不替你下结论(亚洲访问 100ms 以上本来也正常)。
+        r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}:%{time_starttransfer}' https://claude.ai/ 2>/dev/null)
+        r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}:%{time_starttransfer}' https://api.anthropic.com/v1/models 2>/dev/null)
+        c1=${r1%%:*}; t1=${r1##*:}
+        c2=${r2%%:*}; t2=${r2##*:}
+        [ -z "$c1" ] && c1="000"
+        [ -z "$c2" ] && c2="000"
+        ms2=$(awk -v t="${t2:-0}" 'BEGIN{printf "%d", t*1000+0.5}' 2>/dev/null)
+        detail="claude.ai:$c1 api:$c2"
+        case "${ms2:-}" in ''|*[!0-9]*|0) ;; *) detail="$detail · api 首包 ${ms2}ms" ;; esac
+        if [ "$c1" != "000" ] && [ "$c2" != "000" ]; then
+            optional_result "生态可达性" ok "$detail"
         else
-            optional_result "生态可达性" fail "claude.ai:$r1 api:$r2 · 换条线路后重新检查"
+            optional_result "生态可达性" fail "$detail · 换条线路后重新检查"
         fi
     fi
 }
@@ -3296,7 +3388,7 @@ case "$operation" in
             echo "# 结束"
         } > "$OUT_FILE" 2>&1
         cat "$OUT_FILE"
-        summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
+        summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
         ;;
     fix) fix ;;
     status) status ;;
