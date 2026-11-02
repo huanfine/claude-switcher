@@ -1119,7 +1119,10 @@ def assess_probe(policy, expected_ip, output, exit_code):
     try:
         expected = ipaddress.IPv4Address(expected_ip)
     except ValueError:
-        return "fail:未获取有效的 IPv4 出口，无法比对 STUN 结果"
+        # 出口是 IPv6(或压根取不到)时,STUN 只回 IPv4,本来就无从比对。
+        # 这不是「检测到泄漏」,判 fail 等于把一个测不出来的东西当成没通过,
+        # 用户会被拦在门外 —— 和「没配好 ≠ 不安全」是同一条原则。
+        return "warn:出口不是 IPv4,STUN 结果无从比对"
     if output == "RESULT:NONE":
         if policy == "reject":
             return "ok:常见 STUN UDP 拒绝规则已验证，探测无响应"
@@ -2171,12 +2174,16 @@ webrtc_status() {
     case "$exitip" in
         *:*)
             exitip=$(curl -4 -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
-            if [ -z "$exitip" ]; then
-                # 真的只有 v6 出口:IPv4 的 STUN 结果本来就无从比对。
-                # 这不是泄漏,但也不能当作已验证 —— 明确说成 warn,不拦启动。
-                echo "warn:出口只有 IPv6,STUN 结果无法比对"
-                return
-            fi ;;
+            # 注意 curl -4 也可能拿回 v6:节点本身是 v6-only 出口时,Cloudflare 看到的
+            # 就是节点的 v6 地址,和请求的协议族无关(实测 2602:fa59:10:503::1)。
+            # 所以这里不能只判空,必须确认拿到的真是 IPv4。
+            case "$exitip" in
+                ''|*:*)
+                    # 真的没有 v4 出口:IPv4 的 STUN 结果本来就无从比对。
+                    # 这不是泄漏,但也不能当作已验证 —— 明确说成 warn,不拦启动。
+                    echo "warn:出口只有 IPv6,STUN 结果无法比对"
+                    return ;;
+            esac ;;
     esac
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         mode=$(clash_mode)
