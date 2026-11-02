@@ -50,6 +50,8 @@
    ```
    图标用 `assets/icon-2048.png` 经 sips 生成 iconset 再 `iconutil -c icns` 打进 `Contents/Resources/AppIcon.icns`，`Info.plist` 声明 `CFBundleIconFile`，最后 `codesign --force --deep -s -`
 7. Clash Verge 模式下通过核心脚本的 `write-merge-rules` 隐藏入口生成「全局扩展脚本」(profiles/Script.js)，直接前置 `config.rules`，保留已有 main，备份并迁移 Merge.yaml 中本项目旧标记块；重启 Clash Verge 后必须验证内核 `/rules`。其他客户端提示用户自行添加 DOMAIN-SUFFIX 置顶规则
+
+   **重启必须真的重启**：改 Script.js 不会让运行中的内核换规则——Clash Verge 只在自身启动/应用配置时重新生成运行时配置，`clash-verge.yaml` 的时间戳会一直停在上次重启。而 `osascript -e 'tell application "Clash Verge" to quit'` 对这个 Tauri 应用**不生效**（实测 PID 不变），紧跟的 `open -a` 只是把窗口唤到前台，于是内核仍是旧规则、`verify` 失败、用户看到「置顶规则 ✗ 未验证内核加载」。`fix` 现在走 `quit_clash_verge`：先 AppleScript quit，等 8 秒没退就补 SIGTERM，确认进程消失后再 `open`，最后等 TUN 网卡出现。
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 

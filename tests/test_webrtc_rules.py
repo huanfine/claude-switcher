@@ -409,6 +409,44 @@ webrtc_test() { echo probe-called >&2; printf '%s' "$PROBE_RESULT"; return "$PRO
         return subprocess.run([bash, "-c", code + match.group(0) + '\nwebrtc_status "203.0.113.1"'],
                               env=env, text=True, encoding="utf-8", capture_output=True, timeout=5)
 
+    def run_status_with_exit(self, exit_ip, curl_body):
+        """固定出口 IP 跑 webrtc_status,curl 用来模拟 v4 出口探测。"""
+        source = SOURCE.read_text(encoding="utf-8")
+        match = re.search(r"(?ms)^webrtc_status\(\) \{\n.*?^\}", source)
+        self.assertIsNotNone(match)
+        bash = (str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe")
+                if os.name == "nt" else "/bin/bash")
+        code = r'''
+set -u
+PROXY_MODE=clash-verge
+clash_rules() {
+    case "$1" in
+        verify) echo OK ;;
+        assess) printf 'ok:assessed:%s:%s\n' "$2" "$3" ;;
+    esac
+}
+clash_mode() { echo rule; }
+webrtc_test() { printf 'RESULT:198.51.100.9'; return 0; }
+curl() { ''' + curl_body + r'''; }
+'''
+        return subprocess.run([bash, "-c", code + match.group(0) + '\nwebrtc_status "' + exit_ip + '"'],
+                              text=True, encoding="utf-8", capture_output=True, timeout=5)
+
+    def test_v6_exit_compares_against_v4_exit(self):
+        # STUN 探针只返回 IPv4 地址。双栈节点在 v4/v6 之间来回报时,
+        # 拿 v6 出口去比必然判「无法比对」—— 而这会拦住启动。
+        run = self.run_status_with_exit("2602:fa59:10:503::1",
+                                        "printf 'ip=198.51.100.9\\nloc=US\\n'")
+        self.assertIn("assessed:198.51.100.9", run.stdout, run.stdout + run.stderr)
+        self.assertFalse(run.stdout.startswith("fail:"), run.stdout)
+
+    def test_v6_only_exit_is_warn_not_fail(self):
+        # 真的只有 v6 出口时,IPv4 的 STUN 结果本来就无从比对:
+        # 这不是泄漏,但也不能当作已验证。
+        run = self.run_status_with_exit("2602:fa59:10:503::1", "printf ''")
+        self.assertTrue(run.stdout.startswith("warn:"), run.stdout + run.stderr)
+        self.assertIn("IPv6", run.stdout)
+
     def test_flclash_no_response_is_unverified_not_safely_rejected(self):
         run = self.run_status(result="RESULT:NONE", mode="flclash")
         self.assertTrue(run.stdout.startswith("warn:"), run.stdout + run.stderr)

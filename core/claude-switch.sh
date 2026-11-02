@@ -1390,6 +1390,26 @@ proxy_app_name() {
     esac
 }
 
+# 让 Clash Verge 真的退出。只发 AppleScript quit 不够 —— 实测这个 Tauri 应用
+# 会忽略它:PID 不变,紧接着的 open 只是把窗口唤到前台,运行时配置根本没重新生成,
+# 用户点「一键修复」看到的是「置顶规则 ✗ 未验证内核加载」,而脚本以为已经重启过了。
+# 所以等一小会儿还没退就补一个 SIGTERM(它会走自己的清理流程,把内核一起停掉)。
+quit_clash_verge() {
+    local pid i
+    osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
+    for i in $(seq 1 8); do
+        pgrep -f "Clash Verge.app/Contents/MacOS/clash-verge" >/dev/null || return 0
+        sleep 1
+    done
+    pid=$(pgrep -f "Clash Verge.app/Contents/MacOS/clash-verge" | head -1)
+    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
+    for i in $(seq 1 10); do
+        pgrep -f "Clash Verge.app/Contents/MacOS/clash-verge" >/dev/null || return 0
+        sleep 1
+    done
+    return 1
+}
+
 # Shadowrocket 在 Mac 上表现为 VPN 配置;launchd/非图形环境下 scutil 可能查不到该行,此时以 TUN 判定为准(避免误杀)
 shadowrocket_up() {
     nc=$(scutil --nc list 2>/dev/null)
@@ -2023,6 +2043,21 @@ webrtc_test() {
 # 日常检查与修复共用此判断。先确认规则，再允许探测，避免向已知直连路径发包。
 webrtc_status() {
     local verified result probe_rc assessment mode leak wips w
+    # STUN 探针只返回 IPv4 地址,拿 IPv6 出口没法直接比。双栈节点会在两个族之间
+    # 来回报(本机实测:同一节点一会儿 144.172.103.106 一会儿 2602:fa59:10:503::1),
+    # 不处理的话 WebRTC 会间歇性判「无法比对」—— 而这会拦住启动。
+    # 出口是 v6 时单独取一次 v4 出口来比,因为 UDP 的 STUN 走的就是 v4。
+    local exitip="$1"
+    case "$exitip" in
+        *:*)
+            exitip=$(curl -4 -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+            if [ -z "$exitip" ]; then
+                # 真的只有 v6 出口:IPv4 的 STUN 结果本来就无从比对。
+                # 这不是泄漏,但也不能当作已验证 —— 明确说成 warn,不拦启动。
+                echo "warn:出口只有 IPv6,STUN 结果无法比对"
+                return
+            fi ;;
+    esac
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         mode=$(clash_mode)
         # 全局模式不经过规则匹配,直接按"STUN 结果是否等于当前出口"判断
@@ -2036,7 +2071,7 @@ webrtc_status() {
                     leak=""
                     wips=${result#RESULT:}
                     OLDIFS=$IFS; IFS=','
-                    for w in $wips; do [ -n "$1" ] && [ "$w" != "$1" ] && leak="$leak $w"; done
+                    for w in $wips; do [ -n "$exitip" ] && [ "$w" != "$exitip" ] && leak="$leak $w"; done
                     IFS=$OLDIFS
                     if [ -n "$leak" ]; then
                         echo "fail:暴露非代理IP:${leak# }"
@@ -2057,10 +2092,10 @@ webrtc_status() {
     result=$(webrtc_test)
     probe_rc=$?
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        assessment=$(clash_rules assess "$1" "$result" "$probe_rc" 2>/dev/null)
+        assessment=$(clash_rules assess "$exitip" "$result" "$probe_rc" 2>/dev/null)
     else
         # 其他客户端的规则由用户管理，不能把 reject 的无响应视为已验证。
-        assessment=$(WEBRTC_POLICY=proxy clash_rules assess "$1" "$result" "$probe_rc" 2>/dev/null)
+        assessment=$(WEBRTC_POLICY=proxy clash_rules assess "$exitip" "$result" "$probe_rc" 2>/dev/null)
     fi
     case "$assessment" in
         ok:*|warn:*|fail:*) echo "$assessment" ;;
@@ -2355,8 +2390,7 @@ fix() {
             V="$CLASH_DIR/verge.yaml"
             if [ -f "$V" ] && grep -q '^enable_tun_mode: false' "$V"; then
                 echo "FIX:检测到 TUN 开关被关闭,正在恢复..."
-                osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
-                sleep 3
+                quit_clash_verge
                 sed -i '' 's/^enable_tun_mode: false/enable_tun_mode: true/' "$V"
                 open -a "Clash Verge"
                 for i in $(seq 1 40); do
@@ -2435,8 +2469,7 @@ ASEOF
             echo "FIX:置顶规则 ✗ $rules_result"
             return 1
         fi
-        osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
-        sleep 3
+        quit_clash_verge
         open -a "Clash Verge"
         for i in $(seq 1 40); do tun_up && break; sleep 1; done
         local loaded=0
