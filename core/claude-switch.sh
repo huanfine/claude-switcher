@@ -1604,16 +1604,85 @@ locale_for() {
     esac
 }
 
-# IP 审查:记录出口IP并统计最近48h内不同IP个数(账号画像风险指标)
+# 出口 IP 的归一身份。同一节点会按本次连接走的协议族报出不同形态的地址
+# (IPv4 或 IPv6),拿原始串直接比,一个没动过的节点也会被判成「IP 在变」。
+# 实测踩到:同一节点先后取到 144.172.103.106 和 2602:fa59:10:503::1,
+# 「IP 与上次一致」报 warn、48h 变化次数虚高,而账号来源根本没变。
+#   v4 → 原样
+#   v6 → 取 /64 前缀做身份:隧道出口的接口标识可能轮换,网段不会
+ip_key() {
+    case "$1" in
+        '') return 1 ;;
+        *:*) printf 'v6:%s' "$(printf '%s' "$1" | cut -d: -f1-4)" ;;
+        *)   printf 'v4:%s' "$1" ;;
+    esac
+}
+
+# 归一身份只用于比对,展示时去掉族标记,免得界面上出现 v4:/v6: 这种内部记号。
+ip_show() {
+    case "$1" in
+        v4:*) printf '%s' "${1#v4:}" ;;
+        v6:*) printf '%s' "${1#v6:}" ;;
+        *)    printf '%s' "$1" ;;
+    esac
+}
+
+# 旧版本写进 lastip 的是裸地址(没有 v4:/v6: 前缀)。升级后如果直接比,
+# 第一次检查必然报「IP 变了」—— 正是这个函数要消除的误报。读时统一迁移。
+ip_key_migrate() {
+    case "$1" in
+        '') return 0 ;;
+        v4:*|v6:*) printf '%s' "$1" ;;
+        *) ip_key "$1" ;;
+    esac
+}
+
+# IP 审查:记录出口IP并统计最近48h内不同出口个数(账号画像风险指标)
 iphist_count() {
     [ -z "$1" ] && { echo 0; return; }
     local HIST="$BASE/iphistory.log"
-    local now=$(date +%s)
+    local now=$(date +%s) n
     echo "$1 $now" >>"$HIST"
     # 裁掉48小时(172800秒)以前的记录
     awk -v cutoff=$((now-172800)) '$2>=cutoff' "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
-    # 统计48h内不同IP个数
-    awk '{print $1}' "$HIST" | sort -u | wc -l | tr -d ' '
+    # 按协议族分别去重后取最大值。双栈节点 v4 与 v6 是同一出口的两条腿,
+    # 直接混在一起数会把一个节点算成两个;而只取某一族又会漏掉另一族的变化。
+    # 取最大值:任一族换了地址就算一次变化,两条腿都没动就是 0 次新增。
+    # ip_key 不带换行(给命令替换用),这里得自己补,否则多行会被 sort 当成一行。
+    # read 在「最后一行没有换行」时返回非零,不补 || 判断的话整段会被跳过。
+    n=$(while read -r addr _ || [ -n "$addr" ]; do
+            [ -n "$addr" ] || continue
+            ip_key "$addr"; echo
+        done < "$HIST" | sort -u | cut -d: -f1 | uniq -c | sort -rn | head -1 | awk '{print $1}')
+    echo "${n:-0}"
+}
+
+# 上次记录的出口身份,按协议族分开取。v4 与 v6 不可比 —— 拿一个去比另一个,
+# 只会得出「IP 变了」,而实际只是这次连接走了另一条腿。
+last_seen() {
+    local fam="$1" line
+    [ -f "$BASE/lastip" ] || return 0
+    while read -r line || [ -n "$line" ]; do
+        line=$(ip_key_migrate "$line")
+        case "$line" in "$fam":*) printf '%s' "$line"; return 0 ;; esac
+    done < "$BASE/lastip"
+}
+
+# 写入本次出口身份,保留另一族的记录(两族各自维护自己的「上次」)。
+last_save() {
+    local k="$1" fam tmp="$BASE/lastip.tmp" line
+    case "$k" in v6:*) fam=v6 ;; *) fam=v4 ;; esac
+    : > "$tmp"
+    if [ -f "$BASE/lastip" ]; then
+        while read -r line || [ -n "$line" ]; do
+            line=$(ip_key_migrate "$line")
+            [ -n "$line" ] || continue
+            case "$line" in "$fam":*) continue ;; esac
+            printf '%s\n' "$line" >> "$tmp"
+        done < "$BASE/lastip"
+    fi
+    printf '%s\n' "$k" >> "$tmp"
+    mv "$tmp" "$BASE/lastip"
 }
 
 # ---------- 出口采样 ----------
@@ -1629,8 +1698,12 @@ iphist_count() {
 #   · 总耗时封顶在预算内,剩下的时间留给后面的检查项。
 # 取不到时会在预算内继续重采,替代原来「整轮再跑一遍」的写法。
 PROBE_IP=""; PROBE_LOC=""; PROBE_STATUS="unknown"; PROBE_SEEN=""
+# 漂移判定按协议族分开比:同一节点双栈时,v4 与 v6 是两条腿,交替出现不是漂移。
+# 原来直接比原始串,双栈节点会被判成「出口在漂移」并拦住启动。
+PROBE_IP=""; PROBE_LOC=""; PROBE_STATUS="unknown"; PROBE_SEEN=""
 probe_egress() {
-    local want="${1:-3}" budget="${2:-10}" start elapsed per trace ip loc n=0
+    local want="${1:-3}" budget="${2:-10}" start elapsed per trace ip loc n=0 k
+    local k4="" k6="" i4="" i6=""
     PROBE_IP=""; PROBE_LOC=""; PROBE_STATUS="unknown"; PROBE_SEEN=""
     start=$(date +%s)
     while [ "$n" -lt "$want" ]; do
@@ -1645,12 +1718,23 @@ probe_egress() {
         loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -1)
         if [ -z "$PROBE_IP" ]; then
             PROBE_IP="$ip"; PROBE_LOC="$loc"
-        elif [ "$ip" != "$PROBE_IP" ]; then
-            # 采样间出口不一致 = 节点在漂移。立刻停:再采只会更慢,结论不会变好。
-            PROBE_SEEN="$PROBE_IP $ip"
-            PROBE_STATUS="unstable"
-            return 1
         fi
+        # 比的是归一身份,不是原始串:v6 出口可能在同一 /64 内换后缀,
+        # 拿原始串比会把「网段没变」误判成漂移,进而拦住启动。
+        k=$(ip_key "$ip")
+        case "$k" in
+            v6:*)
+                if [ -n "$k6" ] && [ "$k" != "$k6" ]; then
+                    # 同一协议族内换了网段 = 真的在漂移。立刻停:再采只会更慢。
+                    PROBE_SEEN="$i6 $ip"; PROBE_STATUS="unstable"; return 1
+                fi
+                k6="$k"; i6="$ip" ;;
+            *)
+                if [ -n "$k4" ] && [ "$k" != "$k4" ]; then
+                    PROBE_SEEN="$i4 $ip"; PROBE_STATUS="unstable"; return 1
+                fi
+                k4="$k"; i4="$ip" ;;
+        esac
         PROBE_SEEN="${PROBE_SEEN:+$PROBE_SEEN }$ip"
     done
     [ -z "$PROBE_IP" ] && { PROBE_STATUS="unknown"; return 1; }
@@ -1683,11 +1767,14 @@ check() {
             [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP不符(当前 ${ip:-无}/${loc:-未知},期望 $COUNTRY_TARGET)" ;;
     esac
     if ! check_disabled "IP一致"; then
-        lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
-        if [ -n "$ip" ] && [ -n "$lastip" ] && [ "$ip" != "$lastip" ]; then
-            ipwarn="注意:出口IP与上次不同($lastip -> $ip)"
+        curkey=""; [ -n "$ip" ] && curkey=$(ip_key "$ip")
+        if [ -n "$curkey" ]; then
+            lastip=$(last_seen "${curkey%%:*}")
+            if [ -n "$lastip" ] && [ "$curkey" != "$lastip" ]; then
+                ipwarn="注意:出口IP与上次不同($(ip_show "$lastip") -> $(ip_show "$curkey"))"
+            fi
+            last_save "$curkey"
         fi
-        [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
 
         # IP 审查:48h 内出口 IP 变化 ≥3 次追加警告(只 warn 不 fail)
         ipn=$(iphist_count "$ip")
@@ -2025,7 +2112,11 @@ checkdetail() {
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     if [ "$loc" = "$COUNTRY_TARGET" ]; then
-        echo "出口IP=ok:$ip/$loc"
+        # v6 出口单独标一下:用户看到一串冒号地址会以为哪里不对,实际只是走了 IPv6。
+        case "$ip" in
+            *:*) echo "出口IP=ok:$ip/$loc (IPv6 出口)" ;;
+            *)   echo "出口IP=ok:$ip/$loc" ;;
+        esac
     elif [ -z "$COUNTRY_TARGET" ]; then
         config_result "出口IP" "环境层未就绪(未取到目标国家) · 点「一键修复」"
     else
@@ -2034,13 +2125,16 @@ checkdetail() {
     if check_disabled "IP一致"; then
         optional_result "IP一致" ok
     else
-        lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
+        curkey=""; [ -n "$ip" ] && curkey=$(ip_key "$ip")
         ipst=""; ipdt=""
-        if [ -z "$ip" ]; then ipst="fail"; ipdt="未获取到出口IP"
-        elif [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
-        elif [ "$ip" = "$lastip" ]; then ipst="ok"
-        else ipst="warn"; ipdt="$lastip → $ip"; fi
-        [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
+        if [ -z "$ip" ]; then ipst="fail"; ipdt="未获取到出口IP · 检查网络后重新检查"
+        else
+            lastip=$(last_seen "${curkey%%:*}")
+            if [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
+            elif [ "$curkey" = "$lastip" ]; then ipst="ok"
+            else ipst="warn"; ipdt="$(ip_show "$lastip") → $(ip_show "$curkey")"; fi
+            last_save "$curkey"
+        fi
         # IP 审查:48h 内出口 IP 变化 ≥3 次提示账号画像风险(只 warn 不 fail)
         ipn=$(iphist_count "$ip")
         if [ "$ipn" -ge 3 ] 2>/dev/null; then
@@ -3095,11 +3189,61 @@ switch_to() {
     return 0
 }
 
+# 命令说明。原来的做法是把 21 个命令塞进一行 usage 里,没有分组也没有解释 ——
+# 对要交给非开发者使用的工具,等于没有说明。这里按「你什么时候会用到它」分组。
+help() {
+    cat <<'HELP'
+用法: claude-switch.sh <命令> [参数]
+
+日常(最常用的五个)
+  checkdetail          逐项检查 14 项环境,每项给出原因和下一步
+  check                只输出一行 OK / FAIL,给 App 当启动前的硬性门禁
+  fix                  一键修复能自动处理的问题(规则、时区、地区、保镖)
+  switch A|B|C|D       切换到某个账号并启动 Claude
+  status               当前账号、出口、代理状态的摘要
+
+出问题时
+  verdict [报告]       复核一份 checkdetail 报告,给出结论(有 fail 即判违反)
+  evidence <file>      导出一次检查的证据
+  drill [--auto|--manual] [--yes]
+                       演练:关掉 TUN 后看流量是否真的出不去(fail-closed)
+  diagnose-proxy [--proxy URL|--config FILE]
+                       代理链路诊断,定位是节点、规则还是本地代理的问题
+  fingerprint          打印环境指纹(时区、地区、语言、出口、客户端版本)
+  cli-info             当前代理客户端的版本与配置路径
+
+区域与客户端
+  set-region           按当前出口对齐时区 / 地区 / 语言
+  set-client <mode>    指定代理客户端(clash-verge / shadowrocket / sing-box …)
+  get-client           打印当前选定的代理客户端
+  open-safe <url>      在受控环境里打开链接
+
+维护
+  update               更新核心脚本(校验 SHA256,自检失败自动回滚)
+  update-check         只检查有没有新版本,不写入
+  snapshot-export <A|B|C|D> <file>    导出某个账号的快照
+  snapshot-import <file> <A|B|C|D>    导入快照到某个账号
+  export-diagnostics <file>           导出脱敏诊断包(不含 IP、凭据、账号内容)
+  get-check-config                    读取检查项开关
+  set-check-config <json>             修改检查项开关
+
+  help                 显示这份说明
+
+检查项的结论含义
+  ok      通过
+  warn    有问题但不拦启动
+  config  环境没配好(代理组 / 目标国家 / 时区目标缺失),系统无从判定
+  fail    已配置但实测不达标 —— 硬性项失败时 Claude 不会被拉起
+  skip    你显式关掉了这一项,不代表检查通过
+HELP
+}
+
 operation="${1:-}"
 started_at=$(date +%s)
 summary=""
 case "$operation" in
     check)  check ;;
+    help|-h|--help) help ;;  # 分组说明;原来只有一行 usage,非开发者无从下手
     drill)  drill "${@:2}" ;;  # fail-closed 演练:默认自动关 TUN,--manual 走手动停核
     verdict) support verdict "${2:-}" ;;
     evidence) support evidence "${2:-}" ;;
@@ -3131,7 +3275,12 @@ case "$operation" in
     set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|drill [--auto|--manual] [--yes]|verdict [报告]|evidence <file>|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    # 未知命令:不再甩一行 21 个命令的 usage —— 用户多半是打错了,
+    # 直接指到 help 比让他从一长串里找更省事。
+    *)
+        [ -n "$operation" ] && echo "未知命令: $operation" >&2
+        echo "运行 claude-switch.sh help 查看全部命令" >&2
+        exit 2 ;;
 esac
 rc=$?
 case "$operation" in

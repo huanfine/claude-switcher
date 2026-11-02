@@ -29,8 +29,12 @@ def extract(name, text=None):
     return match.group(0)
 
 
-PROBE_FN = extract("probe_egress")
+PROBE_FN = extract("ip_key") + "\n\n" + extract("probe_egress")
 CHECK_FN = extract("check")
+
+# 出口身份归一:check() 与 probe_egress() 都靠它,隔离环境里必须一起带上。
+IP_HELPERS = "\n".join(extract(n) for n in (
+    "ip_key", "ip_show", "ip_key_migrate", "last_seen", "last_save"))
 
 # check() 依赖的一整套外部命令。curl 由各用例按需覆盖,用来模拟三种出口状态。
 CHECK_HARNESS = r"""
@@ -100,6 +104,29 @@ class ProbeEgressTests(unittest.TestCase):
         self.assertIn("status=unstable", run.stdout)
         self.assertIn("calls=2", run.stdout, "第 2 次就不一致,不该继续采到第 6 次")
 
+    def test_dual_stack_alternating_is_not_drift(self):
+        # 同一节点双栈时,v4 与 v6 是两条腿,交替出现不是漂移。
+        # 原来直接比原始串,这种机器会被判「出口在漂移」并拦住启动。
+        run = self.run_probe(
+            "c=$(cat ctr 2>/dev/null || echo 0); c=$((c+1)); echo $c > ctr; "
+            "if [ $((c % 2)) = 1 ]; then printf 'ip=198.51.100.2\\nloc=US\\n'; "
+            "else printf 'ip=2602:fa59:10:503::1\\nloc=US\\n'; fi", count=4)
+        self.assertIn("status=ok", run.stdout)
+
+    def test_v6_suffix_rotation_is_not_drift(self):
+        # 同一 /64 内换接口标识:网段没变,账号来源没变。
+        run = self.run_probe(
+            "c=$(cat ctr 2>/dev/null || echo 0); c=$((c+1)); echo $c > ctr; "
+            "printf 'ip=2602:fa59:10:503::%s\\nloc=US\\n' \"$c\"")
+        self.assertIn("status=ok", run.stdout)
+
+    def test_v6_prefix_change_is_drift(self):
+        # 换了 /64 = 换了网段,这是真的在漂移,必须拦住。
+        run = self.run_probe(
+            "c=$(cat ctr 2>/dev/null || echo 0); c=$((c+1)); echo $c > ctr; "
+            "printf 'ip=2602:fa59:10:%s::1\\nloc=US\\n' \"$((500 + c))\"")
+        self.assertIn("status=unstable", run.stdout)
+
     def test_budget_caps_total_time(self):
         # 网络半死:每次 curl 都卡满 2 秒。总耗时必须封顶在预算内,否则会把 App 的
         # 45 秒检查超时吃光,用户看到的是「操作超时」而不是「网络在抖」。
@@ -110,6 +137,62 @@ class ProbeEgressTests(unittest.TestCase):
         self.assertLess(elapsed, 7.0, "预算 3 秒不该跑到 %.1f 秒" % elapsed)
 
 
+class IpIdentityTests(unittest.TestCase):
+    """出口身份归一:比对用 key,展示用 show,历史统计按 key 去重。"""
+
+    def run_bash(self, expr):
+        return subprocess.run(["/bin/bash", "-c", IP_HELPERS + "\n" + expr],
+                              text=True, capture_output=True, timeout=20).stdout.strip()
+
+    def test_v4_keeps_full_address(self):
+        self.assertEqual(self.run_bash("ip_key 198.51.100.2"), "v4:198.51.100.2")
+
+    def test_v6_reduces_to_prefix(self):
+        self.assertEqual(self.run_bash("ip_key 2602:fa59:10:503::1"),
+                         "v6:2602:fa59:10:503")
+
+    def test_show_strips_family_tag(self):
+        # 界面上不该出现 v4:/v6: 这种内部记号。
+        self.assertEqual(self.run_bash('ip_show "$(ip_key 2602:fa59:10:503::1)"'),
+                         "2602:fa59:10:503")
+
+    def test_legacy_lastip_is_migrated(self):
+        # 升级前 lastip 存的是裸地址;不迁移的话第一次检查必然误报「IP 变了」。
+        self.assertEqual(self.run_bash("ip_key_migrate 198.51.100.2"), "v4:198.51.100.2")
+        self.assertEqual(self.run_bash("ip_key_migrate v6:2602:fa59:10:503"),
+                         "v6:2602:fa59:10:503")
+
+    def test_empty_ip_has_no_key(self):
+        self.assertEqual(self.run_bash('ip_key "" || echo none'), "none")
+
+    def test_families_keep_separate_last_seen(self):
+        # 两族各自维护自己的「上次」:记了 v6 不能把 v4 的记录冲掉,
+        # 否则下次回到 v4 时会再误报一次「IP 变了」。
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "lastip").write_text("144.172.103.106", encoding="utf-8")
+            src = "BASE=" + tmp + "\n" + IP_HELPERS + "\n" + (
+                "last_save v6:2602:fa59:10:503\n"
+                'printf "v4=[%s]\\n" "$(last_seen v4)"\n'
+                'printf "v6=[%s]\\n" "$(last_seen v6)"\n')
+            out = subprocess.run(["/bin/bash", "-c", src], text=True,
+                                 capture_output=True, timeout=20).stdout
+        self.assertIn("v4=[v4:144.172.103.106]", out)
+        self.assertIn("v6=[v6:2602:fa59:10:503]", out)
+
+    def test_history_counts_one_node_once(self):
+        # 同一节点的 v4/v6 两种形态在 48h 统计里必须算一个出口,
+        # 否则双栈机器「变化次数」翻倍,把正常使用报成账号画像风险。
+        with tempfile.TemporaryDirectory() as tmp:
+            src = "BASE=%s\n%s\n%s\n" % (tmp, IP_HELPERS, extract("iphist_count")) + \
+                "iphist_count 198.51.100.2 >/dev/null\n" \
+                "iphist_count 2602:fa59:10:503::1 >/dev/null\n" \
+                "iphist_count 2602:fa59:10:503::9 >/dev/null\n" \
+                "iphist_count 203.0.113.7\n"
+            out = subprocess.run(["/bin/bash", "-c", src], text=True,
+                                 capture_output=True, timeout=20).stdout.strip()
+        self.assertEqual(out, "2", "v4 + v6 同一节点算一个出口,另一个节点算第二个")
+
+
 class CheckEgressGateTests(unittest.TestCase):
     """check() 面对 unknown 与 unstable 的两种不同处理。"""
 
@@ -117,10 +200,24 @@ class CheckEgressGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "Library" / "Logs").mkdir(parents=True, exist_ok=True)
             src = CHECK_HARNESS + "\ncurl() { %s; }\n" % curl_body + \
-                PROBE_FN + "\n" + CHECK_FN + "\ncheck\n"
+                IP_HELPERS + "\n" + PROBE_FN + "\n" + CHECK_FN + "\ncheck\n"
             env = dict(os.environ, HOME=tmp)
             return subprocess.run(["/bin/bash", "-c", src], env=env, cwd=tmp,
                                   text=True, capture_output=True, timeout=60)
+
+    def test_cross_family_exit_does_not_warn(self):
+        # 实测踩到的误报:同一节点上次报 v4、这次报 v6,被判成「IP 变了」。
+        # 两条腿不可比,不该拿一个去比另一个。
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "Library" / "Logs").mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / "lastip").write_text("144.172.103.106", encoding="utf-8")
+            src = CHECK_HARNESS + "\ncurl() { printf 'ip=2602:fa59:10:503::1\\nloc=US\\n'; }\n" + \
+                IP_HELPERS + "\n" + PROBE_FN + "\n" + CHECK_FN + "\ncheck\n"
+            env = dict(os.environ, HOME=tmp)
+            run = subprocess.run(["/bin/bash", "-c", src], env=env, cwd=tmp,
+                                 text=True, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("与上次不同", run.stdout)
 
     def test_unknown_does_not_block_launch(self):
         # 抖动导致的取不到,不该拦住 Claude 启动;但必须写明「未确认」。
