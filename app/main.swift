@@ -142,7 +142,12 @@ final class VM: ObservableObject {
         if phase == .done { phase = .ready }
     }
 
-    private func run(_ args: [String], timeout: TimeInterval = 45, done: @escaping (CoreResult) -> Void) {
+    /// onLine:每产出一行就回调一次,用于「边查边显示」。它只影响观感,
+    /// 判定仍然由 done 里的完整输出决定 —— 流式预览不参与任何通过/失败计算,
+    /// 否则半行、重复行都会变成判定输入。
+    private func run(_ args: [String], timeout: TimeInterval = 45,
+                     onLine: ((String) -> Void)? = nil,
+                     done: @escaping (CoreResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-out-\(UUID().uuidString).txt")
             guard FileManager.default.createFile(atPath: tmp.path, contents: nil, attributes: [.posixPermissions: 0o600]),
@@ -166,7 +171,20 @@ final class VM: ObservableObject {
             let deadline = ProcessDeadline()
             let watchdog = DispatchWorkItem { deadline.expire(p) }
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
-            p.waitUntilExit()
+            if let onLine {
+                // 检查要跑十来秒(出口采样是三次真实往返),这段时间界面不能一片「待检查」。
+                // 轮询输出文件比改 Pipe 读取风险小:输出仍然落盘,收尾仍读全量。
+                var offset: UInt64 = 0
+                var pending = Data()
+                while p.isRunning {
+                    Thread.sleep(forTimeInterval: 0.12)
+                    Self.drain(tmp, offset: &offset, pending: &pending, emit: onLine)
+                }
+                p.waitUntilExit()
+                Self.drain(tmp, offset: &offset, pending: &pending, emit: onLine)
+            } else {
+                p.waitUntilExit()
+            }
             watchdog.cancel()
             let data = (try? Data(contentsOf: tmp)) ?? Data()
             let out = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -182,12 +200,55 @@ final class VM: ObservableObject {
         }
     }
 
+    /// 检查项名 → 界面行名。流式预览和最终解析共用一份,避免两套映射慢慢走偏。
+    static let rowNameMap: [String: String] = [
+        "代理内核": "代理内核", "TUN网卡": "TUN 网卡", "出口IP": "出口 IP",
+        "IP一致": "IP 与上次一致", "时区": "时区", "地区": "地区",
+        "IPv6": "IPv6 关闭", "DNS": "DNS 走隧道", "WebRTC": "WebRTC",
+        "保镖": "保镖在线", "规则置顶": "规则置顶",
+        "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "生态可达性": "生态可达性",
+    ]
+
+    /// 单行预览:只改观感,不参与判定。最终结果由 done 里的全量解析覆盖。
+    private func preview(_ line: String) {
+        let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2, let rowName = Self.rowNameMap[parts[0]],
+              let idx = rows.firstIndex(where: { $0.name == rowName }) else { return }
+        let status = parts[1].split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        switch status.first ?? "" {
+        case "ok": rows[idx].state = .ok
+        case "warn": rows[idx].state = .warn
+        case "skip": rows[idx].state = .skip
+        case "config": rows[idx].state = .config
+        default: rows[idx].state = .fail
+        }
+        rows[idx].detail = status.count > 1 ? status[1] : ""
+    }
+
     func refresh() {
         guard !isBusy else { return }
         hideAfterSwitch?.cancel()
         if !coreAvailable() { markCoreMissing(); return }
         isBusy = true
         checkEnvironment { _ in self.isBusy = false }
+    }
+
+    /// 把输出文件里新增的完整行吐出去。半行留在 pending 里等下一次,不猜。
+    private static func drain(_ url: URL, offset: inout UInt64, pending: inout Data,
+                              emit: @escaping (String) -> Void) {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? fh.close() }
+        try? fh.seek(toOffset: offset)
+        guard let chunk = try? fh.readToEnd(), !chunk.isEmpty else { return }
+        offset += UInt64(chunk.count)
+        pending.append(chunk)
+        while let nl = pending.firstIndex(of: 0x0A) {
+            let lineData = pending.subdata(in: pending.startIndex..<nl)
+            pending.removeSubrange(pending.startIndex...nl)
+            if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                DispatchQueue.main.async { emit(line) }
+            }
+        }
     }
 
     private func coreAvailable() -> Bool {
@@ -227,7 +288,9 @@ final class VM: ObservableObject {
         banner = ""
         note = ""
         for i in rows.indices { rows[i].state = .pending; rows[i].detail = "" }
-        run(["checkdetail"], timeout: checkTimeout) { result in
+        run(["checkdetail"], timeout: checkTimeout, onLine: { [weak self] line in
+            self?.preview(line)
+        }) { result in
             var allOk = result.succeeded
             var matched = Set<Int>()
             var duplicated = false
@@ -235,13 +298,7 @@ final class VM: ObservableObject {
             // 但用户该做的事完全不同 —— 前者去补配置,后者去修环境。
             var configRows: [String] = []
             var failedRows: [String] = []
-            let keyMap: [String: String] = [
-                "代理内核": "代理内核", "TUN网卡": "TUN 网卡", "出口IP": "出口 IP",
-                "IP一致": "IP 与上次一致", "时区": "时区", "地区": "地区",
-                "IPv6": "IPv6 关闭", "DNS": "DNS 走隧道", "WebRTC": "WebRTC",
-                "保镖": "保镖在线", "规则置顶": "规则置顶",
-                "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "生态可达性": "生态可达性",
-            ]
+            let keyMap = Self.rowNameMap
             for line in result.output.split(separator: "\n") {
                 let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
                 guard parts.count == 2, let rowName = keyMap[parts[0]],

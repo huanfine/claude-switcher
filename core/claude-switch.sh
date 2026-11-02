@@ -1703,14 +1703,37 @@ ip_key_migrate() {
 # 出口 ASN / 运营商。一次检查里只查一次:出口变了要判类型、ASN 检查项也要用它,
 # 查两次纯属浪费,而且两次之间出口可能正好在飘。
 IP_ORG=""; IP_ORG_LOOKED="0"
+# org 是 IP 的固有属性,不会自己变。一次检查查一次只解决了「同一次里别查两遍」,
+# 跨检查还是每次都查 —— 单次约 1.4 秒,占整轮检查的十分之一,而出口 IP 往往
+# 一整天都不动。按 IP 缓存 24 小时:出口换了自然就查新的,没换就不该重复付这个钱。
+ORG_CACHE_TTL=86400
 ip_org() {
     [ "$IP_ORG_LOOKED" = "1" ] && { printf '%s' "$IP_ORG"; return 0; }
     IP_ORG_LOOKED="1"
     [ -z "${1:-}" ] && return 0
+    local ip="$1" now cip corg cts tmp
+    now=$(date +%s)
+    if [ -n "${BASE:-}" ] && [ -f "$BASE/org-cache" ]; then
+        while IFS=$(printf '\t') read -r cip corg cts; do
+            [ "$cip" = "$ip" ] && [ -n "$corg" ] || continue
+            case "${cts:-}" in ''|*[!0-9]*) continue ;; esac
+            if [ $((now - cts)) -lt "$ORG_CACHE_TTL" ]; then
+                IP_ORG="$corg"; printf '%s' "$IP_ORG"; return 0
+            fi
+            break
+        done < "$BASE/org-cache"
+    fi
     # 必须查「实际出口 IP」的 ASN。直接查 ipinfo.io/json 取的是访问 ipinfo 自身
     # 那条链路的出口,在分流配置下可能与受保护流量的出口不是同一个 IP,
     # 从而报出不相干的 ASN(例如受保护出口是机房 A,却报成 Cloudflare)。
     IP_ORG=$(curl -s --max-time 6 "https://ipinfo.io/$1/json" 2>/dev/null | grep '"org"' | cut -d'"' -f4)
+    # 查不到就不写缓存:否则一次网络抖动会把「未知」钉住 24 小时
+    if [ -n "${BASE:-}" ] && [ -n "$IP_ORG" ]; then
+        tmp="$BASE/org-cache.tmp"
+        { [ -f "$BASE/org-cache" ] && grep -vF "$ip"$'\t' "$BASE/org-cache"
+          printf '%s\t%s\t%s\n' "$ip" "$IP_ORG" "$now"; } 2>/dev/null | tail -20 > "$tmp" \
+            && mv "$tmp" "$BASE/org-cache"
+    fi
     printf '%s' "$IP_ORG"
 }
 
@@ -3449,13 +3472,15 @@ case "$operation" in
     evidence) support evidence "${2:-}" ;;
     checkdetail)
         OUT_FILE="$BASE/last-check.txt"
+        # 直接 tee 到 stdout,不要再「先写文件、跑完再 cat」:那等于把十几秒的检查
+        # 结果压到最后一次性吐出来,界面只能干等。bash 的 echo 是逐行刷新的,
+        # tee 原样转发,界面才能边查边显示。
         {
             echo "# $(date '+%F %T') pid=$$ 开始"
             checkdetail
             rc=$?
             echo "# 结束"
-        } > "$OUT_FILE" 2>&1
-        cat "$OUT_FILE"
+        } 2>&1 | tee "$OUT_FILE"
         summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
         ;;
     fix) fix ;;
