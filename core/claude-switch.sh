@@ -325,7 +325,9 @@ def main(args):
             name, _, rest = line.partition("=")
             status, _, detail = rest.partition(":")
             status = status.strip()
-            if status not in ("ok", "warn", "fail", "skip"):
+            # config 也必须收:它和 fail 一样拦启动,丢掉它会让「没配好」的现场
+            # 在证据里凭空消失,事后复核只剩一堆 ok。
+            if status not in ("ok", "warn", "fail", "skip", "config"):
                 continue
             name = name.strip()
             if not name:
@@ -339,14 +341,21 @@ def main(args):
             env = env_read()
         except ValueError:
             env = {}
+        # 判定口径必须和 verdict 命令一致:config(环境层没就绪)一样拦启动,算 blocker;
+        # 一项都没真正验证过是 incomplete —— 「没有失败」不等于「验过了」。
+        if any(v["status"] in ("fail", "config") for v in items.values()):
+            evidence_verdict = "violated"
+        elif not any(v["status"] in ("ok", "warn") for v in items.values()):
+            evidence_verdict = "incomplete"
+        else:
+            evidence_verdict = "established"
         doc = {
             "schema_version": "claude-switcher-evidence/0.1",
             "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
             "host": platform.node(),
             "environment": {key: env.get(key) for key in
                             ("country", "timezone", "locale", "proxy_mode", "proxy_group")},
-            "verdict": "violated" if any(v["status"] == "fail" for v in items.values())
-                       else "established",
+            "verdict": evidence_verdict,
             "items": items,
             "source": str(base / "last-check.txt"),
         }
@@ -2295,11 +2304,15 @@ checkdetail() {
                 esac
             fi
             # 次数阈值同样分类型:家宽轮换再多次也不构成风险信号。
+            # 文案要说明「哪一类出口」在变 —— 只写「出口变动 7 次」,用户不知道
+            # 这是家宽的正常轮换还是机房漂移,也就不知道该不该处理。
             if [ "${ipn:-0}" -ge 3 ] 2>/dev/null && [ "$klass" != "residential" ]; then
+                label="出口"
+                [ "$klass" = "hosting" ] && label="机房出口"
                 if [ "$ipst" = "ok" ]; then
-                    ipst="warn"; ipdt="48h内出口变动${ipn}次,建议固定节点"
+                    ipst="warn"; ipdt="48h内${label}变动${ipn}次,建议固定节点"
                 else
-                    ipdt="$ipdt;48h内出口变动${ipn}次"
+                    ipdt="$ipdt;48h内${label}变动${ipn}次"
                 fi
             fi
             last_save "$curkey"
@@ -3358,7 +3371,7 @@ help() {
   status               当前账号、出口、代理状态的摘要
 
 出问题时
-  verdict [报告]       复核一份 checkdetail 报告,给出结论(有 fail 即判违反)
+  verdict [报告]       复核一份 checkdetail 报告,给出结论(fail/config 即判违反;全关掉判「未验证」)
   evidence <file>      导出一次检查的证据
   drill [--auto|--manual] [--yes]
                        演练:关掉 TUN 后看流量是否真的出不去(fail-closed)

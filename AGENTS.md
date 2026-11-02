@@ -35,6 +35,13 @@
 2. **不要把环境值写进代码或安装器 sed**。历史上安装器、`set-client`、`set-region`、自动更新都在用 sed 回写脚本头部 5 个变量,导致安装产物 ≠ 发布产物、SHA256 校验要剔除 5 行、升级还要回注——这套已全部拆除,别再引入。
 3. **探测不到就明确报错,不要静默用默认值**。`load_env` 遇到损坏的 env.json 会 fail,因为环境值错会直接把规则写进错误的代理组。
 
+关于置顶规则的几条硬约束(踩过就不要再踩):
+
+- **规则顺序固定:端口 → 域名 → IP 兜底**。域名命中更快更精确,IP 只在域名没命中时兜。`expected_rules()` 按索引逐条比对内核 `/rules`,顺序错了会直接报「运行规则未按策略置顶」。
+- **IP 兜底必须带 `no-resolve`**。不带的话每条规则都要先把域名反查成 IP 再匹配,首包明显变慢。
+- **不要用 `GEOSITE` / `IP-ASN` 做兜底**。它们依赖客户端内置数据库,库里没有对应条目时 mihomo 会**拒绝加载整份配置**——为了兜底把用户代理搞挂,代价远大于收益。纯 CIDR 不需要任何数据库。
+- **`ip_class()` 的 org 串要先归一(小写、去空格逗号)再匹配**。bash 的 `case` 模式是「词」,模式里的空格和 `&` 会终止词、直接语法错误;模式列表中间也不能夹注释(反斜杠续行会把注释并进同一条命令)。
+
 ## 安装步骤
 
 首选引导用户运行安装器（双击 `installer/安装.command`，或终端执行它）。如果安装器环境受限，按下面的手动等效步骤执行：
@@ -55,7 +62,7 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
+日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
 
 检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 6 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 

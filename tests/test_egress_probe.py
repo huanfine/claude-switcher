@@ -371,6 +371,36 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(second.returncode, 2)
             self.assertIn("未覆盖", second.stderr)
 
+    def test_all_skipped_evidence_is_incomplete(self):
+        """全部关掉时「没有失败」不等于「验过了」,证据不能记成 established。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / ".claude-switcher"
+            base.mkdir()
+            (base / "last-check.txt").write_text(
+                "WebRTC=skip:已关闭\nASN属性=skip:已关闭\n", encoding="utf-8")
+            out = Path(tmp) / "ev.json"
+            env = dict(os.environ, HOME=tmp)
+            run = subprocess.run(["/bin/bash", str(SCRIPT), "evidence", str(out)],
+                                 env=env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["verdict"],
+                             "incomplete")
+
+    def test_config_evidence_is_violated(self):
+        """环境层没就绪和实测不达标一样拦启动,证据里都要记成 violated。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / ".claude-switcher"
+            base.mkdir()
+            (base / "last-check.txt").write_text(
+                "出口IP=ok:198.51.100.2\n时区=config:未配置\n", encoding="utf-8")
+            out = Path(tmp) / "ev.json"
+            env = dict(os.environ, HOME=tmp)
+            run = subprocess.run(["/bin/bash", str(SCRIPT), "evidence", str(out)],
+                                 env=env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["verdict"],
+                             "violated")
+
 
 TUN_STATE_FN = extract("tun_state")
 
