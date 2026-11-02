@@ -86,6 +86,9 @@ final class VM: ObservableObject {
     @Published var settingsMessage = ""
     @Published private(set) var settingsBusy = false
     @Published var showSettingsSheet = false
+    /// 运行期看门狗已经动手停了 Claude。与「检查没过」不是一回事:
+    /// 后者是拉起前的门禁,前者是已经放行之后又被抓回来,必须显眼到不可能忽略。
+    @Published private(set) var intercepted = false
 
     static let optionalChecks: [(key: String, label: String)] = [
         ("IP一致", "IP 与上次一致"),
@@ -134,7 +137,18 @@ final class VM: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        killOrphanWatch()
         refresh()
+    }
+
+    /// App 被强杀或崩溃时,它起的看门狗走不到 applicationWillTerminate,会留成孤儿。
+    /// 这些孤儿拿着上一轮的基线继续判,既可能误伤也可能和新的守护打架。
+    /// 启动时一律收掉;脚本那边还有 pidfile 单实例兜底,两层都留着。
+    private func killOrphanWatch() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        p.arguments = ["-f", "claude-switch.sh watch"]
+        if (try? p.run()) != nil { p.waitUntilExit() }
     }
 
     func prepareToShow() {
@@ -145,8 +159,12 @@ final class VM: ObservableObject {
     /// onLine:每产出一行就回调一次,用于「边查边显示」。它只影响观感,
     /// 判定仍然由 done 里的完整输出决定 —— 流式预览不参与任何通过/失败计算,
     /// 否则半行、重复行都会变成判定输入。
+    /// timeout <= 0 表示不设超时(看门狗是常驻进程,给它一个截止时间等于定时自杀)。
+    /// onStart: 进程真正起来之后把 Process 交出去,好让调用方持有引用自己收尾 ——
+    /// 用 pkill -f 全局匹配去杀,会连别的实例(比如 LaunchAgent 那份)一起带走。
     private func run(_ args: [String], timeout: TimeInterval = 45,
                      onLine: ((String) -> Void)? = nil,
+                     onStart: ((Process) -> Void)? = nil,
                      done: @escaping (CoreResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-out-\(UUID().uuidString).txt")
@@ -168,9 +186,12 @@ final class VM: ObservableObject {
                 DispatchQueue.main.async { done(CoreResult(output: "无法启动脚本：\(error.localizedDescription)", succeeded: false)) }
                 return
             }
+            if let onStart { DispatchQueue.main.async { onStart(p) } }
             let deadline = ProcessDeadline()
             let watchdog = DispatchWorkItem { deadline.expire(p) }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+            if timeout > 0 {
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+            }
             if let onLine {
                 // 检查要跑十来秒(出口采样是三次真实往返),这段时间界面不能一片「待检查」。
                 // 轮询输出文件比改 Pipe 读取风险小:输出仍然落盘,收尾仍读全量。
@@ -228,9 +249,78 @@ final class VM: ObservableObject {
     func refresh() {
         guard !isBusy else { return }
         hideAfterSwitch?.cancel()
+        // 重新检查前先撤掉旧的守护:否则它会在检查过程中按旧结论把 Claude 关掉。
+        stopWatch()
+        intercepted = false
         if !coreAvailable() { markCoreMissing(); return }
         isBusy = true
         checkEnvironment { _ in self.isBusy = false }
+    }
+
+    // ---- 运行期看门狗 ----
+    // 启动门禁只覆盖「拉起那一刻」。用着用着出口被切、代理掉线,Claude 不会自己停,
+    // 会拿着错误的出口继续发请求。watch 补的就是这一段:脚本负责判定和关进程,
+    // 界面只负责把原因显示出来。
+    private var watchActive = false
+    private var watchStopping = false
+    private var watchProcess: Process?
+
+    private func startWatch() {
+        guard !watchActive else { return }
+        watchActive = true
+        watchStopping = false
+        run(["watch", "10", "6"], timeout: 0,
+            onLine: { [weak self] line in
+                self?.handleWatchLine(line)
+            },
+            onStart: { [weak self] p in
+                self?.watchProcess = p
+            }) { [weak self] _ in
+            guard let self else { return }
+            self.watchActive = false
+            self.watchProcess = nil
+            // 我们自己停的(重新检查/退出)不报警;意外退出必须报 —— 守护断了
+            // 就意味着从现在起没人盯着出口,界面不能还挂着「通过」。
+            guard !self.watchStopping else { return }
+            self.phase = .failed
+            if self.banner.isEmpty { self.banner = "看门狗已停止，请重新检查" }
+        }
+    }
+
+    private func handleWatchLine(_ line: String) {
+        guard line.hasPrefix("STOP:") else { return }
+        let reason = String(line.dropFirst(5))
+        watchStopping = true
+        watchActive = false
+        // 不动 isBusy:看门狗停 Claude 与界面上的修复/切换是两条线,
+        // 清掉忙碌标记会让 refresh 的互斥失效,可能并发跑出两个检查。
+        phase = .failed
+        intercepted = true
+        lastCheckSummary = "已拦截"
+        banner = "已自动停止 Claude：\(reason)"
+        // 界面横幅只在窗口开着时有用,而这是「已经在用」的时候出的问题 ——
+        // 用户多半没开窗口。必须推一条系统通知,否则等于没提醒。
+        notify(title: "已自动停止 Claude", body: reason)
+    }
+
+    /// 走 osascript 而不是 UNUserNotificationCenter:这个 App 是 ad-hoc 签名,
+    /// 通知授权在重签名后会失效,而 display notification 不依赖它。
+    private func notify(title: String, body: String) {
+        let clean = body.replacingOccurrences(of: "\\", with: " ")
+            .replacingOccurrences(of: "\"", with: "'")
+        let script = "display notification \"\(clean)\" with title \"Claude 切换器\" subtitle \"\(title)\" sound name \"Basso\""
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        try? p.run()
+    }
+
+    func stopWatch() {
+        guard watchActive else { return }
+        watchStopping = true
+        watchActive = false
+        if let p = watchProcess, p.isRunning { p.terminate() }
+        watchProcess = nil
     }
 
     /// 把输出文件里新增的完整行吐出去。半行留在 pending 里等下一次,不猜。
@@ -340,6 +430,8 @@ final class VM: ObservableObject {
                 self.banner = "环境没配好：\(configRows.joined(separator: "、"))。点「一键修复」补齐后重新检查"
             }
             let passed = allOk && matched.count == self.rows.count
+            // 通过之后才开守护;不通过时把旧的撤掉,免得它拿旧结论继续放行。
+            if passed { self.startWatch() } else { self.stopWatch() }
             self.lastCheckSummary = passed
                 ? (self.rows.contains { $0.state == .warn }
                     ? "有警告"
@@ -1563,6 +1655,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vm.canQuit ? .terminateNow : .terminateCancel
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // App 关了但 watch 还在跑,是最坏的组合:它照样会杀 Claude,而用户
+        // 看不到任何原因。退出时必须把守护一起收掉。
+        vm.stopWatch()
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showMainWindow()
         return false
@@ -1576,7 +1674,12 @@ struct MenuBarContent: View {
     var body: some View {
         Text("Claude 切换器")
         Text("当前账号：\(vm.current)")
-        Text("最近检查：\(vm.lastCheckSummary)")
+        if vm.intercepted {
+            // 拦截后「最近检查：通过」是事实,但完全不是用户现在该看的东西。
+            Text(vm.banner).foregroundStyle(.red)
+        } else {
+            Text("最近检查：\(vm.lastCheckSummary)")
+        }
         if vm.phase == .fixing { Text("正在修复…") }
         if vm.phase == .switching { Text("正在切换账号…") }
         Divider()
@@ -1611,8 +1714,16 @@ struct SwitcherMenu: Scene {
     @ObservedObject var vm: VM
     let controller: AppDelegate
 
-    private static let statusImage: NSImage = {
+    private static let normalImage: NSImage = {
         let image = NSImage(systemSymbolName: "shield.lefthalf.filled", accessibilityDescription: "Claude 切换器")!
+        image.isTemplate = true
+        return image
+    }()
+
+    /// 被拦截时换图标。菜单栏图标是唯一一直可见的东西 —— 窗口关着的时候,
+    /// 它是用户唯一能察觉「出事了」的入口。
+    private static let blockedImage: NSImage = {
+        let image = NSImage(systemSymbolName: "exclamationmark.shield.fill", accessibilityDescription: "已拦截")!
         image.isTemplate = true
         return image
     }()
@@ -1621,8 +1732,8 @@ struct SwitcherMenu: Scene {
         MenuBarExtra {
             MenuBarContent(vm: vm, showWindow: controller.showMainWindow)
         } label: {
-            Image(nsImage: Self.statusImage)
-                .accessibilityLabel("Claude 切换器")
+            Image(nsImage: vm.intercepted ? Self.blockedImage : Self.normalImage)
+                .accessibilityLabel(vm.intercepted ? "Claude 切换器：已拦截" : "Claude 切换器")
         }
         .menuBarExtraStyle(.menu)
         .commands {

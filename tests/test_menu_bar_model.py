@@ -17,6 +17,9 @@ SCENARIOS = (
     "nonzero_switch", "timeout_switch", "busy_guard", "fix_guard", "failed_fix",
     "checking_allows_quit", "hide_after_success", "reopen_cancels_hide",
     "window_lifecycle", "termination_guard",
+    # 运行期看门狗:通过才起、没通过不起、收到 STOP 要拦、重新检查要撤掉旧的。
+    "watch_after_pass", "watch_not_started_on_failure", "watch_blocks_on_stop",
+    "watch_restart_drops_old_guard",
 )
 
 

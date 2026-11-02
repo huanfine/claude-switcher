@@ -50,13 +50,43 @@ private final class Fixture {
           switch) delay switch; cat "$root/switch-output"; result switch ;;
           fix) delay fix; echo 'FIX:演示修复完成'; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
+          watch)
+            # 常驻,直到测试写出 watch-stop 才吐 STOP 行。真脚本靠 curl 判定,
+            # 这里只需要验证「界面收到 STOP: 之后怎么反应」。
+            # 必须自带寿命上限:场景进程退出后这个子进程会变孤儿,活得越久
+            # fork 越多,后面场景就越容易超时失败 —— 表现为「随机某个断言挂了」。
+            echo $$ > "$root/watch-pid"
+            n=0
+            while [ "$n" -lt 50 ]; do
+              if [ -f "$root/watch-stop" ]; then
+                echo "STOP:$(cat "$root/watch-stop")"
+                exit 3
+              fi
+              /bin/sleep 0.1
+              n=$((n + 1))
+            done
+            exit 0 ;;
           *) exit 2 ;;
         esac
         """)
         try FileManager.default.moveItem(at: root.appendingPathComponent("core-script"), to: core)
     }
 
-    deinit { try? FileManager.default.removeItem(at: root) }
+    deinit {
+        // 场景结束必须把后台 watch 收掉。它自己也有寿命上限,这里只是提前收,
+        // 别让几十个场景的残留叠在一起抢 CPU。pid 由 fake core 自己写出来,
+        // 按 pid 杀比按命令行模糊匹配可靠。
+        let pidFile = root.appendingPathComponent("watch-pid")
+        if let raw = try? String(contentsOf: pidFile, encoding: .utf8),
+           let pid = pid_t(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            kill(pid, SIGTERM)
+        }
+        let killer = Process()
+        killer.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        killer.arguments = ["-f", root.path]
+        if (try? killer.run()) != nil { killer.waitUntilExit() }
+        try? FileManager.default.removeItem(at: root)
+    }
 
     func write(_ name: String, _ value: String) throws {
         try value.write(to: root.appendingPathComponent(name), atomically: true, encoding: .utf8)
@@ -70,10 +100,14 @@ private final class Fixture {
         VM(core: core.path, checkTimeout: checkTimeout, operationTimeout: operationTimeout)
     }
 
-    var calls: [String] {
+    var rawCalls: [String] {
         ((try? String(contentsOf: root.appendingPathComponent("calls"), encoding: .utf8)) ?? "")
             .split(separator: "\n").map(String.init)
     }
+
+    /// 用户/流程动作。看门狗是后台守护,由检查结果自动启停,不属于用户发起的动作序列 ——
+    /// 混进来会让「启动不应重复检查」这类断言失去意义。要查它用 rawCalls。
+    var calls: [String] { rawCalls.filter { !$0.hasPrefix("watch ") } }
 
     func idle(_ vm: VM) throws { try spin { !vm.isBusy } }
 
@@ -291,6 +325,46 @@ struct MenuBarModelTests {
                 try f.idle(vm)
                 try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "修复结束必须重新检查，不能并行执行")
                 try expect(vm.canQuit && vm.phase == .ready, "修复后应该可以退出")
+            case "watch_after_pass":
+                // 启动门禁只管拉起那一刻。通过之后必须立刻把运行期守护挂上,
+                // 否则「用着用着出口被换」这条路上没人看。
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try spin { f.rawCalls.contains("watch 10 6") }
+                try expect(vm.phase == .ready, "守护启动不该改变检查结论")
+                try expect(!vm.intercepted, "正常守护期间不该显示拦截态")
+                try expect(vm.lastCheckSummary == "通过", "摘要仍应是检查结果")
+            case "watch_not_started_on_failure":
+                // 没通过就不该起守护:拿一个已经失效的结论去守护,比不守护更糟。
+                try f.audit(["WebRTC": "fail:演示失败"])
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                pump(0.4)
+                try expect(!f.rawCalls.contains { $0.hasPrefix("watch ") }, "检查未通过不该起守护")
+            case "watch_blocks_on_stop":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try spin { f.rawCalls.contains("watch 10 6") }
+                try f.write("watch-stop", "出口 IPv4 变了(1.2.3.4 → 5.6.7.8)")
+                try spin { vm.phase == .failed }
+                try expect(vm.banner.contains("出口 IPv4 变了"), "必须说清为什么停掉 Claude")
+                try expect(vm.lastCheckSummary == "已拦截", "摘要应写已拦截,不能还挂着通过")
+                try expect(vm.intercepted, "拦截态必须置位,菜单栏图标要跟着变")
+                try expect(vm.canQuit, "拦截后应允许退出")
+                // 重新检查要把拦截态清掉,否则修好之后界面还挂着红色的「已拦截」。
+                // 先撤掉 watch-stop,否则新起的守护会立刻再读一次、又把自己停掉。
+                try? FileManager.default.removeItem(at: f.root.appendingPathComponent("watch-stop"))
+                vm.refresh(); try f.idle(vm)
+                try expect(!vm.intercepted, "重新检查后应清除拦截态")
+            case "watch_restart_drops_old_guard":
+                // 重新检查时旧守护必须撤掉。否则它会拿上一轮的出口基线继续比对,
+                // 检查还没跑完就先按旧结论把 Claude 关了。
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try spin { f.rawCalls.contains("watch 10 6") }
+                vm.refresh(); try f.idle(vm)
+                try expect(vm.phase == .ready, "重新检查后仍应就绪")
+                try expect(vm.lastCheckSummary == "通过", "重新检查应重新得出结论")
             case "failed_fix":
                 try f.write("fix-exit", "1")
                 let vm = f.vm()

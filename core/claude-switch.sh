@@ -3205,6 +3205,126 @@ quit_claude() {
     return 1
 }
 
+# ---------- 运行期看门狗 ----------
+# 启动门禁只证明「拉起 Claude 那一刻环境是对的」。用着用着代理掉线、出口被切、
+# 系统更新把 IPv6 又打开 —— 这些都不会自己停下 Claude,它会拿着错误的出口
+# 继续把请求发出去。watch 就是补这一段:运行期间持续复查,一有问题立刻关掉它。
+
+watch_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$BASE/watch.log"; }
+
+# 立刻停 Claude:先礼后兵。osascript 对这类 App 常常没反应,所以必须落到 pkill,
+# 否则「已经拦住了」只是提示语上的一句好话。
+stop_claude_now() {
+    local reason="$1"
+    if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1; then
+        osascript -e 'tell application "Claude" to quit' >/dev/null 2>&1
+        local i
+        for i in 1 2 3; do
+            pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || break
+            sleep 1
+        done
+        pkill -f "/Applications/Claude.app/Contents/MacOS/Claude" 2>/dev/null
+    fi
+    # CLI 一并停掉:后台的 claude 进程比 App 更容易悄悄重试
+    pkill -f "claude-code/cli.js" 2>/dev/null
+    pkill -f "@anthropic-ai/claude-code" 2>/dev/null
+    watch_log "已停止 Claude:$reason"
+}
+
+# 一轮快速复查:只做「一变就必须停」的项,单次约 2 秒。
+# 慢项(STUN/生态可达性)留给整轮 check,靠 full_every 兜底。
+watch_cycle() {
+    local ip key
+    ip=$(curl -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+    [ -n "$ip" ] || return 2          # 采不到:交给调用方累计失败次数
+    key=$(ip_key "$ip")
+    case "$key" in
+        v6:*)
+            if [ -n "$WATCH_K6" ] && [ "$key" != "$WATCH_K6" ]; then
+                WATCH_STOP="出口 IPv6 网段变了($(ip_show "$WATCH_K6") → $(ip_show "$key"))"
+                return 1
+            fi
+            WATCH_K6="$key" ;;
+        *)
+            if [ -n "$WATCH_K4" ] && [ "$key" != "$WATCH_K4" ]; then
+                WATCH_STOP="出口 IPv4 变了($(ip_show "$WATCH_K4") → $(ip_show "$key"))"
+                return 1
+            fi
+            WATCH_K4="$key" ;;
+    esac
+    WATCH_IP="$ip"
+    return 0
+}
+
+# watch [间隔秒] [整轮检查周期]
+# 单实例接管。App 被强杀或崩溃时,它起的看门狗走不到 applicationWillTerminate,
+# 直接变孤儿;新实例再起来就是两个守护各拿一份基线,重复报警、重复关进程,
+# 而且旧那份的基线还是上一轮的。所以新实例一律接管:先收掉旧的,再占住 pidfile。
+watch_lock() {
+    local old i
+    WATCH_PIDFILE="$BASE/watch.pid"
+    if [ -r "$WATCH_PIDFILE" ]; then
+        old=$(cat "$WATCH_PIDFILE" 2>/dev/null)
+        case "${old:-}" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null; then
+                    watch_log "接管:停掉旧看门狗 pid=$old"
+                    kill "$old" 2>/dev/null
+                    for i in 1 2 3 4 5; do
+                        kill -0 "$old" 2>/dev/null || break
+                        sleep 0.2
+                    done
+                    kill -9 "$old" 2>/dev/null
+                fi ;;
+        esac
+    fi
+    printf '%s\n' "$$" > "$WATCH_PIDFILE"
+    # 只删自己写的那份。旧实例被接管时也会跑到 EXIT,无条件 rm 会把新实例的记录带走。
+    trap '[ "$(cat "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"' EXIT INT TERM
+}
+
+watch() {
+    local interval="${1:-10}" full_every="${2:-6}" n=0 miss=0 rc
+    mkdir -p "$BASE"
+    watch_lock
+    WATCH_K4=""; WATCH_K6=""; WATCH_STOP=""; WATCH_IP=""
+    watch_log "watch 启动 interval=${interval}s full_every=${full_every} pid=$$"
+    while :; do
+        n=$((n + 1))
+        watch_cycle
+        rc=$?
+        case "$rc" in
+            1) stop_claude_now "$WATCH_STOP"; echo "STOP:$WATCH_STOP"; return 3 ;;
+            2)
+                miss=$((miss + 1))
+                if [ "$miss" -ge 3 ]; then
+                    stop_claude_now "出口探测连续 ${miss} 次失败(代理可能已断)"
+                    echo "STOP:出口探测连续 ${miss} 次失败(代理可能已断)"
+                    return 3
+                fi ;;
+            *) miss=0 ;;
+        esac
+        # 整轮:跑真正的门禁。任何一项不合格都停,而不是等它自己发现。
+        # 但先复检一次:一次 curl 抖动就杀进程,比漏判更让人受不了。
+        # 出口变了不在此列 —— 那是 watch_cycle 当场判的,不重试。
+        if [ "$n" -eq 1 ] || [ $((n % full_every)) -eq 0 ]; then
+            if ! out=$("${BASH:-/bin/bash}" "$0" check 2>&1); then
+                sleep 5
+                if ! out=$("${BASH:-/bin/bash}" "$0" check 2>&1); then
+                    WATCH_STOP="运行中检查未通过:${out#FAIL:}"
+                    stop_claude_now "$WATCH_STOP"
+                    echo "STOP:$WATCH_STOP"
+                    return 3
+                fi
+                watch_log "整轮检查失败一次,复检通过,不处理:$out"
+            fi
+        fi
+        sleep "$interval"
+    done
+}
+
+
 archive_current() {
     local cur="$1"
     local t0 staged current previous moved=0 had_old=0
@@ -3452,6 +3572,8 @@ help() {
 日常(最常用的五个)
   checkdetail          逐项检查 14 项环境,每项给出原因和下一步
   check                只输出一行 OK / FAIL,给 App 当启动前的硬性门禁
+  watch [间隔] [整轮周期]
+                       运行期看门狗:出口一变或任一项不合格,立刻关掉 Claude
   fix                  一键修复能自动处理的问题(规则、时区、地区、保镖)
   switch A|B|C|D       切换到某个账号并启动 Claude
   status               当前账号、出口、代理状态的摘要
@@ -3515,6 +3637,7 @@ case "$operation" in
         summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
         ;;
     fix) fix ;;
+    watch) watch "${2:-10}" "${3:-6}" ;;
     status) status ;;
     switch) switch_to "${2:-}" ;;
     set-region) set_region ;;

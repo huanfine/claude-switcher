@@ -95,6 +95,19 @@
 
 `verdict [报告]` 离线复核 `last-check.txt`（或指定报告），只读不探测，输出 `VERDICT:established|violated` 与 blockers/advisories/skipped 三行。`warn` 与 `skip` 既不会被提升成 pass，也不会被当成 fail。`evidence <file>` 把最近一次检查写成 JSON（时间、主机、环境、逐项状态、判定），权限 0600，只新建不覆盖——证据被覆盖就失去追溯意义。
 
+## 运行期出口看门狗（watch）
+
+`check` 是拉起前的门禁，只管那一刻。`watch [间隔] [整轮周期]` 管「已经在用」的那段时间：出口变了就立刻停 Claude。四条纪律，改它之前先读完：
+
+1. **基线只来自「放行那一刻」**。`watch_cycle` 第一轮采到的值即基线，之后每轮比对。App 侧只在 `passed` 之后 `startWatch()`，`refresh()` 开头 `stopWatch()`——拿上一轮的基线继续判，会在检查还没跑完时先按旧结论把 Claude 关掉。
+2. **v4/v6 分族记账，v6 只比 `/64` 前缀**。同一台机器在 v4 与 v6 之间来回切是代理正常行为，不是出口变化；v6 后缀轮换同理（隐私扩展地址天天换）。只有前缀变了才算换了网段。
+3. **一次失败不动手**。整轮审计失败先 `sleep 5` 复检，仍失败才停；出口探测连续 3 次拿不到地址才判定代理已断。一次 curl 抖动就杀进程，比漏判更让人受不了——这条是用户原话，别改。
+4. **停 Claude 必须落到 `pkill`**。`osascript quit` 对 Tauri/Electron 应用经常无响应，等 3 秒仍在就直接 `pkill`，同时清掉 `claude-code/cli.js` 与 `@anthropic-ai/claude-code` 两类 CLI 进程。少清一类，就会留下一个还在发请求的进程。
+
+拦截后的提醒走三条路：窗口横幅、菜单栏图标（换成 `exclamationmark.shield.fill`）、系统通知。**通知不能省**——出问题时用户多半没开着窗口，前两条都看不见。通知走 `osascript display notification` 而不是 `UNUserNotificationCenter`：App 是 ad-hoc 签名，重签名后通知授权会失效。
+
+App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是最坏的一种组合。
+
 ## 验收标准（全部满足才算装完）
 
 - 终端执行 `~/.local/bin/claude-switch.sh checkdetail` 输出完整 14 行；硬性安全项全部 `=ok`，非关键项只能是 `=ok`、既有警告，或用户显式配置的 `=skip`/降级警告
