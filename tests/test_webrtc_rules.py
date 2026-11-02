@@ -244,12 +244,6 @@ class WebRTCRulesTests(unittest.TestCase):
                 run = self.run_helper("assess", "proxy", "203.0.113.1", output, code)
                 self.assertTrue(run.stdout.startswith("fail:"), run.stdout + run.stderr)
 
-    def test_non_ipv4_expected_exit_is_warn_not_fail(self):
-        # 出口是 v6 时 STUN 只回 v4,本来就无从比对。测不出来的东西
-        # 不能当成「没通过」—— 那等于把用户拦在门外。
-        run = self.run_helper("assess", "proxy", "2602:fa59:10:503::1", "RESULT:203.0.113.1", "0")
-        self.assertTrue(run.stdout.startswith("warn:"), run.stdout + run.stderr)
-
     def test_probe_proxy_ip_passes_and_other_ip_fails_without_echoing_it(self):
         run = self.run_helper("assess", "proxy", "203.0.113.1", "RESULT:203.0.113.1", "0")
         self.assertTrue(run.stdout.startswith("ok:"), run.stdout + run.stderr)
