@@ -2405,7 +2405,7 @@ checkdetail() {
                 # 于是「连接从美国出去、解析从中国发起」,正是风控看的地域矛盾。
                 cnres=$(dns_cn_resolvers)
                 if [ -n "$cnres" ]; then
-                    optional_result "DNS" warn "本机已接管,但上游解析器在国内(${cnres}) · 解析与出口地域不一致"
+                    optional_result "DNS" warn "本机已接管,但上游解析器在国内(${cnres}) · 解析与出口地域不一致,建议把 DNS 换成走隧道的 DoH"
                 else
                     optional_result "DNS" ok "走隧道"
                 fi ;;
