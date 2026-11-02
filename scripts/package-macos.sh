@@ -40,7 +40,11 @@ rm -rf "$APP" "$ZIP" "$DMG" "$KIT_ZIP"
 
 echo "==> 编译 $APP_NAME $VERSION ($ARCH_LABEL)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O -parse-as-library -warnings-as-errors \
+# -Xfrontend -disable-sandbox:SwiftUI 的 @State 是宏,展开要跑 swift-plugin-server。
+# 编译器把插件关进沙箱时,插件会返回 malformed response,报出来的却是一堆
+# 「@State 不存在 / cannot assign to property」的假错误。安装器早就加了这个开关,
+# 打包脚本没加 —— 同一份源码两套结果,构建机上会莫名其妙编不过。
+swiftc -O -parse-as-library -warnings-as-errors -Xfrontend -disable-sandbox \
     -target "$ARCH-apple-macos13.0" \
     "$ROOT/app/main.swift" \
     -o "$APP/Contents/MacOS/ClaudeSwitcher" \

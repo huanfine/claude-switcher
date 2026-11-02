@@ -878,6 +878,9 @@ struct ContentView: View {
                                      : (row.state == .config ? ClaudeTheme.terracotta : ClaudeTheme.muted))
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    // 面板只有 440pt,detail 一行放不下二十来个字。截断只保留两头,
+                    // 鼠标悬停必须能看到全文——否则「为什么」和「下一步」都被截掉一半。
+                    .help(row.detail)
             }
 
             stateIcon(row.state)

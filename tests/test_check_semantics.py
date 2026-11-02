@@ -166,8 +166,8 @@ esac''')
         value = self.dns_line("dns:\n  nameserver:\n  - https://dns.alidns.com/dns-query\n"
                               "  default-nameserver:\n  - 223.5.5.5\n")
         self.assertTrue(value.startswith("warn:"), value)
-        self.assertIn("alidns", value)
-        self.assertIn("地域不一致", value)
+        self.assertIn("上游解析器在国内", value)
+        self.assertIn("DoH", value, "只说有问题不给下一步,用户不知道改哪里")
 
     def test_foreign_upstream_resolver_stays_ok(self):
         value = self.dns_line("dns:\n  nameserver:\n  - https://dns.google/dns-query\n"
