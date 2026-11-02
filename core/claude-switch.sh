@@ -3212,10 +3212,22 @@ quit_claude() {
 
 watch_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$BASE/watch.log"; }
 
+# 拦截记录:给人看的历史。watch.log 是流水账(启动、复检、接管全在里面),
+# 这份只记「真的动过手」的事件,界面按它渲染「异常记录」。TAB 分隔三列:
+# 时间 / 类型 / 原因 —— 界面按 TAB 切,别改成空格。
+watch_incident() {
+    local reason="${1:-}" kind="${2:-拦截}" f tmp
+    [ -n "$reason" ] || return 0
+    f="$BASE/incidents.log"; tmp="$BASE/incidents.log.tmp"
+    printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$kind" "$reason" >> "$f" 2>/dev/null || return 0
+    # 只留最近 50 条:这是给人看的,不是审计存档;要追溯有 watch.log。
+    tail -50 "$f" > "$tmp" 2>/dev/null && mv "$tmp" "$f"
+}
+
 # 立刻停 Claude:先礼后兵。osascript 对这类 App 常常没反应,所以必须落到 pkill,
 # 否则「已经拦住了」只是提示语上的一句好话。
 stop_claude_now() {
-    local reason="$1"
+    local reason="$1" kind="${2:-拦截}"
     if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1; then
         osascript -e 'tell application "Claude" to quit' >/dev/null 2>&1
         local i
@@ -3229,6 +3241,7 @@ stop_claude_now() {
     pkill -f "claude-code/cli.js" 2>/dev/null
     pkill -f "@anthropic-ai/claude-code" 2>/dev/null
     watch_log "已停止 Claude:$reason"
+    watch_incident "$reason" "$kind"
 }
 
 # 一轮快速复查:只做「一变就必须停」的项,单次约 2 秒。
@@ -3260,15 +3273,32 @@ watch_cycle() {
 # 单实例接管。App 被强杀或崩溃时,它起的看门狗走不到 applicationWillTerminate,
 # 直接变孤儿;新实例再起来就是两个守护各拿一份基线,重复报警、重复关进程,
 # 而且旧那份的基线还是上一轮的。所以新实例一律接管:先收掉旧的,再占住 pidfile。
+# pidfile 里只有数字,而 pid 会被复用:守护被 SIGKILL 时走不到 trap,pidfile 会残留,
+# 之后这个号被别的进程拿到,新实例一接管就把无关进程杀了。所以杀之前必须确认它
+# 真是看门狗。ps 不可用时宁可不接管 —— 留两个守护是脏,杀错进程是事故。
+watch_pid_is_watchdog() {
+    local p="${1:-}"
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$p" 2>/dev/null || return 1
+    ps -p "$p" -o command= 2>/dev/null | grep -q 'claude-switch\.sh watch'
+}
+
 watch_lock() {
-    local old i
+    local old obase i
     WATCH_PIDFILE="$BASE/watch.pid"
     if [ -r "$WATCH_PIDFILE" ]; then
-        old=$(cat "$WATCH_PIDFILE" 2>/dev/null)
+        # 用 awk 而不是 cut -f2:cut 对「没有分隔符」的行会原样返回整行,
+        # 旧格式(只有 pid)的 pidfile 就会被误读成「BASE 是那个 pid」,永远不接管。
+        old=$(awk -F'\t' '{print $1; exit}' "$WATCH_PIDFILE" 2>/dev/null)
+        obase=$(awk -F'\t' 'NF > 1 {print $2; exit}' "$WATCH_PIDFILE" 2>/dev/null)
         case "${old:-}" in
             ''|*[!0-9]*) ;;
             *)
-                if [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null; then
+                if [ -n "${obase:-}" ] && [ "$obase" != "$BASE" ]; then
+                    # 不同 BASE 的旧记录(备份/迁移带过来的 pidfile)。那个进程服务的是
+                    # 另一套环境,不该被我们杀掉 —— 实测复制一份 BASE 就误杀过真实守护。
+                    :
+                elif [ "$old" != "$$" ] && watch_pid_is_watchdog "$old"; then
                     watch_log "接管:停掉旧看门狗 pid=$old"
                     kill "$old" 2>/dev/null
                     for i in 1 2 3 4 5; do
@@ -3279,12 +3309,13 @@ watch_lock() {
                 fi ;;
         esac
     fi
-    printf '%s\n' "$$" > "$WATCH_PIDFILE"
+    printf '%s\t%s\n' "$$" "$BASE" > "$WATCH_PIDFILE"
     # 只删自己写的那份。旧实例被接管时也会跑到 EXIT,无条件 rm 会把新实例的记录带走。
+    # 比的是 pidfile 第一段(pid),不是整行 —— 格式是「pid<TAB>BASE」。
     # TERM/INT 分支必须带 exit:bash 的 trap 执行完会回到被中断的地方继续跑,
     # 不 exit 的话 App 的 terminate() 压根停不下看门狗 —— 实测就是这样留下孤儿的。
-    trap '[ "$(cat "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"' EXIT
-    trap '[ "$(cat "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"; exit 143' INT TERM
+    trap '[ "$(cut -f1 "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"' EXIT
+    trap '[ "$(cut -f1 "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"; exit 143' INT TERM
 }
 
 watch() {
@@ -3298,11 +3329,11 @@ watch() {
         watch_cycle
         rc=$?
         case "$rc" in
-            1) stop_claude_now "$WATCH_STOP"; echo "STOP:$WATCH_STOP"; return 3 ;;
+            1) stop_claude_now "$WATCH_STOP" "出口变化"; echo "STOP:$WATCH_STOP"; return 3 ;;
             2)
                 miss=$((miss + 1))
                 if [ "$miss" -ge 3 ]; then
-                    stop_claude_now "出口探测连续 ${miss} 次失败(代理可能已断)"
+                    stop_claude_now "出口探测连续 ${miss} 次失败(代理可能已断)" "代理断开"
                     echo "STOP:出口探测连续 ${miss} 次失败(代理可能已断)"
                     return 3
                 fi ;;
@@ -3316,7 +3347,7 @@ watch() {
                 sleep 5
                 if ! out=$("${BASH:-/bin/bash}" "$0" check 2>&1); then
                     WATCH_STOP="运行中检查未通过:${out#FAIL:}"
-                    stop_claude_now "$WATCH_STOP"
+                    stop_claude_now "$WATCH_STOP" "检查未通过"
                     echo "STOP:$WATCH_STOP"
                     return 3
                 fi

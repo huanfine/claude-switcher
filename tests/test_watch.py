@@ -8,6 +8,7 @@
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import time
 import unittest
@@ -96,32 +97,86 @@ class WatchLockTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="watch-lock-")
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
+        # 真 ps 在受限环境(CI/沙箱)里可能被拒。这里测的是「拿到命令行之后怎么判断」,
+        # 不是 ps 本身,所以用桩替代,让结果确定。
+        self.bin = self.base / "bin"
+        self.bin.mkdir()
+        stub = self.bin / "ps"
+        stub.write_text('#!/bin/bash\nprintf "%s\\n" "$PS_STUB_OUTPUT"\n')
+        stub.chmod(0o755)
 
-    def run_lock(self):
+    def run_lock(self, ps_output=""):
         code = 'set -u\nBASE=%s\n' % shell_quote(str(self.base))
-        code += helper("watch_log") + "\n" + helper("watch_lock") + "\n"
+        code += helper("watch_log") + "\n" + helper("watch_pid_is_watchdog") + "\n"
+        code += helper("watch_lock") + "\n"
         # 必须在脚本还活着的时候把 pidfile 读出来:正常退出会走 EXIT trap 把它删掉,
         # 那正是设计意图,不是缺陷。
         code += 'watch_lock\necho "me=$$"\necho "pidfile=$(cat "$BASE/watch.pid" 2>/dev/null)"\n'
+        env = dict(os.environ, LC_ALL="C", PS_STUB_OUTPUT=ps_output,
+                   PATH=str(self.bin) + ":" + os.environ.get("PATH", ""))
         run = subprocess.run(["/bin/bash", "-c", code], text=True,
-                             capture_output=True, timeout=20, env=dict(os.environ, LC_ALL="C"))
+                             capture_output=True, timeout=20, env=env)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         return run.stdout
 
     def pidfile_content(self, out):
-        return re.search(r"pidfile=(.*)", out).group(1).strip()
+        """pidfile 格式是「pid<TAB>BASE」,只比 pid 那一段。"""
+        raw = re.search(r"pidfile=(.*)", out).group(1).strip()
+        return raw.split("\t")[0].split()[0] if raw else ""
+
+    def fake_watchdog(self):
+        """造一个命令行含 claude-switch.sh watch 的长睡进程,冒充看门狗。
+
+        不能用 cp /bin/sleep:复制出来的系统二进制在 /tmp 执行会被系统直接 SIGKILL
+        (和文件名无关,换个名字一样死),测出来的 poll() 永远是 -9。
+        用 bash 脚本,命令行照样带那串字。
+        """
+        script = self.base / "claude-switch.sh watch"
+        script.write_text("#!/bin/bash\n/bin/sleep 30\n")
+        os.chmod(script, 0o755)
+        # 独立进程组:收尾时连 sleep 子进程一起清,否则每个测试都留一个睡 30 秒的。
+        proc = subprocess.Popen([str(script)], start_new_session=True)
+
+        def cleanup():
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        self.addCleanup(cleanup)
+        return proc
 
     def test_takes_over_live_watchdog(self):
-        victim = subprocess.Popen(["/bin/sleep", "30"])
-        self.addCleanup(lambda: victim.poll() is None and victim.kill())
+        victim = self.fake_watchdog()
         (self.base / "watch.pid").write_text(str(victim.pid), encoding="utf-8")
-        out = self.run_lock()
+        out = self.run_lock("/bin/bash /x/claude-switch.sh watch 10 6")
         me = re.search(r"me=(\d+)", out).group(1)
         # 旧的必须被收掉,否则两个守护会同时动手
         victim.wait(timeout=10)
         self.assertIsNotNone(victim.returncode)
         self.assertEqual(self.pidfile_content(out), me)
         self.assertIn("接管", (self.base / "watch.log").read_text(encoding="utf-8"))
+
+    def test_does_not_kill_unrelated_process(self):
+        """pidfile 残留 + pid 复用:不能把恰好拿到这个号的无关进程杀掉。
+
+        守护被 SIGKILL 时走不到 trap,pidfile 会留在磁盘上;系统之后把这个 pid
+        分配给谁都有可能。只凭 kill -0 成功就下手,迟早杀错人。
+        """
+        victim = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(lambda: victim.poll() is None and victim.kill())
+        (self.base / "watch.pid").write_text(str(victim.pid), encoding="utf-8")
+        out = self.run_lock("/bin/sleep 30")
+        self.assertIsNone(victim.poll(), "无关进程被误杀")
+        self.assertEqual(self.pidfile_content(out), re.search(r"me=(\d+)", out).group(1))
+
+    def test_does_not_take_over_other_base(self):
+        """备份/迁移带过来的 pidfile:那个进程服务的是另一套环境,不该动它。"""
+        victim = self.fake_watchdog()
+        (self.base / "watch.pid").write_text("%d\t/tmp/another-base" % victim.pid, encoding="utf-8")
+        out = self.run_lock("/bin/bash /x/claude-switch.sh watch 10 6")
+        self.assertIsNone(victim.poll(), "别的 BASE 的守护被误杀")
+        self.assertEqual(self.pidfile_content(out), re.search(r"me=(\d+)", out).group(1))
 
     def test_dead_pid_does_not_block(self):
         (self.base / "watch.pid").write_text("999999", encoding="utf-8")
@@ -144,7 +199,8 @@ class WatchLockTests(unittest.TestCase):
         转,于是每重启一次 App 就多一个孤儿守护,各自拿一份基线判出口。
         """
         code = 'set -u\nBASE=%s\n' % shell_quote(str(self.base))
-        code += helper("watch_log") + "\n" + helper("watch_lock") + "\n"
+        code += helper("watch_log") + "\n" + helper("watch_pid_is_watchdog") + "\n"
+        code += helper("watch_lock") + "\n"
         code += 'watch_lock\nwhile :; do /bin/sleep 0.2; done\n'
         proc = subprocess.Popen(["/bin/bash", "-c", code], env=dict(os.environ, LC_ALL="C"))
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
@@ -168,6 +224,52 @@ class WatchLockTests(unittest.TestCase):
         subprocess.run(["/bin/bash", "-c", code], text=True, capture_output=True, timeout=20,
                        env=dict(os.environ, LC_ALL="C"))
         self.assertTrue((self.base / "watch.pid").exists())
+
+
+class IncidentRecordTests(unittest.TestCase):
+    """拦截记录。界面按 TAB 切三列渲染历史,格式错一条就少显示一条。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory(prefix="incident-")
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def run_incident(self, *args):
+        code = 'set -u\nBASE=%s\n' % shell_quote(str(self.base))
+        code += helper("watch_incident") + "\n"
+        code += "watch_incident " + " ".join(shell_quote(a) for a in args) + "\n"
+        run = subprocess.run(["/bin/bash", "-c", code], text=True, capture_output=True,
+                             timeout=20, env=dict(os.environ, LC_ALL="C"))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def read_lines(self):
+        return (self.base / "incidents.log").read_text(encoding="utf-8").strip().split("\n")
+
+    def test_writes_three_tab_columns(self):
+        self.run_incident("出口 IPv4 变了(1.2.3.4 → 5.6.7.8)", "出口变化")
+        f = self.read_lines()[0].split("\t")
+        self.assertEqual(len(f), 3, "必须正好三列,界面按 TAB 切")
+        self.assertRegex(f[0], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+        self.assertEqual(f[1], "出口变化")
+        self.assertEqual(f[2], "出口 IPv4 变了(1.2.3.4 → 5.6.7.8)")
+
+    def test_kind_defaults_when_missing(self):
+        self.run_incident("原因")
+        self.assertEqual(self.read_lines()[0].split("\t")[1], "拦截")
+
+    def test_empty_reason_writes_nothing(self):
+        """空原因不写:一条只有时间的记录对排查毫无用处,只会把真记录挤掉。"""
+        self.run_incident("")
+        self.assertFalse((self.base / "incidents.log").exists())
+
+    def test_keeps_only_last_fifty(self):
+        for i in range(55):
+            self.run_incident("第 %d 次" % i, "检查未通过")
+        lines = self.read_lines()
+        self.assertEqual(len(lines), 50, "只留最近 50 条")
+        self.assertIn("第 54 次", lines[-1])
+        self.assertNotIn("第 0 次", "\n".join(lines))
 
 
 if __name__ == "__main__":

@@ -108,6 +108,8 @@
 
 拦截后的提醒走三条路：窗口横幅、菜单栏图标（换成 `exclamationmark.shield.fill`）、系统通知。**通知不能省**——出问题时用户多半没开着窗口，前两条都看不见。通知走 `osascript display notification` 而不是 `UNUserNotificationCenter`：App 是 ad-hoc 签名，重签名后通知授权会失效。
 
+7. **拦截必须留结构化记录**。`stop_claude_now` 末尾调 `watch_incident <原因> <类型>`，写 `incidents.log`：TAB 分隔「时间 / 类型 / 原因」三列，只留最近 50 条。界面的「拦截记录」卡片按 TAB 切列渲染，**列数或分隔符一改，界面就整条丢掉**。`watch.log` 是流水账（启动/复检/接管全在里面），别拿它当历史——用户想回看「上次为什么被停」时，从几百行里捞是灾难。空原因不写：一条只有时间的记录只会把真记录挤出 50 条窗口。
+
 App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是最坏的一种组合。
 
 ## 验收标准（全部满足才算装完）

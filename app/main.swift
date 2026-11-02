@@ -29,6 +29,16 @@ struct AccountStamp: Equatable {
     let date: String
 }
 
+/// 一次「真的动过手」的拦截。来自 `~/.claude-switcher/incidents.log`,
+/// 脚本写、界面读。watch.log 是流水账(启动/复检/接管都在里面),这份只留拦截,
+/// 否则用户想回头看「上次为什么被停」得从几百行里捞。
+struct Incident: Identifiable {
+    let id = UUID()
+    let time: String
+    let kind: String
+    let reason: String
+}
+
 // 超时回调与 waitUntilExit 在不同队列上执行。
 private final class ProcessDeadline {
     private let lock = NSLock()
@@ -89,6 +99,11 @@ final class VM: ObservableObject {
     /// 运行期看门狗已经动手停了 Claude。与「检查没过」不是一回事:
     /// 后者是拉起前的门禁,前者是已经放行之后又被抓回来,必须显眼到不可能忽略。
     @Published private(set) var intercepted = false
+    /// 拦截历史,最新的在前。脚本写 incidents.log,这里只读。
+    @Published private(set) var incidents: [Incident] = []
+    /// 记录文件位置。生产是固定路径,测试注入到夹具目录 —— 否则跑测试会读到
+    /// 本机真实的拦截历史,断言全凭运气。
+    var incidentsPath = NSHomeDirectory() + "/.claude-switcher/incidents.log"
 
     static let optionalChecks: [(key: String, label: String)] = [
         ("IP一致", "IP 与上次一致"),
@@ -251,12 +266,28 @@ final class VM: ObservableObject {
         rows[idx].detail = status.count > 1 ? status[1] : ""
     }
 
+    /// 读拦截历史。TAB 分隔三列:时间 / 类型 / 原因 —— 和脚本那边一一对应,
+    /// 少一列就整条丢掉,宁可少显示也不显示半条错的。
+    func loadIncidents() {
+        guard let text = try? String(contentsOfFile: incidentsPath, encoding: .utf8) else {
+            incidents = []
+            return
+        }
+        let parsed: [Incident] = text.split(separator: "\n").compactMap { line in
+            let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard f.count >= 3, !f[2].isEmpty else { return nil }
+            return Incident(time: f[0], kind: f[1], reason: f[2])
+        }
+        incidents = parsed.reversed()
+    }
+
     func refresh() {
         guard !isBusy else { return }
         hideAfterSwitch?.cancel()
         // 重新检查前先撤掉旧的守护:否则它会在检查过程中按旧结论把 Claude 关掉。
         stopWatch()
         intercepted = false
+        loadIncidents()
         if !coreAvailable() { markCoreMissing(); return }
         isBusy = true
         checkEnvironment { _ in self.isBusy = false }
@@ -303,6 +334,9 @@ final class VM: ObservableObject {
         intercepted = true
         lastCheckSummary = "已拦截"
         banner = "已自动停止 Claude：\(reason)"
+        // 脚本刚写完这条记录,立刻读回来 —— 界面上的「异常记录」要和日志同步,
+        // 不能等下次重新检查才出现。
+        loadIncidents()
         // 界面横幅只在窗口开着时有用,而这是「已经在用」的时候出的问题 ——
         // 用户多半没开窗口。必须推一条系统通知,否则等于没提醒。
         notify(title: "已自动停止 Claude", body: reason)
@@ -345,8 +379,11 @@ final class VM: ObservableObject {
 
     private static func killWatchByPidfile() {
         let path = NSHomeDirectory() + "/.claude-switcher/watch.pid"
-        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
-              let pid = pid_t(raw.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1 else { return }
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+        // pidfile 格式是「pid<TAB>BASE」,取第一段。BASE 用来区分是不是本机的记录。
+        let head = raw.split(whereSeparator: { $0 == "\t" || $0 == " " || $0 == "\n" })
+            .first.map(String.init) ?? ""
+        guard let pid = pid_t(head), pid > 1 else { return }
         // pid 会被复用。杀之前先确认它确实是看门狗,而不是恰好拿到同一个号的进程。
         guard isWatchProcess(pid) else { return }
         kill(pid, SIGKILL)
@@ -861,6 +898,9 @@ struct ContentView: View {
             ClaudeBackground()
             VStack(spacing: 12) {
                 header
+                // 拦截态放最顶上。用户打开窗口第一眼要看到「Claude 已经被我停了」,
+                // 而不是先扫完 14 行环境检查才发现哪里不对。
+                if vm.intercepted { interceptedBanner }
                 HStack {
                     Text("环境检查").font(.caption.weight(.semibold)).foregroundColor(ClaudeTheme.muted)
                     Spacer()
@@ -869,6 +909,7 @@ struct ContentView: View {
                 // 小屏上窗口高度会被系统可见区域压缩,让卡片区可滚动而不是被裁切
                 ScrollView {
                     VStack(spacing: 16) {
+                        if !vm.incidents.isEmpty { incidentHistoryCard }
                         checksCard
                         clientCard
                         if vm.phase == .ready || vm.phase == .switching || vm.phase == .done {
@@ -952,6 +993,103 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showNotice) { NoticeView() }
         .sheet(isPresented: $showFingerprint) { FingerprintView(text: vm.fingerprint) }
+    }
+
+    /// 拦截态横幅。红底白字,不跟其它卡片一个调子 —— 这是「我已经替你动手了」,
+    /// 不是「有个检查没过」,视觉上必须区分开。
+    var interceptedBanner: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                Text("已自动停止 Claude")
+                    .font(.system(size: 13.5, weight: .bold))
+                Spacer()
+                if let latest = vm.incidents.first {
+                    Text(latest.kind)
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.white.opacity(0.24)))
+                }
+            }
+            .foregroundColor(.white)
+
+            Text(interceptedReason)
+                .font(.system(size: 11.5))
+                .foregroundColor(.white.opacity(0.96))
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 11)
+                .fill(
+                    LinearGradient(
+                        colors: [ClaudeTheme.error, ClaudeTheme.error.opacity(0.80)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        )
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.white.opacity(0.18), lineWidth: 1))
+    }
+
+    /// banner 里带「已自动停止 Claude：」前缀,横幅本身已经说了这句话,去掉免得念两遍。
+    var interceptedReason: String {
+        let prefix = "已自动停止 Claude："
+        return vm.banner.hasPrefix(prefix) ? String(vm.banner.dropFirst(prefix.count)) : vm.banner
+    }
+
+    /// 拦截历史。默认只露最近 5 条:这是给人快速回看「刚才为什么被停」的,
+    /// 不是审计存档,要全量有 watch.log。
+    var incidentHistoryCard: some View {
+        let shown = Array(vm.incidents.prefix(5))
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(ClaudeTheme.muted)
+                Text("拦截记录")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(ClaudeTheme.muted)
+                Spacer()
+                Text("最近 \(shown.count) 次")
+                    .font(.system(size: 10))
+                    .foregroundColor(ClaudeTheme.muted)
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 9)
+
+            ForEach(shown) { item in
+                Rectangle()
+                    .fill(ClaudeTheme.divider)
+                    .frame(height: 1)
+                HStack(alignment: .top, spacing: 8) {
+                    Text(item.kind)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(ClaudeTheme.error)
+                        .frame(width: 58, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(item.reason)
+                            .font(.system(size: 11))
+                            .foregroundColor(ClaudeTheme.ink)
+                            .lineLimit(2)
+                            // 440pt 的面板放不下长原因,悬停必须能看到全文
+                            .help(item.reason)
+                        Text(item.time)
+                            .font(.system(size: 9.5))
+                            .foregroundColor(ClaudeTheme.muted)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 13)
+                .padding(.vertical, 7)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 12).fill(ClaudeTheme.card))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(ClaudeTheme.cardBorder, lineWidth: 1))
     }
 
     var statusPill: some View {
@@ -1246,11 +1384,15 @@ struct ContentView: View {
                     Text(vm.banner).font(.callout).foregroundColor(ClaudeTheme.ink)
                 }
             } else {
-                if !vm.banner.isEmpty {
+                // 拦截时原因已经在顶部红条里说过一遍,这里不再复述,只给下一步。
+                if !vm.banner.isEmpty && !vm.intercepted {
                     Text(vm.banner).font(.callout).foregroundColor(ClaudeTheme.error).multilineTextAlignment(.center)
                 }
-                Text(vm.configOnlyFailure ? "环境没配好，补齐配置即可通过" : "存在未通过项，可一键修复或手动处理后重试")
+                Text(vm.intercepted
+                     ? "看门狗已停掉 Claude。确认出口和环境恢复正常后点「重新检查」，通过会自动重新守护"
+                     : (vm.configOnlyFailure ? "环境没配好，补齐配置即可通过" : "存在未通过项，可一键修复或手动处理后重试"))
                     .font(.caption).foregroundColor(ClaudeTheme.muted)
+                    .multilineTextAlignment(.center)
                 HStack(spacing: 10) {
                     Button { vm.fixAll() } label: {
                         Label("一键修复", systemImage: "wand.and.stars")
@@ -1721,6 +1863,10 @@ struct MenuBarContent: View {
             Text(vm.banner).foregroundStyle(.red)
         } else {
             Text("最近检查：\(vm.lastCheckSummary)")
+        }
+        // 菜单栏是窗口关着时唯一能瞄一眼的地方,给一行历史,别让人非得开窗口。
+        if let latest = vm.incidents.first {
+            Text("最近拦截：\(latest.time) · \(latest.kind)")
         }
         if vm.phase == .fixing { Text("正在修复…") }
         if vm.phase == .switching { Text("正在切换账号…") }

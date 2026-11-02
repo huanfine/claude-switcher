@@ -59,6 +59,8 @@ private final class Fixture {
             n=0
             while [ "$n" -lt 50 ]; do
               if [ -f "$root/watch-stop" ]; then
+                # 真脚本在 stop_claude_now 里写这一行,这里照着写,界面才读得到。
+                printf '%s\t%s\t%s\n' "$(date '+%F %T')" "出口变化" "$(cat "$root/watch-stop")" >> "$root/incidents.log"
                 echo "STOP:$(cat "$root/watch-stop")"
                 exit 3
               fi
@@ -97,7 +99,10 @@ private final class Fixture {
     }
 
     func vm(checkTimeout: TimeInterval = 2, operationTimeout: TimeInterval = 2) -> VM {
-        VM(core: core.path, checkTimeout: checkTimeout, operationTimeout: operationTimeout)
+        let model = VM(core: core.path, checkTimeout: checkTimeout, operationTimeout: operationTimeout)
+        // 拦截记录指到夹具目录:真实路径里是本机真实历史,断言会随环境飘。
+        model.incidentsPath = root.appendingPathComponent("incidents.log").path
+        return model
     }
 
     var rawCalls: [String] {
@@ -351,6 +356,10 @@ struct MenuBarModelTests {
                 try expect(vm.lastCheckSummary == "已拦截", "摘要应写已拦截,不能还挂着通过")
                 try expect(vm.intercepted, "拦截态必须置位,菜单栏图标要跟着变")
                 try expect(vm.canQuit, "拦截后应允许退出")
+                // 拦截原因不能只活在 banner 里:用户关掉窗口再回来就没了。
+                try expect(vm.incidents.count == 1, "拦截后应立刻读到刚写的记录")
+                try expect(vm.incidents.first?.kind == "出口变化", "类型应来自脚本")
+                try expect(vm.incidents.first?.reason.contains("1.2.3.4") == true, "原因应完整")
                 // 重新检查要把拦截态清掉,否则修好之后界面还挂着红色的「已拦截」。
                 // 先撤掉 watch-stop,否则新起的守护会立刻再读一次、又把自己停掉。
                 try? FileManager.default.removeItem(at: f.root.appendingPathComponent("watch-stop"))
@@ -382,6 +391,30 @@ struct MenuBarModelTests {
                 guard let vpid = pid_t(raw), vpid > 1 else { throw TestFailure(description: "看门狗没写出 pid") }
                 vm.stopWatch()
                 try spin(until: { kill(vpid, 0) != 0 }, timeout: 4)
+            case "incidents_loaded":
+                try f.write("incidents.log",
+                            "2026-11-02 11:48:57\t出口变化\t1.2.3.4 → 5.6.7.8\n"
+                            + "2026-11-02 11:54:01\t检查未通过\t时区不符\n")
+                let vm = f.vm()
+                vm.loadIncidents()
+                try expect(vm.incidents.count == 2, "应解析两条记录")
+                try expect(vm.incidents.first?.kind == "检查未通过", "最新的排在最前")
+                try expect(vm.incidents.first?.reason == "时区不符", "原因列应完整")
+                try expect(vm.incidents.last?.kind == "出口变化", "最旧的排在最后")
+            case "incidents_malformed_ignored":
+                // 缺列的行整条丢掉:显示半条比不显示更糟,用户会以为原因就这些。
+                try f.write("incidents.log",
+                            "只有一列\n"
+                            + "2026-11-02 11:00:00\t出口变化\n"
+                            + "2026-11-02 11:01:00\t代理断开\t探测连续 3 次失败\n")
+                let vm = f.vm()
+                vm.loadIncidents()
+                try expect(vm.incidents.count == 1, "缺列的行应被丢掉")
+                try expect(vm.incidents.first?.kind == "代理断开", "保留的那条应完整")
+            case "incidents_missing_file":
+                let vm = f.vm()
+                vm.loadIncidents()
+                try expect(vm.incidents.isEmpty, "没有记录文件时应为空,不是崩掉")
             case "failed_fix":
                 try f.write("fix-exit", "1")
                 let vm = f.vm()

@@ -20,6 +20,8 @@ SCENARIOS = (
     # 运行期看门狗:通过才起、没通过不起、收到 STOP 要拦、重新检查要撤掉旧的。
     "watch_after_pass", "watch_not_started_on_failure", "watch_blocks_on_stop",
     "watch_restart_drops_old_guard", "watch_stop_kills_process",
+    # 拦截记录:界面要能把「上次为什么被停」翻出来
+    "incidents_loaded", "incidents_malformed_ignored", "incidents_missing_file",
 )
 
 
