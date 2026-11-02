@@ -1875,6 +1875,18 @@ probe_egress() {
     PROBE_STATUS="ok"; return 0
 }
 
+# 哪些网络服务还开着 IPv6,一行一个。
+# 只看 Wi-Fi 是不够的:插网线走 Ethernet、或开着「iPhone USB」共享时,
+# IPv6 会从另一条服务溜出去,而检查项照样报「已关闭」—— 最隐蔽的一类漏报。
+# 停用中的服务(列表里带 * 前缀)不参与判定:它们不承载流量。
+ipv6_on_services() {
+    local s
+    while IFS= read -r s; do
+        case "$s" in ''|'*'*) continue ;; esac
+        networksetup -getinfo "$s" 2>/dev/null | grep -i '^IPv6:' | grep -qiv 'Off' && printf '%s\n' "$s"
+    done <<< "$(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)"
+}
+
 # ---------- 安全检查 ----------
 check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
@@ -1955,8 +1967,8 @@ check() {
         fails="$fails;地区不符(当前 ${locale:-未知},期望 $LOCALE_TARGET)"
     fi
 
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || fails="$fails;IPv6未关闭"
+    v6=$(ipv6_on_services | paste -sd '、' -)
+    [ -n "$v6" ] && fails="$fails;IPv6未关闭($v6)"
 
     if ! check_disabled "DNS"; then
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
@@ -2383,8 +2395,12 @@ checkdetail() {
     else
         echo "地区=fail:当前 ${locale:-未知},期望 $LOCALE_TARGET · 点「一键修复」对齐"
     fi
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭 · 点「一键修复」'; fi
+    v6=$(ipv6_on_services | paste -sd '、' -)
+    if [ -z "$v6" ]; then
+        echo 'IPv6=ok:已关闭'
+    else
+        echo "IPv6=fail:未关闭($v6) · 点「一键修复」"
+    fi
     if check_disabled "DNS"; then
         optional_result "DNS" ok
     else
@@ -2603,9 +2619,15 @@ fix() {
 
     # B. 时区/IPv6/DNS缓存/保镖(需管理员权限,会弹一次密码框)
     tz=$(readlink /etc/localtime 2>/dev/null)
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
+    v6=$(ipv6_on_services)
     adminCmds=""
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
+    # 逐条服务关 IPv6。只关 Wi-Fi 会漏掉 Ethernet/iPhone USB,检查项也就跟着漏报。
+    if [ -n "$v6" ]; then
+        while IFS= read -r svc; do
+            [ -n "$svc" ] && adminCmds="${adminCmds}networksetup -setv6off '$svc'; "
+        done <<< "$v6"
+    fi
     # 看门狗是「修完能留住」的唯一保障。它守着旧目标时,上面这行改完 5 分钟内就被改回去,
     # 用户看到的就是「一键修复没生效」——所以必须和系统时区在同一次授权里一起对齐。
     wt=$(tz_watchdog_target)
@@ -2622,17 +2644,26 @@ fix() {
     fi
     if [ -n "$adminCmds" ]; then
         adminCmds="${adminCmds}dscacheutil -flushcache; killall -HUP mDNSResponder"
-        echo "FIX:修复时区/IPv6/DNS/保镖(需要密码)..."
+        echo "FIX:修复时区/IPv6/保镖(需要密码)..."
         if osascript <<ASEOF >/dev/null 2>&1
 do shell script "$adminCmds" with prompt "一键修复需要管理员权限" with administrator privileges
 ASEOF
         then
-            echo "FIX:时区/IPv6/DNS/保镖 ✓"
+            echo "FIX:时区/IPv6/保镖 ✓"
         else
             echo "FIX:时区/IPv6/保镖 ✗(取消或失败)"
         fi
     else
         echo "FIX:时区/IPv6/保镖 无需修复 ✓"
+    fi
+    # DNS 这里只刷新了缓存,并没有改变解析路径 —— 不能跟着一起打勾。
+    # 真没走隧道时必须明说「这项修不了」,否则用户看到「修复完成」却还是红叉。
+    if ! check_disabled "DNS"; then
+        dnsnow=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
+        case "$dnsnow" in
+            "$FAKE_PREFIX"*) ;;
+            *) echo "FIX:DNS 未走隧道(${dnsnow:-空}) · 一键修复改不了这项,请在客户端里把 DNS 设为隧道/DoH" ;;
+        esac
     fi
 
     # B3. Claude 客户端单独设英文(用户级,无需密码;系统首选语言已是英文则跳过)

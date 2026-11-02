@@ -44,7 +44,11 @@ class CheckSemanticsTests(unittest.TestCase):
 esac''')
         self.stub("dig", "echo 198.18.0.2")
         self.stub("defaults", '''if [[ "$*" == *AppleLocale* ]]; then echo en_US; else printf '(\\n    en-US,\\n)'; fi''')
-        self.stub("networksetup", "echo 'IPv6: Off'")
+        self.stub("networksetup", '''case "$1" in
+  -listallnetworkservices) printf 'An asterisk (*) denotes that a network service is disabled.\\nWi-Fi\\nEthernet\\n*Thunderbolt Bridge\\n' ;;
+  -getinfo) case "$2" in Wi-Fi) echo "IPv6: Off" ;; Ethernet) echo "IPv6: Off" ;; *) echo "IPv6: Off" ;; esac ;;
+  *) echo "IPv6: Off" ;;
+esac''')
         self.stub("launchctl", "exit 1")
         self.stub("readlink", "echo /var/db/timezone/zoneinfo/America/New_York")
 
@@ -156,6 +160,30 @@ esac''')
         check = self.run_core(script, "check")
         self.assertNotEqual(check.returncode, 0)
         self.assertIn("环境未配置(时区目标缺失", check.stdout)
+
+    def test_ipv6_is_checked_on_every_service_not_just_wifi(self):
+        """只看 Wi-Fi 会漏报:插网线走 Ethernet 时,v6 从另一条服务溜出去。
+
+        这是最隐蔽的一类漏报 —— 检查项报「已关闭」,实际上一根网线就破了。
+        """
+        self.stub("networksetup", '''case "$1" in
+  -listallnetworkservices) printf 'header\\nWi-Fi\\nEthernet\\n' ;;
+  -getinfo) case "$2" in Wi-Fi) echo "IPv6: Off" ;; *) echo "IPv6: Automatic" ;; esac ;;
+esac''')
+        run = self.run_core(self.core(), "checkdetail")
+        value = self.line(run.stdout, "IPv6")
+        self.assertTrue((value or "").startswith("fail:"), value)
+        self.assertIn("Ethernet", value)
+        self.assertNotIn("Wi-Fi", value, "关掉的服务不该被点名")
+
+    def test_disabled_service_does_not_count(self):
+        """停用中的服务不承载流量,不该因为它开着 IPv6 就判失败。"""
+        self.stub("networksetup", '''case "$1" in
+  -listallnetworkservices) printf 'header\\nWi-Fi\\n*Thunderbolt Bridge\\n' ;;
+  -getinfo) case "$2" in Wi-Fi) echo "IPv6: Off" ;; *) echo "IPv6: Automatic" ;; esac ;;
+esac''')
+        run = self.run_core(self.core(), "checkdetail")
+        self.assertEqual(self.line(run.stdout, "IPv6"), "ok:已关闭", run.stdout)
 
     def test_rule_hint_turns_kernel_errors_into_actions(self):
         """内核校验的错误要翻成「缺什么 + 点哪里」,而不是原样抛给用户。"""
