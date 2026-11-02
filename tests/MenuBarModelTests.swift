@@ -365,6 +365,23 @@ struct MenuBarModelTests {
                 vm.refresh(); try f.idle(vm)
                 try expect(vm.phase == .ready, "重新检查后仍应就绪")
                 try expect(vm.lastCheckSummary == "通过", "重新检查应重新得出结论")
+            case "watch_stop_kills_process":
+                // 「发了 SIGTERM」不等于「进程停了」。实测 bash 卡在 sleep 里时能拖到
+                // 下一轮,这期间新守护撞上旧的,两边各拿一份基线判出口。
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try spin { f.rawCalls.contains("watch 10 6") }
+                let pidFile = f.root.appendingPathComponent("watch-pid")
+                var raw = ""
+                for _ in 0..<60 {
+                    raw = (try? String(contentsOf: pidFile, encoding: .utf8))?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !raw.isEmpty { break }
+                    pump(0.05)
+                }
+                guard let vpid = pid_t(raw), vpid > 1 else { throw TestFailure(description: "看门狗没写出 pid") }
+                vm.stopWatch()
+                try spin(until: { kill(vpid, 0) != 0 }, timeout: 4)
             case "failed_fix":
                 try f.write("fix-exit", "1")
                 let vm = f.vm()

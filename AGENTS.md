@@ -103,6 +103,8 @@
 2. **v4/v6 分族记账，v6 只比 `/64` 前缀**。同一台机器在 v4 与 v6 之间来回切是代理正常行为，不是出口变化；v6 后缀轮换同理（隐私扩展地址天天换）。只有前缀变了才算换了网段。
 3. **一次失败不动手**。整轮审计失败先 `sleep 5` 复检，仍失败才停；出口探测连续 3 次拿不到地址才判定代理已断。一次 curl 抖动就杀进程，比漏判更让人受不了——这条是用户原话，别改。
 4. **停 Claude 必须落到 `pkill`**。`osascript quit` 对 Tauri/Electron 应用经常无响应，等 3 秒仍在就直接 `pkill`，同时清掉 `claude-code/cli.js` 与 `@anthropic-ai/claude-code` 两类 CLI 进程。少清一类，就会留下一个还在发请求的进程。
+5. **`TERM`/`INT` 的 trap 里必须 `exit`**。bash 的 trap 执行完会回到被中断的地方继续跑，只删 pidfile 不 `exit` 的话，App 的 `terminate()` 压根停不下看门狗——实测就是这样每重启一次 App 就多一个孤儿守护，各自拿一份基线判出口。`EXIT` 分支只做清理，不要 `exit`（会递归）。
+6. **定位看门狗只认 pidfile，不用 `pkill -f "claude-switch.sh watch"`**。`-f` 匹配整条命令行，任何命令行里含这串字的进程都会被误杀——包括用户自己的 `grep`、`tail`，以及诊断命令本身。实测踩到过，表现为「正在跑的 shell 突然收到 SIGTERM」。App 侧读 pidfile 后还要用 `ps -p <pid> -o command=` 确认一次，避免 pid 复用误杀无关进程。
 
 拦截后的提醒走三条路：窗口横幅、菜单栏图标（换成 `exclamationmark.shield.fill`）、系统通知。**通知不能省**——出问题时用户多半没开着窗口，前两条都看不见。通知走 `osascript display notification` 而不是 `UNUserNotificationCenter`：App 是 ad-hoc 签名，重签名后通知授权会失效。
 

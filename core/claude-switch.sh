@@ -3281,7 +3281,10 @@ watch_lock() {
     fi
     printf '%s\n' "$$" > "$WATCH_PIDFILE"
     # 只删自己写的那份。旧实例被接管时也会跑到 EXIT,无条件 rm 会把新实例的记录带走。
-    trap '[ "$(cat "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"' EXIT INT TERM
+    # TERM/INT 分支必须带 exit:bash 的 trap 执行完会回到被中断的地方继续跑,
+    # 不 exit 的话 App 的 terminate() 压根停不下看门狗 —— 实测就是这样留下孤儿的。
+    trap '[ "$(cat "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"' EXIT
+    trap '[ "$(cat "$WATCH_PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_PIDFILE"; exit 143' INT TERM
 }
 
 watch() {

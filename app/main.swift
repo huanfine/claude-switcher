@@ -143,12 +143,17 @@ final class VM: ObservableObject {
 
     /// App 被强杀或崩溃时,它起的看门狗走不到 applicationWillTerminate,会留成孤儿。
     /// 这些孤儿拿着上一轮的基线继续判,既可能误伤也可能和新的守护打架。
-    /// 启动时一律收掉;脚本那边还有 pidfile 单实例兜底,两层都留着。
+    /// 启动时收掉;脚本那边还有 pidfile 单实例锁兜底,两层都留着。
+    ///
+    /// 不能用 pkill -f "claude-switch.sh watch":它匹配的是整条命令行,任何命令行里
+    /// 含这串字的进程都会被误杀 —— 包括用户自己的 grep、tail,以及我们派生的诊断
+    /// 命令。实测踩到过,表现为「正在跑的 shell 突然收到 SIGTERM」。pidfile 才精确。
     private func killOrphanWatch() {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        p.arguments = ["-f", "claude-switch.sh watch"]
-        if (try? p.run()) != nil { p.waitUntilExit() }
+        #if CLAUDE_SWITCHER_TESTS
+        // 测试进程不该碰真实环境:pidfile 指向的是本机正在跑的守护,杀了就断守护。
+        #else
+        Self.killWatchByPidfile()
+        #endif
     }
 
     func prepareToShow() {
@@ -319,8 +324,45 @@ final class VM: ObservableObject {
         guard watchActive else { return }
         watchStopping = true
         watchActive = false
-        if let p = watchProcess, p.isRunning { p.terminate() }
+        if let p = watchProcess, p.isRunning {
+            let pid = p.processIdentifier
+            p.terminate()
+            // terminate() 只发 SIGTERM,而 bash 正卡在 sleep 里时不会立刻响应 ——
+            // 实测能拖到下一轮(10s)。这期间新起的守护会撞上旧的,两边各拿一份
+            // 基线判出口。所以半秒还不停就直接 SIGKILL:旧守护多活一秒都是风险。
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                if p.isRunning { kill(pid, SIGKILL) }
+            }
+        } else {
+            // onStart 是主队列异步回调,极端情况下 stopWatch 会先于它执行,那时
+            // watchProcess 还是 nil。按 pidfile 兜底,别让旧守护借着这个空档活下来。
+            #if !CLAUDE_SWITCHER_TESTS
+            Self.killWatchByPidfile()
+            #endif
+        }
         watchProcess = nil
+    }
+
+    private static func killWatchByPidfile() {
+        let path = NSHomeDirectory() + "/.claude-switcher/watch.pid"
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let pid = pid_t(raw.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1 else { return }
+        // pid 会被复用。杀之前先确认它确实是看门狗,而不是恰好拿到同一个号的进程。
+        guard isWatchProcess(pid) else { return }
+        kill(pid, SIGKILL)
+    }
+
+    private static func isWatchProcess(_ pid: pid_t) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-p", String(pid), "-o", "command="]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(decoding: data, as: UTF8.self).contains("claude-switch.sh watch")
     }
 
     /// 把输出文件里新增的完整行吐出去。半行留在 pending 里等下一次,不猜。
