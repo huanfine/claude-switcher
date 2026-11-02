@@ -31,13 +31,14 @@
     },
     {
       "name": "监控与埋点",
-      "note": "browser-intake-us5-datadoghq.com 的根域名是整串(中间是连字符不是点),DOMAIN-SUFFIX,datadoghq.com 抓不到它;上报 IP 与 API IP 不一致会触发异常检测",
+      "note": "browser-intake-us5-datadoghq.com 的根域名是整串(中间是连字符不是点),DOMAIN-SUFFIX,datadoghq.com 抓不到它;上报 IP 与 API IP 不一致会触发异常检测。siftscience.com 是反欺诈检测,同样上报。",
       "domains": [
         "datadoghq.com",
         "browser-intake-us5-datadoghq.com",
         "sentry.io",
         "statsigapi.net",
-        "segment.io"
+        "segment.io",
+        "siftscience.com"
       ]
     },
     {
@@ -51,17 +52,33 @@
     },
     {
       "name": "客服与静态资源",
-      "note": "",
+      "note": "anthropic.com.cdn.cloudflare.net 的根是 cloudflare.net,不在 cloudflare.com 后缀里;anthropic.auth0.com 是登录认证,漏了会在登录时换出口",
       "domains": [
         "intercom.io",
         "intercomcdn.com",
         "intercomassets.com",
         "anthropic-com.ghost.io",
+        "anthropic.auth0.com",
+        "anthropic.com.cdn.cloudflare.net",
         "servd-anthropic-website.b-cdn.net",
         "cdn.usefathom.com"
       ]
     }
   ],
+  "ip_fallback": {
+    "note": [
+      "域名规则的最后一道防线:域名漏配、DNS 走 DoH 解析、ECH 加密了 SNI 时,",
+      "按 IP 匹配是唯一还认得出来的手段。api.anthropic.com / claude.ai / claude.com /",
+      "claudeusercontent.com 目前都解析到 160.79.104.10,整段都在 160.79.104.0/21 里。",
+      "no-resolve 是必须的:否则每条规则都要先把域名反查成 IP 再匹配,首包会明显变慢。",
+      "只收纯 CIDR,不用 GEOSITE/ASN —— 那两种依赖客户端内置数据库,",
+      "库里没有对应条目时 mihomo 会直接拒绝加载整份配置,等于把用户的代理搞挂。"
+    ],
+    "cidrs": [
+      "160.79.104.0/21",
+      "2607:6bc0::/32"
+    ]
+  },
   "ports": {
     "note": "STUN/TURN 标准端口。国内直连规则会把 stun.miwifi.com 等判直连,UDP 需按端口强制进隧道",
     "values": [3478, 5349, 19302]

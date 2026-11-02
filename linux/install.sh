@@ -296,14 +296,23 @@ else
     # 改完本文件跑一次 `python3 scripts/sync-rules.py`,或 `--check` 只做校验。
     # 漏配一个域名就会落到 Match() → 漏网之鱼 → 自动最快组,出口 IP 和 claude.ai
     # 不是同一个,这正是风控最容易抓到的「同一用户来源分裂」。
+    CLAUDE_IPS="160.79.104.0/21 2607:6bc0::/32"
     for d in claude.ai claude.com clau.de anthropic.com \
              claudeusercontent.com claudemcpclient.com claudemcpcontent.com cloudflare.com \
              challenges.cloudflare.com datadoghq.com browser-intake-us5-datadoghq.com sentry.io \
-             statsigapi.net segment.io stripe.com stripe.network \
-             stripecdn.com intercom.io intercomcdn.com intercomassets.com \
-             anthropic-com.ghost.io servd-anthropic-website.b-cdn.net cdn.usefathom.com; do
+             statsigapi.net segment.io siftscience.com stripe.com \
+             stripe.network stripecdn.com intercom.io intercomcdn.com \
+             intercomassets.com anthropic-com.ghost.io anthropic.auth0.com anthropic.com.cdn.cloudflare.net \
+             servd-anthropic-website.b-cdn.net cdn.usefathom.com; do
     # <<< claude-switcher:rules generated <<<
         echo "  - DOMAIN-SUFFIX,$d,$GRP"
+    done
+    # IP 兜底:域名漏配时仍能把 Anthropic 自有网段的流量关进隧道
+    for c in $CLAUDE_IPS; do
+        case "$c" in
+            *:*) echo "  - IP-CIDR6,$c,$GRP,no-resolve" ;;
+            *)   echo "  - IP-CIDR,$c,$GRP,no-resolve" ;;
+        esac
     done
 fi
 

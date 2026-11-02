@@ -60,9 +60,27 @@ class RulesSyncTests(unittest.TestCase):
         names = domains()
         for domain in ("claude.ai", "claude.com", "anthropic.com",
                        "clau.de", "claudemcpclient.com", "claudemcpcontent.com",
-                       "claudeusercontent.com", "browser-intake-us5-datadoghq.com"):
+                       "claudeusercontent.com", "browser-intake-us5-datadoghq.com",
+                       # 这两条的根域名不在任何已有后缀里,漏了就是纯漏网
+                       "anthropic.auth0.com", "anthropic.com.cdn.cloudflare.net"):
             with self.subTest(domain=domain):
                 self.assertIn(domain, names)
+
+    def test_ip_fallback_covers_anthropic_own_range(self):
+        """域名规则是白名单,漏一个就换出口;IP 段是最后一道防线,不能为空。"""
+        cidrs = (data().get("ip_fallback") or {}).get("cidrs") or []
+        self.assertIn("160.79.104.0/21", cidrs, "Anthropic 自有 IPv4 段必须收录")
+        for cidr in cidrs:
+            self.assertIn("/", cidr)
+            self.assertNotIn(" ", cidr)
+
+    def test_ip_fallback_renders_into_every_target(self):
+        for rel in TARGETS:
+            with self.subTest(path=rel):
+                text = (ROOT / rel).read_text(encoding="utf-8-sig")
+                self.assertIn("160.79.104.0/21", text, f"{rel} 没渲染 IP 兜底清单")
+                self.assertIn("CLAUDE_IPS" if rel != "core/claude-switch.sh" else "IP_FALLBACK",
+                              text, f"{rel} 没渲染 IP 兜底变量")
 
     def test_manifest_lives_only_in_generated_blocks(self):
         for rel in TARGETS:

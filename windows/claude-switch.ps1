@@ -621,11 +621,13 @@ $CLAUDE_DOMAINS = @(
     'claude.ai', 'claude.com', 'clau.de', 'anthropic.com',
     'claudeusercontent.com', 'claudemcpclient.com', 'claudemcpcontent.com', 'cloudflare.com',
     'challenges.cloudflare.com', 'datadoghq.com', 'browser-intake-us5-datadoghq.com', 'sentry.io',
-    'statsigapi.net', 'segment.io', 'stripe.com', 'stripe.network',
-    'stripecdn.com', 'intercom.io', 'intercomcdn.com', 'intercomassets.com',
-    'anthropic-com.ghost.io', 'servd-anthropic-website.b-cdn.net', 'cdn.usefathom.com'
+    'statsigapi.net', 'segment.io', 'siftscience.com', 'stripe.com',
+    'stripe.network', 'stripecdn.com', 'intercom.io', 'intercomcdn.com',
+    'intercomassets.com', 'anthropic-com.ghost.io', 'anthropic.auth0.com', 'anthropic.com.cdn.cloudflare.net',
+    'servd-anthropic-website.b-cdn.net', 'cdn.usefathom.com'
 )
 $CLAUDE_PORTS = @('3478', '5349', '19302')
+$CLAUDE_IPS = @('160.79.104.0/21', '2607:6bc0::/32')
 # <<< claude-switcher:rules generated <<<
 
 # 读取 YAML 中第一个 key: value 标量(用于 clash-verge.yaml / config.yaml / verge.yaml 的顶层字段)
@@ -774,6 +776,12 @@ function Write-ClashScriptRules {
         $rules = @()
         foreach ($d in $CLAUDE_DOMAINS) { $rules += "DOMAIN-SUFFIX,$d,$PROXY_GROUP" }
         foreach ($p in $CLAUDE_PORTS) { $rules += "DST-PORT,$p,$PROXY_GROUP" }
+        # IP 兜底排在域名之后:域名命中更快更精确,IP 只在域名没命中时兜底。
+        # no-resolve 不能省 —— 否则每条规则都要先反查域名 IP 再匹配,首包会明显变慢。
+        foreach ($c in $CLAUDE_IPS) {
+            if ($c -match ':') { $rules += "IP-CIDR6,$c,$PROXY_GROUP,no-resolve" }
+            else { $rules += "IP-CIDR,$c,$PROXY_GROUP,no-resolve" }
+        }
         $json = ConvertTo-Json -InputObject @($rules) -Compress
         $managed = "// >>> claude-switcher managed rules >>>`r`n" +
             "  const pinnedRules = $json;`r`n" +

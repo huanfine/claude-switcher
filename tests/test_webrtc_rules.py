@@ -24,18 +24,22 @@ def _load_rules():
     """清单只认 data/claude-rules.json 这一个来源,测试不再抄一份。"""
     data = json.loads((ROOT / "data/claude-rules.json").read_text(encoding="utf-8"))
     domains = [d for group in data["domain_groups"] for d in group["domains"]]
-    return domains, tuple(data["ports"]["values"])
+    cidrs = tuple((data.get("ip_fallback") or {}).get("cidrs") or ())
+    return domains, tuple(data["ports"]["values"]), cidrs
 
 
-DOMAINS, PORTS = _load_rules()
+DOMAINS, PORTS, IP_FALLBACK = _load_rules()
 
 
 def expected_rules(group, policy="proxy"):
     target = "REJECT" if policy == "reject" else group
+    # mihomo 把 IP-CIDR 和 IP-CIDR6 都报成 IPCIDR,payload 里带冒号的是 v6。
     return ([{"type": "AND", "payload": f"((Network,udp) && (DstPort,{p}))",
               "proxy": target} for p in PORTS] +
             [{"type": "DomainSuffix", "payload": d, "proxy": group}
-             for d in DOMAINS])
+             for d in DOMAINS] +
+            [{"type": "IPCIDR", "payload": c, "proxy": group}
+             for c in IP_FALLBACK])
 
 
 class WebRTCRulesTests(unittest.TestCase):
@@ -151,8 +155,11 @@ class WebRTCRulesTests(unittest.TestCase):
         self.assertEqual(self.run_helper("write", "reject").returncode, 0)
         self.assertEqual(self.run_helper("write", "proxy").returncode, 0)
         rules = self.evaluate_script()["rules"]
-        self.assertEqual(len(rules), len(DOMAINS) + 4)
-        self.assertTrue(all(r.endswith("," + self.group) for r in rules[:3]))
+        # 置顶规则(端口 + 域名 + IP 兜底)在前,用户原有那条 example.test 规则排在最后
+        self.assertEqual(len(rules), len(PORTS) + len(DOMAINS) + len(IP_FALLBACK) + 1)
+        self.assertTrue(all(r.endswith("," + self.group) for r in rules[:len(PORTS)]))
+        # IP 兜底排在域名之后,且必须带 no-resolve —— 少了它每条规则都要先反查域名 IP
+        self.assertTrue(all(r.endswith(",no-resolve") for r in rules[-1 - len(IP_FALLBACK):-1]))
 
     def test_existing_script_runs_first_and_repeated_write_is_idempotent(self):
         script = self.profiles / "Script.js"

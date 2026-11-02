@@ -566,23 +566,28 @@ DOMAINS = (
     # 出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,它必须与受保护流量同一条链路
     "cloudflare.com",
     "challenges.cloudflare.com",
-    # browser-intake-us5-datadoghq.com 的根域名是整串(中间是连字符不是点),DOMAIN-SUFFIX,datadoghq.com 抓不到它;上报 IP 与 API IP 不一致会触发异常检测
+    # browser-intake-us5-datadoghq.com 的根域名是整串(中间是连字符不是点),DOMAIN-SUFFIX,datadoghq.com 抓不到它;上报 IP 与 API IP 不一致会触发异常检测。siftscience.com 是反欺诈检测,同样上报。
     "datadoghq.com",
     "browser-intake-us5-datadoghq.com",
     "sentry.io",
     "statsigapi.net",
     "segment.io",
+    "siftscience.com",
     "stripe.com",
     "stripe.network",
     "stripecdn.com",
+    # anthropic.com.cdn.cloudflare.net 的根是 cloudflare.net,不在 cloudflare.com 后缀里;anthropic.auth0.com 是登录认证,漏了会在登录时换出口
     "intercom.io",
     "intercomcdn.com",
     "intercomassets.com",
     "anthropic-com.ghost.io",
+    "anthropic.auth0.com",
+    "anthropic.com.cdn.cloudflare.net",
     "servd-anthropic-website.b-cdn.net",
     "cdn.usefathom.com",
 )
 PORTS = (3478, 5349, 19302)
+IP_FALLBACK = ("160.79.104.0/21", "2607:6bc0::/32")
 # <<< claude-switcher:rules generated <<<
 REQUIRED_RULE_COLUMNS = {
     "id", "profile_id", "rule_action", "content", "rule_target",
@@ -780,23 +785,28 @@ DOMAINS = (
     # 出口 IP 审计拿 cloudflare.com/cdn-cgi/trace 当基准,它必须与受保护流量同一条链路
     "cloudflare.com",
     "challenges.cloudflare.com",
-    # browser-intake-us5-datadoghq.com 的根域名是整串(中间是连字符不是点),DOMAIN-SUFFIX,datadoghq.com 抓不到它;上报 IP 与 API IP 不一致会触发异常检测
+    # browser-intake-us5-datadoghq.com 的根域名是整串(中间是连字符不是点),DOMAIN-SUFFIX,datadoghq.com 抓不到它;上报 IP 与 API IP 不一致会触发异常检测。siftscience.com 是反欺诈检测,同样上报。
     "datadoghq.com",
     "browser-intake-us5-datadoghq.com",
     "sentry.io",
     "statsigapi.net",
     "segment.io",
+    "siftscience.com",
     "stripe.com",
     "stripe.network",
     "stripecdn.com",
+    # anthropic.com.cdn.cloudflare.net 的根是 cloudflare.net,不在 cloudflare.com 后缀里;anthropic.auth0.com 是登录认证,漏了会在登录时换出口
     "intercom.io",
     "intercomcdn.com",
     "intercomassets.com",
     "anthropic-com.ghost.io",
+    "anthropic.auth0.com",
+    "anthropic.com.cdn.cloudflare.net",
     "servd-anthropic-website.b-cdn.net",
     "cdn.usefathom.com",
 )
 PORTS = (3478, 5349, 19302)
+IP_FALLBACK = ("160.79.104.0/21", "2607:6bc0::/32")
 # <<< claude-switcher:rules generated <<<
 SCRIPT_BEGIN = "// >>> claude-switcher managed rules >>>"
 SCRIPT_END = "// <<< claude-switcher managed rules <<<"
@@ -949,6 +959,8 @@ def norm(value):
 def expected_rules():
     rules = [("port", p) for p in PORTS]
     rules.extend(("domain", d) for d in DOMAINS)
+    # IP 兜底排在域名规则之后:域名命中更快更精确,IP 只在域名没命中时才兜。
+    rules.extend(("ip", c) for c in IP_FALLBACK)
     return rules
 
 
@@ -978,6 +990,15 @@ def verify_runtime(clash_dir, group, policy):
                     or rule.get("proxy") != target
                     or (rule.get("extra") or {}).get("disabled") is True):
                 fail("运行规则未按策略置顶:UDP/" + str(value))
+        elif kind == "ip":
+            rule = rules[index]
+            # mihomo 把 IP-CIDR 和 IP-CIDR6 都报成 IPCIDR,只能靠 payload 里的冒号区分。
+            if (not isinstance(rule, dict)
+                    or str(rule.get("type", "")).upper().replace("-", "") != "IPCIDR"
+                    or str(rule.get("payload", "")).strip() != value
+                    or rule.get("proxy") != group
+                    or (rule.get("extra") or {}).get("disabled") is True):
+                fail("运行规则未按策略置顶:IP " + value)
         else:
             rule = rules[index]
             if (not isinstance(rule, dict)
@@ -992,7 +1013,9 @@ def verify_runtime(clash_dir, group, policy):
 def rule_strings(group, policy):
     target = "REJECT" if policy == "reject" else group
     return ([f"AND,((NETWORK,UDP),(DST-PORT,{port})),{target}" for port in PORTS] +
-            [f"DOMAIN-SUFFIX,{domain},{group}" for domain in DOMAINS])
+            [f"DOMAIN-SUFFIX,{domain},{group}" for domain in DOMAINS] +
+            [f"{'IP-CIDR6' if ':' in cidr else 'IP-CIDR'},{cidr},{group},no-resolve"
+             for cidr in IP_FALLBACK])
 
 
 def managed_block(group, policy):

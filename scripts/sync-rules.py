@@ -60,14 +60,22 @@ def load():
     note = data.get("note") or []
     if not isinstance(note, list) or any(not isinstance(n, str) for n in note):
         raise SystemExit("FAIL:note 必须是字符串列表")
-    return note, ordered, ports
+    cidrs = (data.get("ip_fallback") or {}).get("cidrs") or []
+    if not isinstance(cidrs, list):
+        raise SystemExit("FAIL:ip_fallback.cidrs 必须是列表")
+    for cidr in cidrs:
+        if not isinstance(cidr, str) or "/" not in cidr or any(c in cidr for c in " \t\r\n,"):
+            raise SystemExit("FAIL:非法 CIDR %r" % (cidr,))
+    if len(set(cidrs)) != len(cidrs):
+        raise SystemExit("FAIL:ip_fallback.cidrs 里有重复项")
+    return note, ordered, ports, cidrs
 
 
 def head(note, indent):
     return [indent + BEGIN, indent + BANNER] + [indent + ("# " + line if line else "#") for line in note]
 
 
-def render_python(note, ordered, ports, indent):
+def render_python(note, ordered, ports, cidrs, indent):
     out = head(note, indent)
     out.append(indent + "DOMAINS = (")
     last = None
@@ -78,13 +86,18 @@ def render_python(note, ordered, ports, indent):
         out.append(indent + '    "%s",' % domain)
     out.append(indent + ")")
     out.append(indent + "PORTS = (%s)" % ", ".join(str(p) for p in ports))
+    if cidrs:
+        out.append(indent + "IP_FALLBACK = (%s)" % ", ".join('"%s"' % c for c in cidrs))
     out.append(indent + END)
     return out
 
 
-def render_bash(note, ordered, ports, indent):
+def render_bash(note, ordered, ports, cidrs, indent):
     domains = [domain for _, domain in ordered]
     out = head(note, indent)
+    # IPS 必须在 for 循环之前赋值 —— 块的结尾是循环的 `; do`,循环体在块外面。
+    if cidrs:
+        out.append(indent + "CLAUDE_IPS=\"%s\"" % " ".join(cidrs))
     rows = [domains[i:i + 4] for i in range(0, len(domains), 4)]
     for index, row in enumerate(rows):
         prefix = indent + ("for d in " if index == 0 else " " * len("for d in "))
@@ -94,7 +107,7 @@ def render_bash(note, ordered, ports, indent):
     return out
 
 
-def render_powershell(note, ordered, ports, indent):
+def render_powershell(note, ordered, ports, cidrs, indent):
     domains = [domain for _, domain in ordered]
     out = head(note, indent)
     out.append(indent + "$CLAUDE_DOMAINS = @(")
@@ -103,6 +116,8 @@ def render_powershell(note, ordered, ports, indent):
         out.append(indent + "    " + ", ".join("'%s'" % d for d in row) + ("," if start + 4 < len(domains) else ""))
     out.append(indent + ")")
     out.append(indent + "$CLAUDE_PORTS = @(%s)" % ", ".join("'%d'" % p for p in ports))
+    if cidrs:
+        out.append(indent + "$CLAUDE_IPS = @(%s)" % ", ".join("'%s'" % c for c in cidrs))
     out.append(indent + END)
     return out
 
@@ -135,14 +150,14 @@ def replace_blocks(text, block, rel):
 
 def main(argv):
     check = "--check" in argv
-    note, ordered, ports = load()
+    note, ordered, ports, cidrs = load()
     stale = []
     for rel, renderer, indent in TARGETS:
         path = ROOT / rel
         if not path.exists():
             raise SystemExit("FAIL:缺少目标文件 %s" % rel)
         original, bom = read(path)
-        updated, count = replace_blocks(original, renderer(note, ordered, ports, indent), rel)
+        updated, count = replace_blocks(original, renderer(note, ordered, ports, cidrs, indent), rel)
         if updated == original:
             print("ok    %s (%d 处)" % (rel, count))
             continue
