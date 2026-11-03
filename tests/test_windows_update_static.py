@@ -146,9 +146,16 @@ class WindowsUpdateStaticTests(unittest.TestCase):
 
     def test_check_update_contract(self):
         text = read(CORE)
+        # 更新源必须是本 fork。这条断言以前写死的是上游 YOURSJEYO,等于把
+        # 「自动更新把上游整包拉下来覆盖本地改动」这个 bug 固化成预期行为。
         self.assertIn(
-            "https://api.github.com/repos/YOURSJEYO/claude-switcher/releases/latest",
+            "https://api.github.com/repos/huanfine/claude-switcher/releases/latest",
             text,
+        )
+        self.assertNotIn(
+            "api.github.com/repos/YOURSJEYO/",
+            text,
+            "Windows 自动更新不得指回上游仓库,否则会覆盖本 fork 的改动",
         )
         self.assertIn("-UserAgent 'ClaudeSwitcher'", text)
         self.assertIn("-TimeoutSec 8", text)
@@ -169,6 +176,8 @@ class WindowsUpdateStaticTests(unittest.TestCase):
                 self.assertIn(key, text)
         self.assertIn("*-windows.zip", text)
         self.assertIn("SHA256SUMS-release.txt", text)
+        # 本仓库没有 Release,404 必须转成人话,不能把 PowerShell 原始异常甩给用户
+        self.assertIn("未发布 Release", text)
 
     def test_update_now_hardening(self):
         body = update_now_body()

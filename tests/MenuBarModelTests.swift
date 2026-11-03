@@ -147,9 +147,14 @@ struct MenuBarModelTests {
                 try expect(vm.archived == Set(["A", "B", "C"]), "应解析三个已建档账号")
                 try expect(vm.stamps["A"] == AccountStamp(size: "1.2G", date: "2026-10-20"), "应解析账号大小与日期")
                 let card = ContentView(vm: vm)
-                try expect(card.accountSubtitle("A") == "当前", "当前账号副标题不正确")
-                try expect(card.accountSubtitle("B") == "已建档 · 900M · 10-19", "已建档副标题应带大小与日期")
-                try expect(card.accountSubtitle("D") == "未初始化", "空槽位副标题不正确")
+                // 卡片是两行:第一行状态,第二行体积和日期。两行都要断言,
+                // 否则「当前账号」和它的存档信息对不上也发现不了。
+                try expect(card.accountStateLabel("A") == "当前账号" && card.accountSubtitle("A") == "1.2G · 10-20",
+                           "当前账号卡片文案不正确")
+                try expect(card.accountStateLabel("B") == "已建档" && card.accountSubtitle("B") == "900M · 10-19",
+                           "已建档卡片应带大小与日期")
+                try expect(card.accountStateLabel("D") == "未初始化" && card.accountSubtitle("D") == "空",
+                           "空槽位卡片文案不正确")
                 vm.switchTo("C"); try f.idle(vm)
                 try expect(vm.current == "C" && vm.note.isEmpty, "已建档的 C 不应提示首次登录")
                 try expect(f.calls.contains("switch C"), "C 应被允许切换")
@@ -415,6 +420,65 @@ struct MenuBarModelTests {
                 let vm = f.vm()
                 vm.loadIncidents()
                 try expect(vm.incidents.isEmpty, "没有记录文件时应为空,不是崩掉")
+            case "health_score_gates_on_hard_failure":
+                // 首页那个大数字是用户唯一会看的结论。曾经硬性项全挂还显示 85 分,
+                // 因为分数只按「项数」扣 —— 等于告诉用户「小毛病,能用」。
+                // 硬性项(不可关闭的那 8 项)是「Claude 能不能启动」的开关,
+                // 一失败就必须塌到低位,并且结论要直说「不会启动」。
+                func rows(_ overrides: [String: RowState]) -> [CheckRow] {
+                    let hard = ["代理内核", "TUN网卡", "出口IP", "时区", "地区", "IPv6", "保镖", "规则置顶"]
+                    let soft = ["IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性"]
+                    return (hard.map { ($0, false) } + soft.map { ($0, true) }).map { name, disable in
+                        CheckRow(name: name, icon: "circle", canDisable: disable,
+                                 state: overrides[name] ?? .ok)
+                    }
+                }
+
+                // 全通过 = 100
+                let clean = HealthSummary.evaluate(rows([:]))
+                try expect(clean.score == 100 && clean.level == .ok, "全通过应满分且判定为 ok")
+                try expect(clean.headline.contains("可以正常启动"), "全通过要直说能启动")
+
+                // 只掉提示项:还能启动,分数只是略降
+                let notices = HealthSummary.evaluate(rows(["ASN属性": .warn, "生态可达性": .warn]))
+                try expect(notices.level == .notice, "提示项不该被判成无法启动")
+                try expect(notices.score == 88, "两个提示项应扣到 88，实际 \(notices.score)")
+                try expect(notices.badge == "可以启动", "提示项的徽章要直说「可以启动」")
+                try expect(notices.headline.contains("2 项建议处理"), "正文要说清要处理几项")
+
+                // 硬性项失败:必须塌到 30 分以下,并且说「不会启动」
+                let broken = HealthSummary.evaluate(rows(["代理内核": .fail]))
+                try expect(broken.level == .cannotStart, "硬性项失败必须判定为无法启动")
+                try expect(broken.score < 30, "无法启动时分数必须塌到 30 以下，实际 \(broken.score)")
+                try expect(broken.headline.contains("代理内核"), "结论要点名是哪一项没过")
+                try expect(broken.headline.contains("不会启动"), "结论要说清后果，不能只说「未通过」")
+
+                // 再多挂一项硬性,分数只会更低,不会反弹
+                let worse = HealthSummary.evaluate(rows(["代理内核": .fail, "TUN网卡": .fail]))
+                try expect(worse.score < broken.score, "硬性项挂得越多分越低")
+                try expect(worse.headline.contains("另有"), "多项失败要说清还有几项")
+
+                // 硬性项失败 + 提示项一堆,依然是「无法启动」,不能被提示项稀释
+                let mixed = HealthSummary.evaluate(rows(["出口IP": .fail, "DNS": .warn,
+                                                         "ASN属性": .warn, "WebRTC": .warn]))
+                try expect(mixed.level == .cannotStart && mixed.score < 30,
+                           "提示项再多也不能把「无法启动」抬回可启动")
+            case "fix_note_explains_failure":
+                // 修不了的时候只写「需手动处理」等于没说。脚本本来就把原因写在
+                // ✗ 后面,界面必须把它捞出来显示。
+                try expect(VM.fixNote(from: "代理内核/TUN ✗(请打开 Clash Verge 检查节点/线路)")
+                           == "请打开 Clash Verge 检查节点/线路", "✗ 后面的括号内容就是原因")
+                try expect(VM.fixNote(from: "时区/IPv6/保镖 ✗(取消或失败)") == "取消或失败",
+                           "括号要剥掉")
+                try expect(VM.fixNote(from: "置顶规则 ✗ 未验证内核加载:ok") == "未验证内核加载:ok",
+                           "没有括号就取符号后面整段")
+                try expect(VM.fixNote(from: "Claude 客户端语言 → en-US ✓(重启 Claude 后生效)")
+                           == "重启 Claude 后生效", "成功也要带前提")
+                try expect(VM.fixNote(from: "时区/IPv6/保镖 无需修复 ✓").isEmpty,
+                           "符号后面没内容就不该编一句附注")
+                // 没有 ✓/✗ 但明显是失败的行(脚本里真有),整句就是原因
+                try expect(VM.fixNote(from: "FlClash 未能退出，请手动退出后重试")
+                           == "FlClash 未能退出，请手动退出后重试", "无符号的失败行要整句保留")
             case "failed_fix":
                 try f.write("fix-exit", "1")
                 let vm = f.vm()

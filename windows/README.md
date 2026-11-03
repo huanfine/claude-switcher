@@ -1,6 +1,6 @@
 # Claude 切换器 · Windows 版 (Beta)
 
-> ⚠️ **本版本为 Beta,未经大规模真机测试**。核心逻辑移植自 macOS 稳定版,但 Windows 环境差异大,遇到问题请到 [Issues](https://github.com/YOURSJEYO/claude-switcher/issues) 反馈。
+> ⚠️ **本版本为 Beta,未经大规模真机测试**。核心逻辑移植自 macOS 稳定版,但 Windows 环境差异大,遇到问题请到 [Issues](https://github.com/huanfine/claude-switcher/issues) 反馈。
 
 ## 系统要求
 

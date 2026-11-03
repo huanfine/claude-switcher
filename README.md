@@ -2,14 +2,14 @@
 
 # Claude 切换器
 
-[English](README.en.md) · [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
+[English](README.en.md) · [GitHub](https://github.com/huanfine/claude-switcher)
 
 **Fail-Closed 账号环境管理器 —— 把真实 IP 泄漏拦截在启动之前**
 
 > 🛠️ **本项目持续活跃更新中**——防护项随目标平台风控演进不断增加，见下方[路线图](#路线图)。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/YOURSJEYO/claude-switcher?label=release&color=blue)](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
+[![Release](https://img.shields.io/github/v/release/huanfine/claude-switcher?label=release&color=blue)](https://github.com/huanfine/claude-switcher/releases)
 [![Platform](https://img.shields.io/badge/Platform-macOS-blue.svg)]()
 [![Windows](https://img.shields.io/badge/Windows-Beta-lightgrey.svg)](windows/)
 [![Linux](https://img.shields.io/badge/Linux-Beta-lightgrey.svg)](linux/)
@@ -145,7 +145,9 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 ### 直接下载（推荐）
 
-到 [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest) 下载最新版本，按用途选择：
+到 [Releases](https://github.com/huanfine/claude-switcher/releases) 下载最新版本，按用途选择：
+
+> 本仓库是二改版，暂未发布预编译产物。Releases 为空时请直接走下面的「[从源码安装](#从源码安装)」——clone 后双击 `installer/安装.command`，效果与 installer-kit 相同。**不要下载上游仓库的安装包**：上游版本会把更新源改回上游，本地改动会被后续自动更新覆盖。
 
 - `ClaudeSwitcher-<版本>-installer-kit.zip`：**首次安装推荐**。解压后双击 `installer/安装.command`，安装核心脚本、守护进程与桌面 App。
 - `ClaudeSwitcher-<版本>-macos-arm64-app-only.dmg` / `.zip`：**仅包含界面 App**（不含核心脚本）；已安装核心脚本时可用于替换旧版界面。首次安装请用上面的 installer-kit。
@@ -157,7 +159,7 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 ```bash
 # 克隆后双击 installer/安装.command 即可,自动识别代理客户端、代理组名与地区目标
-git clone https://github.com/YOURSJEYO/claude-switcher.git
+git clone https://github.com/huanfine/claude-switcher.git
 ```
 
 ## 地区自适应
@@ -460,20 +462,9 @@ WEBRTC_POLICY=proxy ~/.local/bin/claude-switch.sh fix
 
 欢迎 Fork / PR。Issue 区接受场景补充——你遇到的每一个真实泄漏场景，都可能成为下一个检查项。
 
-## 微信交流群
-
-欢迎加入 **claude-switcher 交流群**，交流安装配置、使用心得和问题排查。使用微信扫描下方二维码即可入群：
-
-![claude-switcher 微信交流群二维码](assets/wechat-group.png)
-
-> 当前二维码标注 **2026 年 11 月 2 日前有效**。若二维码过期或无法入群，请通过 [Issue](https://github.com/YOURSJEYO/claude-switcher/issues) 提醒维护者更新。
-
-Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
-
 ## 问题反馈
 
-- 提交 [Issue](https://github.com/YOURSJEYO/claude-switcher/issues)
-- 在 [Linux.do](https://linux.do) 论坛发帖讨论
+- 提交 [Issue](https://github.com/huanfine/claude-switcher/issues)
 - **安全问题请走非公开渠道**：见 [SECURITY.md](SECURITY.md)（GitHub Private Vulnerability Reporting 优先）
 
 反馈掉登录、弹盾类问题时，请附上「应用设置 → 日志」导出的日志，里面不含密码和 Cookie 原文；如果可以，也请附上可复现步骤。
@@ -493,21 +484,7 @@ Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 - [x] 快照切换提速：归档改为同卷移动 + 载入走 COW 克隆（APFS clonefile / Linux reflink），不再产生全量复制
 - [x] 应用内自动更新：launchd 每 12 小时自动检查更新，自检失败自动回滚，也可手动 `claude-switch.sh update` 保底
 
-> 有想优先看到的功能，去 [Issues](https://github.com/YOURSJEYO/claude-switcher/issues) 投票或提需求，热度高的先做。
-
-## 帮忙吆喝一声
-
-如果这个工具让你少被封了一个号，希望有条件的佬哥能帮我们在 [Linux.do](https://linux.do) 论坛发个帖子推荐一下——仓库地址 <https://github.com/YOURSJEYO/claude-switcher>，一句话定位：**"Claude 账号的 Fail-Closed 环境保护罩：硬性安全项不过就物理上不让启动"**。让更多被风控折磨的兄弟少走弯路。
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=yoursjeyo%2Fclaude-switcher&type=timeline&legend=bottom-right">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=yoursjeyo/claude-switcher&type=timeline&theme=dark&legend=bottom-right" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=yoursjeyo/claude-switcher&type=timeline&legend=bottom-right" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=yoursjeyo/claude-switcher&type=timeline&legend=bottom-right" />
- </picture>
-</a>
+> 有想优先看到的功能，去 [Issues](https://github.com/huanfine/claude-switcher/issues) 投票或提需求，热度高的先做。
 
 ## License
 

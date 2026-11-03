@@ -6,6 +6,7 @@ last-check.txt
 *.log
 
 build/
+.build/
 _trash/
 .worktrees/
 

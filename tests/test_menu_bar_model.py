@@ -15,6 +15,10 @@ SCENARIOS = (
     "unknown_check_code", "empty_check_code", "nonzero_check", "timeout_check",
     "invalid_status", "nonzero_status", "switch_note_then_failure", "empty_switch",
     "nonzero_switch", "timeout_switch", "busy_guard", "fix_guard", "failed_fix",
+    # 健康分:硬性项失败 = 无法启动,分数必须塌下来,不能被提示项稀释
+    "health_score_gates_on_hard_failure",
+    # 修复失败要说清为什么,不能只丢一句「需手动处理」
+    "fix_note_explains_failure",
     "checking_allows_quit", "hide_after_success", "reopen_cancels_hide",
     "window_lifecycle", "termination_guard",
     # 运行期看门狗:通过才起、没通过不起、收到 STOP 要拦、重新检查要撤掉旧的。

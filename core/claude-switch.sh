@@ -2487,6 +2487,18 @@ checkdetail() {
         ms2=$(awk -v t="${t2:-0}" 'BEGIN{printf "%d", t*1000+0.5}' 2>/dev/null)
         detail="claude.ai:$c1 api:$c2"
         case "${ms2:-}" in ''|*[!0-9]*|0) ;; *) detail="$detail · api 首包 ${ms2}ms" ;; esac
+        # 每次检查落一条采样,给界面的「24h 延迟洞察」用。
+        # 只记观测值,不在这里下判断:ms 为 0 表示这次没连上,
+        # 可用率就是靠它算出来的 —— 别把失败样本丢掉,否则可用率永远是 100%。
+        if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
+            printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "${ms2:-0}" "$c1" "$c2" >> "$BASE/rtt.log" 2>/dev/null
+            # 每 10 分钟最多 60 条,24h 也就 8 千条。超过 512KB 就裁一半,
+            # 不做的话日志会一直长下去。
+            if [ "$(stat -f%z "$BASE/rtt.log" 2>/dev/null || echo 0)" -gt 524288 ] 2>/dev/null; then
+                tail -n 3000 "$BASE/rtt.log" > "$BASE/rtt.log.tmp" 2>/dev/null \
+                    && mv "$BASE/rtt.log.tmp" "$BASE/rtt.log" 2>/dev/null
+            fi
+        fi
         if [ "$c1" != "000" ] && [ "$c2" != "000" ]; then
             optional_result "生态可达性" ok "$detail"
         else
@@ -3324,6 +3336,10 @@ watch() {
     watch_lock
     WATCH_K4=""; WATCH_K6=""; WATCH_STOP=""; WATCH_IP=""
     watch_log "watch 启动 interval=${interval}s full_every=${full_every} pid=$$"
+    # 每完成一轮巡逻吐一次心跳。界面靠它做「驻守中」的呼吸动画 ——
+    # 心跳必须来自真的跑完一轮,不能由界面自己循环,否则守护断了动画还在跳,
+    # 那比没有动画更糟:用户会以为一切正常。
+    echo "BEAT:$(date +%s)"
     while :; do
         n=$((n + 1))
         watch_cycle
@@ -3354,6 +3370,8 @@ watch() {
                 watch_log "整轮检查失败一次,复检通过,不处理:$out"
             fi
         fi
+        # 这一轮平安落地,再吐一次心跳。
+        echo "BEAT:$(date +%s)"
         sleep "$interval"
     done
 }

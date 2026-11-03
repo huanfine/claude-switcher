@@ -4,7 +4,7 @@
 
 **A fail-closed local environment manager for multiple Claude accounts**
 
-[中文](README.md) · [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest) · [Issues](https://github.com/YOURSJEYO/claude-switcher/issues)
+[中文](README.md) · [Releases](https://github.com/huanfine/claude-switcher/releases) · [Issues](https://github.com/huanfine/claude-switcher/issues)
 
 <img src="assets/icon-2048.png" width="120">
 
@@ -44,7 +44,12 @@ closing the window in which traffic could leave outside the proxy.
 
 ### Download (recommended)
 
-Open the [latest release](https://github.com/YOURSJEYO/claude-switcher/releases/latest):
+Open the [releases page](https://github.com/huanfine/claude-switcher/releases):
+
+> This fork does not publish prebuilt artifacts yet. If Releases is empty, use
+> [install from source](#from-source) instead — clone and double-click
+> `installer/安装.command`. **Do not install the upstream package**: it resets the
+> update source to upstream, and later auto-updates will overwrite local changes.
 
 | Asset | Use |
 |---|---|
@@ -63,7 +68,7 @@ desktop app, and Python 3.
 ### From source
 
 ```bash
-git clone https://github.com/YOURSJEYO/claude-switcher.git
+git clone https://github.com/huanfine/claude-switcher.git
 cd claude-switcher
 # Then double-click installer/安装.command
 ```
@@ -107,8 +112,8 @@ responsible for how you use it.
 ## Links
 
 - [中文说明](README.md)
-- [Releases](https://github.com/YOURSJEYO/claude-switcher/releases)
-- [Issues](https://github.com/YOURSJEYO/claude-switcher/issues)
+- [Releases](https://github.com/huanfine/claude-switcher/releases)
+- [Issues](https://github.com/huanfine/claude-switcher/issues)
 - [Security policy](SECURITY.md)
 - [Agent handoff guide](AGENTS.md)
 - [Web environment check](https://yoursjeyo.github.io/claude-switcher/)

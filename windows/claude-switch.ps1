@@ -2261,7 +2261,10 @@ function Get-ReleaseInfo {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         # GitHub 要求 User-Agent;PowerShell 5.1 的 -Headers 不允许改它,-UserAgent 等价写入请求头
-        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/YOURSJEYO/claude-switcher/releases/latest' -UserAgent 'ClaudeSwitcher' -TimeoutSec 8
+        # 更新源必须指本 fork。指回上游(YOURSJEYO)的话,每次自动更新都会把上游
+        # 整包拉下来覆盖本地改动 —— macOS 侧靠 core 里的 UPD_REPO 挡住了,这里之前漏了。
+        # 本仓库暂未发布 Release,接口会返回 404,由下面的 catch 转成人话提示。
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/huanfine/claude-switcher/releases/latest' -UserAgent 'ClaudeSwitcher' -TimeoutSec 8
         $latest = ([string]$rel.tag_name).Trim() -replace '^[vV]', ''
         if (-not $latest) { throw '无法解析最新版本号' }
 
@@ -2279,6 +2282,9 @@ function Get-ReleaseInfo {
     } catch {
         $msg = ([string]$_.Exception.Message) -replace '\r?\n', ' '
         if ($msg -match 'rate limit|API rate|403') { $msg = 'GitHub 接口限流，请稍后再试' }
+        # 404 = 本仓库还没发 Release。别把 "Response status code does not indicate
+        # success: 404" 这种原文甩给用户,他看不懂也不知道该怎么办。
+        elseif ($msg -match '404|Not Found') { $msg = '本仓库未发布 Release，请从源码目录重新运行安装器更新' }
         return @{ status = 'error'; current = $current; latest = ''; zip = ''; sums = ''; page = ''; message = $msg }
     }
 }
