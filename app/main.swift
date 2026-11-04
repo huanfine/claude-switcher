@@ -3851,7 +3851,7 @@ struct NodeScanSheet: View {
             }
             HStack(spacing: 8) {
                 if vm.canApplyBestNode {
-                    Text("门禁允许自动应用；会先停守护、只切一次、复查出口国家，再重新检查")
+                    Text("门禁允许自动应用 · 停守护、只切一次、复查出口")
                         .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
                 } else {
                     Text("已有实例环境时只生成报告,不会自动切换节点")
