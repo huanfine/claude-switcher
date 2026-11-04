@@ -84,7 +84,7 @@ Artifacts are written to `build/`.
 
 ## Usage
 
-1. Open **Claude切换器** and wait for the 15 checks.
+1. Open **Claude切换器** and wait for the 16 checks.
 2. If everything is green, choose an account and launch Claude. If a blocking
    check is red, use the one-click repair action.
 3. Sign in once for each additional account; later switches keep sessions

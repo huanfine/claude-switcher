@@ -7,7 +7,7 @@
 
 ## 你的任务
 
-帮助用户在 macOS 上安装并配置「Claude 切换器」：一个带环境安检的 Claude 账号启动/切换工具。目标状态是：**用户双击桌面图标，15 项检查均已完成，硬性安全项全部通过；仅用户显式配置的非关键项可显示跳过或警告，且可以正常启动 Claude**。
+帮助用户在 macOS 上安装并配置「Claude 切换器」：一个带环境安检的 Claude 账号启动/切换工具。目标状态是：**用户双击桌面图标，16 项检查均已完成，硬性安全项全部通过；仅用户显式配置的非关键项可显示跳过或警告，且可以正常启动 Claude**。
 
 ## 开始之前：必须先确认的前置条件
 
@@ -69,9 +69,9 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（15 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
+日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（16 项逐项）/ `node-scan`（只读扫描当前控路 Selector 的候选节点，按纯净度排名出报告；不切节点、不动守护、不写 iphistory）/ `node-apply`（仅门禁允许时把最优节点切上去并固定；切前实时复核门禁、切后复查出口国家，不达标自动回滚）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
 
-检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`IP纯净度`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 7 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
+检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`IP纯净度`、`生态可达性`、`更优节点`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 8 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
 关于 IP 纯净度（第 14 项，`ip_purity`）：口径是**类型基线 − 扣分**，基线对齐 ip.net.coffee 的实测落点（住宅 100 / 移动 85 / VPN 75 / 机房 60 / Tor 50），判定阈值比分数严。六条不能改回去的口径：
 
@@ -97,15 +97,27 @@
 
 机房出口只给 warn 不拦启动（大量用户就用机房节点），代理特征与 Tor 才拦；机房只有掉到 30 分以下（转租段+滥用记录）才拦。
 
-结果缓存 24 小时（`~/.claude-switcher/purity-cache.v2`），**查不到不写缓存**，否则一次网络抖动会把「未知」钉住一整天。缓存五个字段的顺序是 `ip|时间戳|判定|分数|类型|detail`，分隔符是 `|`：不要改回 tab，tab 属于 IFS 空白，`read` 会把前导空字段整个吞掉，导致 score 与 detail 静默错位。文件名带 `v2` 是因为第 5 个字段从「扣分标签」换成了「出口类型」，混用旧文件会串位。
+结果缓存 24 小时（`~/.claude-switcher/purity-cache.v3`），**查不到不写缓存**，否则一次网络抖动会把「未知」钉住一整天。缓存七个字段的顺序是 `ip|时间戳|判定|分数|类型|detail|cc`，分隔符是 `|`：不要改回 tab，tab 属于 IFS 空白，`read` 会把前导空字段整个吞掉，导致 score 与 detail 静默错位。第 7 列 `cc` 是出口国家代码，从已有的 ip-api / ipquery / ipinfo 响应里顺带取出，不发额外请求，供节点扫描的国家硬门槛使用。文件名带 `v3` 就是因为多了这一列：v2 的 6 列没有它，混读会让 detail 把 `|US` 吞进去，宁可让旧缓存整体作废。**降级判型与「仅一家风险源可达」这两类结果不能缓存满 24 小时**——写入时把时间戳往前拨成仅剩 5 分钟 TTL，否则一次数据源抖动会把「没查干净」钉住一整天。多个 IP 并发打分时各自写缓存会互相覆盖，用 `mkdir .purity-cache.lock` 串行化。
 
-**不要把「可关闭」摆到主界面上**：15 项默认全部拦启动，按能不能关分组会让人以为「有些可以不拦」，等于把降级当选项推荐。主界面只列一份清单；关闭入口只在设置页的「降级防护（不推荐）」里。关掉之后必须持续可见——主界面常驻橙色「防护已降级：…」，`check` 输出追加 `|防护降级:…`，否则命令行、日志、自动化这些看不到界面的地方完全无从判断。
+**不要把「可关闭」摆到主界面上**：16 项默认全部拦启动，按能不能关分组会让人以为「有些可以不拦」，等于把降级当选项推荐。主界面只列一份清单；关闭入口只在设置页的「降级防护（不推荐）」里。关掉之后必须持续可见——主界面常驻橙色「防护已降级：…」，`check` 输出追加 `|防护降级:…`，否则命令行、日志、自动化这些看不到界面的地方完全无从判断。
 
 出口身份归一：`IP一致` 与 48h 变化统计都不直接比原始地址，而是比归一身份——v4 原样，v6 取 `/64` 前缀。`lastip` 按协议族各存一行，两族互不覆盖；历史统计先按族去重再取最大值。这样同一节点双栈交替（先报 v4 再报 v6、或 v6 在同一 /64 内换接口标识）不会被判成「出口在漂移」或「IP 变了」。旧版写下的裸地址在读取时自动迁移，升级后第一次检查不会误报。`出口IP` 走 v6 时行尾标注 `(IPv6 出口)`，免得用户以为地址有问题。
 
 客户端日志与诊断：默认在 `~/Library/Logs/claude-switcher/client.log` 记录脱敏命令元数据，512 KiB 后轮转为 `client.log.1`，可用配置中的 `logging` 关闭。`export-diagnostics <file>` 与 App「导出诊断日志」生成 zip，只含客户端日志、检查设置和脱敏环境/状态摘要。不得把公网/住宅/代理 IP、Bearer/token/session/cookie、账号内容、Clash 配置、`lastip`、`iphistory` 或原始 `last-check.txt` 写入日志或诊断包。
 
 跨身份保留（可选，默认关闭）：`~/.claude-switcher/keep-in-workspace.txt` 每行一个相对 Claude 数据目录的路径（如 `settings.json`、`skills/`），`#` 注释、空行忽略。切换时先收进 `~/.claude-switcher/keep-stage/`，还原目标账号后合并回去；绝对路径、含 `..` 和符号链接会跳过并记 WARN。文件不存在或为空时行为与未启用完全一致。只放通用配置，不要放登录态/缓存等账号专属文件。
+
+## 节点扫描与应用（第 16 项，只读优先）
+
+写这一层代码前先把边界记住：**扫描只读，应用只在门禁允许时切一次**。逐节点「切上去实测出口」那条路会写 N 条 `iphistory.log`，把「IP 与上次一致」凭空扣成分数，还会被看门狗当成出口变化直接停掉 Claude——不允许走。
+
+- `node-scan` 从运行中内核的 `/proxies` 沿 `now` 链找到**最深一层含叶子的 Selector**，只列当前真正控路的组；递归列所有嵌套 Selector 会把「☑️ 手动切换」那 75 个无关节点也带进来。
+- 合并配置 `proxies:` 块只按白名单读 `name / server / servername / sni / host / type / udp / network` 八个字段，**不读 `uuid` / `password` / 证书**，不导出订阅原文，报告与诊断包都不含凭据。这与 FlClash 一键修复的「不读订阅节点与凭据」是两条独立边界：那条写规则数据库、不碰节点；这条只读节点名和入口地址、不写任何代理配置。
+- **硬门槛先于纯净度**：国家不符 / 国家取不到 / Tor 或代理判定 / UDP 未标注的节点都不参与推荐。带 `servername` / `Host` 的 CDN 前置节点 `server` 只是入口，标「出口未知」并排除，不能拿入口 IP 打分。多个叶子共用同一落地 IP 只查一次。
+- 差距不足 `NODE_SCAN_MARGIN`（10 分）不出 `BEST`，免得每次扫描都催用户改线路；清空 `BEST` 时必须连 `BEST_IP` / `BEST_SCORE` / `BEST_SELECTOR` 一起清，别留半截报告。
+- `checkdetail` 的第 16 项**只读报告文件**，绝不在 45 秒检查预算里发网络请求。没有报告 / 报告过期 → `skip`，不是 `ok`；`skip` 不扣分，用户关掉检查项不该反而掉分。有 `preferred-node` 时，`PREFERRED_MATCH=0` 优先于「还有更优节点」报「已偏离固定节点」。
+- 报告门禁 `node_gate()` 是**保守并集**（用户选定口径 A）：Claude 进程 / CLI / 任一 A–D 已建档槽位 / 看门狗驻守，任一成立即 `report-only`。执行门禁 `node_apply_gate()` 必须**重新实时判定**，不信报告里的旧快照；看门狗那条从「pidfile 存在」升级为「进程确实已不在跑」的事实检查，残留 pidfile 不阻塞、真有守护仍拒绝。
+- 守护归 App 管、切换归脚本管：App 先 `stopWatch()`，`node-apply` 不杀 App 持有的守护（否则 App 会误报「守护意外退出」），切完由 `checkEnvironment` 通过后自动 `startWatch()`。已建立的连接不会迁移；只对 `Selector` 生效，`URLTest` / `Fallback` 会被自动选路覆盖。
 
 ## 独立代理诊断
 
@@ -140,7 +152,7 @@ App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是
 
 ## 验收标准（全部满足才算装完）
 
-- 终端执行 `~/.local/bin/claude-switch.sh checkdetail` 输出完整 14 行；硬性安全项全部 `=ok`，非关键项只能是 `=ok`、既有警告，或用户显式配置的 `=skip`/降级警告
+- 终端执行 `~/.local/bin/claude-switch.sh checkdetail` 输出完整 16 行；硬性安全项全部 `=ok`，非关键项只能是 `=ok`、既有警告，或用户显式配置的 `=skip`/降级警告
 - 每行结论只允许 `ok` / `fail` / `config` / `warn` / `skip` 五种。`fail` 与 `config` 都拦启动，但语义不同：`fail` 是实测不达标（去修环境），`config` 是环境层没就绪、无从判定（去补配置）。文案必须带「当前值 vs 期望值 + 一条动作」，禁止只写「未生效」「异常」这类无动作的结论
 - 双击桌面 App，无红色硬性安全项，能正常启动 Claude；灰色 `skip` 不得当成绿色通过
 - `launchctl print system/local.claude-bodyguard`、`system/local.tz-watchdog` 与 `gui/$(id -u)/local.claude-update` 均能查到（服务已注册）

@@ -30,6 +30,8 @@ SCENARIOS = (
     "watch_restart_drops_old_guard", "watch_stop_kills_process",
     # 拦截记录:界面要能把「上次为什么被停」翻出来
     "incidents_loaded", "incidents_malformed_ignored", "incidents_missing_file",
+    # 节点扫描报告 → 界面只更新「更优节点」这一行
+    "node_scan_report_updates_row",
 )
 
 

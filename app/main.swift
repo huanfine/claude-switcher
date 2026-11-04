@@ -111,6 +111,8 @@ struct HealthSummary {
     /// 其余几项要么是稳定性,要么是可达性 —— 真出问题时用户自己会立刻感觉到。
     private static let warningOrder = [
         "IP纯净度", "ASN属性", "WebRTC", "DNS", "IP一致", "客户端语言", "生态可达性",
+        // 「有更干净的可用节点」是建议,不是故障 —— 排最后,别抢纯净度那句话。
+        "更优节点",
     ]
 
     /// 排序键统一去掉空格:界面显示「IP 纯净度」,检查协议里是「IP纯净度」。
@@ -191,7 +193,9 @@ struct HealthSummary {
         func row(_ key: String) -> CheckRow? { rows.first { self.key($0.name) == key } }
         func penalty(_ key: String, _ weight: Int) -> Int {
             guard let r = row(key) else { return 0 }
-            return r.state == .ok || r.state == .pending ? 0 : weight
+            // skip = 用户显式关掉 / 这项没验成(节点报告还没生成)。两种都不是
+            // 「实测不合格」,不能算扣分 —— 否则关掉一个检查项总分反而会掉。
+            return r.state == .ok || r.state == .pending || r.state == .skip ? 0 : weight
         }
 
         // 身份：纯净度按「离满分的距离」线性折算，这是唯一有实测分的项；
@@ -205,6 +209,9 @@ struct HealthSummary {
         }
         identity += penalty("ASN属性", 6)
         identity += penalty("IP一致", 4)
+        // 「存在更干净且过硬门槛的可用节点」属于身份维度:它说的是这条出口
+        // 还有更好的选择,不是环境漏了。4 分,不足以一票压过纯净度实测分。
+        identity += penalty("更优节点", 4)
         identity = min(identity, Weight.identityCap)
 
         let isolation = min(
@@ -381,6 +388,9 @@ final class VM: ObservableObject {
         CheckRow(name: "ASN 属性", icon: "building.columns", canDisable: true),
         CheckRow(name: "IP 纯净度", icon: "gauge.medium", canDisable: true),
         CheckRow(name: "生态可达性", icon: "chart.line.uptrend.xyaxis", canDisable: true),
+        // 13pt/medium 下着墨盒 13.0×13.0、着墨量 8.91%,和这一列同一档
+        // (实测 arrow.up.right 只有 9.5×9.5 / 3.64%,会显得缺一块)。
+        CheckRow(name: "更优节点", icon: "network", canDisable: true),
     ]
     @Published var phase: Phase = .checking
     @Published var current = "?"
@@ -409,6 +419,18 @@ final class VM: ObservableObject {
     @Published var loggingEnabled = true
     @Published var settingsMessage = ""
     @Published private(set) var settingsBusy = false
+    /// 只读节点扫描的结果。不放进 isBusy:扫描期间看门狗照常驻守,界面也
+    /// 不该把「重新检查 / 修复 / 切换」全锁住 —— 这一路本来就没有副作用。
+    @Published private(set) var nodeScanBusy = false
+    @Published var nodeScanReport = ""
+    @Published var showNodeScan = false
+    /// 最近一次扫描/应用报告的键值,只用来决定「应用最优节点」按钮该不该出现。
+    @Published private(set) var nodeScanInfo: [String: String] = [:]
+    /// 门禁是保守并集(App 运行时通常会有守护驻守),所以这个按钮很少出现 ——
+    /// 那正是用户要的形状:宁可让人去客户端点一下,不能替在用的会话换线路。
+    var canApplyBestNode: Bool {
+        nodeScanInfo["GATE"] == "auto-ok" && !(nodeScanInfo["BEST"] ?? "").isEmpty
+    }
     @Published var showSettingsSheet = false
     /// 运行期看门狗已经动手停了 Claude。与「检查没过」不是一回事:
     /// 后者是拉起前的门禁,前者是已经放行之后又被抓回来,必须显眼到不可能忽略。
@@ -455,6 +477,7 @@ final class VM: ObservableObject {
         ("ASN属性", "ASN 属性"),
         ("IP纯净度", "IP 纯净度"),
         ("生态可达性", "生态可达性"),
+        ("更优节点", "更优节点"),
     ]
 
     static let clientChoices: [(key: String, label: String)] = [
@@ -591,7 +614,7 @@ final class VM: ObservableObject {
         "IPv6": "IPv6 关闭", "DNS": "DNS 走隧道", "WebRTC": "WebRTC",
         "保镖": "保镖在线", "规则置顶": "规则置顶",
         "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "IP纯净度": "IP 纯净度",
-        "生态可达性": "生态可达性",
+        "生态可达性": "生态可达性", "更优节点": "更优节点",
     ]
 
     /// 单行预览:只改观感,不参与判定。最终结果由 done 里的全量解析覆盖。
@@ -888,6 +911,8 @@ final class VM: ObservableObject {
     #if CLAUDE_SWITCHER_TESTS
     /// 测试用：直接设定运行态。测试进程里没有 Claude，靠监听永远拿不到 true。
     func setClaudeRunningForTest(_ value: Bool) { claudeRunning = value }
+    /// 测试用：直接灌一份扫描报告键值，验证门禁按钮与固定节点分支，不必真跑内核。
+    func setNodeScanInfoForTest(_ info: [String: String]) { nodeScanInfo = info }
     #endif
 
     private func checkEnvironment(done: @escaping (Bool) -> Void) {
@@ -904,7 +929,7 @@ final class VM: ObservableObject {
         note = ""
         // 新的一轮检查开始,上一轮修复回执就该退场了。
         fixStates = [:]
-        // 保留上一轮结果,只标记「这一轮还没回来」。清空的话,14 行会先集体
+        // 保留上一轮结果,只标记「这一轮还没回来」。清空的话,16 行会先集体
         // 变灰、行高骤降、窗口跟着抽一下,再一行行长回来 —— 这就是「不直觉」。
         rechecking = Set(rows.map(\.name))
         run(["checkdetail"], timeout: checkTimeout, onLine: { [weak self] line in
@@ -1131,7 +1156,7 @@ final class VM: ObservableObject {
     /// 修不了、但换节点/换线路就能解决的项。剩下的那些(DNS 没走隧道)得去
     /// 客户端改设置,笼统写成「换节点」会把用户支到错的方向。
     static let nodeBoundNames: Set<String> = [
-        "ASN 属性", "IP 纯净度", "IP 与上次一致", "生态可达性",
+        "ASN 属性", "IP 纯净度", "IP 与上次一致", "生态可达性", "更优节点",
     ]
 
 
@@ -1141,6 +1166,99 @@ final class VM: ObservableObject {
             let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
             if parts.count == 2 && parts[0] == "client" {
                 currentClient = parts[1]
+            }
+        }
+    }
+
+    /// 从 node-scan 的输出里抠 `KEY=VALUE`。纯函数,便于模型测试直接喂文本。
+    /// 扫描命令同时把这段写进报告文件,所以这里和 checkdetail 读的是同一套口径。
+    static func parseNodeScan(_ output: String) -> [String: String] {
+        var result: [String: String] = [:]
+        for line in output.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0])
+            if key.hasPrefix("EPOCH") || key.hasPrefix("GROUP") || key.hasPrefix("SELECTOR")
+                || key.hasPrefix("CURRENT") || key.hasPrefix("BEST") || key.hasPrefix("DELTA")
+                || key.hasPrefix("GATE") || key.hasPrefix("CANDIDATES")
+                || key.hasPrefix("UNIQUE_IPS") || key.hasPrefix("UNKNOWN")
+                || key.hasPrefix("ELIGIBLE") || key.hasPrefix("PREFERRED")
+                || key.hasPrefix("APPLY") || key.hasPrefix("APPLIED") {
+                result[key] = String(parts[1])
+            }
+        }
+        return result
+    }
+
+    /// 扫描完就地更新「更优节点」这一行,不做整轮 refresh。
+    /// refresh() 会先撤掉看门狗再检查 —— 那是「重新检查」的代价,不该让
+    /// 一个只读扫描顺手把守护停掉。
+    func applyNodeScan(_ info: [String: String]) {
+        guard let idx = rows.firstIndex(where: { $0.name == "更优节点" }) else { return }
+        let best = info["BEST"] ?? ""
+        let pref = info["PREFERRED"] ?? ""
+        // 优先级和 checkdetail 完全一致,否则同一屏两处会给出不同结论。
+        // 提示必须和 checkdetail 的同名分支说同一件事。auto-ok 时面板里
+        // 真有「应用最优节点」按钮,再叫用户「到客户端自己切」等于把新能力
+        // 藏起来;反过来 report-only 时不该许诺一个不会出现的按钮。
+        let autoOK = info["GATE"] == "auto-ok"
+        if info["PREFERRED_MATCH"] == "0" && !pref.isEmpty {
+            rows[idx].state = .warn
+            rows[idx].detail = "已偏离固定节点 \(pref) · 点「扫描可用节点」重新应用"
+        } else if info["PREFERRED_MATCH"] == "1" && !pref.isEmpty {
+            rows[idx].state = .ok
+            rows[idx].detail = "已固定在 \(pref) · 后续检查都基于这条线路"
+        } else if !best.isEmpty, let delta = Int(info["DELTA"] ?? "") {
+            rows[idx].state = .warn
+            let hint = autoOK ? "点「扫描可用节点」→「应用最优节点」自动切换" : "到客户端手动切换"
+            rows[idx].detail = "有更干净的节点 \(best)(\(info["BEST_SCORE"] ?? "?") 分,比当前高 \(delta) 分) · \(hint)"
+        } else if info["ELIGIBLE"] == "0" {
+            rows[idx].state = .skip
+            rows[idx].detail = "没有过硬门槛的候选节点 · 保持当前线路"
+        } else {
+            rows[idx].state = .ok
+            rows[idx].detail = "当前线路已是候选里最干净的"
+        }
+    }
+
+    func scanNodes() {
+        guard !nodeScanBusy, coreAvailable() else { return }
+        nodeScanBusy = true
+        // 3 个并发的纯净度查询各要 ~6s,加上内核枚举与配置解析实测 13s;
+        // 给 90s,比 check 的 45s 宽,但不允许无限等。
+        run(["node-scan"], timeout: 90) { [weak self] result in
+            guard let self else { return }
+            self.nodeScanBusy = false
+            self.nodeScanReport = result.succeeded ? result.output
+                : "扫描失败：\(result.output.isEmpty ? "脚本没有返回结果" : result.output)"
+            if result.succeeded {
+                let info = Self.parseNodeScan(result.output)
+                self.nodeScanInfo = info
+                self.applyNodeScan(info)
+            }
+            self.showNodeScan = true
+        }
+    }
+
+    /// 应用最优节点。守护由 App 自己停/起:脚本去杀 App 持有的 watch 进程,
+    /// 会被当成「守护意外退出」误报成假故障。
+    func applyBestNode() {
+        guard canApplyBestNode, !isBusy, !nodeScanBusy, coreAvailable() else { return }
+        isBusy = true
+        stopWatch()
+        run(["node-apply"], timeout: 120) { [weak self] result in
+            guard let self else { return }
+            self.nodeScanReport = result.output
+            if result.succeeded {
+                let info = Self.parseNodeScan(result.output)
+                self.nodeScanInfo = info
+                self.applyNodeScan(info)
+            }
+            // 无论切换成功与否都重新完整检查:通过会自动 startWatch(),
+            // 不通过就保持停守护。切完线路到底过没过,必须重新实测再说。
+            self.checkEnvironment { _ in
+                self.isBusy = false
+                self.showNodeScan = true
             }
         }
     }
@@ -2246,6 +2364,7 @@ struct ContentView: View {
         .sheet(isPresented: $showFingerprint) { FingerprintView(text: vm.fingerprint) }
         .sheet(isPresented: $showHistory) { IncidentHistorySheet(vm: vm) }
         .sheet(isPresented: $showLatency) { LatencyInsightSheet(vm: vm) }
+        .sheet(isPresented: $vm.showNodeScan) { NodeScanSheet(vm: vm) }
     }
 
     /// 主区内容。窗口高度就是按它量出来的,所以量高模式下必须和滚动模式
@@ -2256,7 +2375,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: Geo.group) {
             heroCard
             accountSection
-            // 两列而不是一列:15 行竖着堆,窗口要么高到离谱,要么矮到要滚动。
+            // 两列而不是一列:16 行竖着堆,窗口要么高到离谱,要么矮到要滚动。
             // 等宽由 checkCard 末尾的 maxWidth: .infinity 保证（实测两卡均 464.5pt、间隙 10.5pt）,
             // 这里不要再包一层 frame —— 同一件事说两遍,量高时反而会改到提案高度。
             HStack(alignment: .top, spacing: Geo.inline) {
@@ -2293,6 +2412,11 @@ struct ContentView: View {
 
             ClaudeIconButton(systemName: "arrow.clockwise", help: "重新检查环境", disabled: vm.isBusy) {
                 vm.refresh()
+            }
+            ClaudeIconButton(systemName: "network",
+                             help: vm.nodeScanBusy ? "正在扫描可用节点…" : "扫描可用节点(只读,不切线路)",
+                             disabled: vm.nodeScanBusy) {
+                vm.scanNodes()
             }
             ClaudeIconButton(systemName: "waveform.path.ecg", help: "设备指纹体检(字体/GPU/虚拟机)", disabled: vm.isBusy) {
                 showFingerprint = true
@@ -3307,7 +3431,7 @@ struct ContentView: View {
         .accessibilityLabel("\(row.name)，\(stateWord(row.state))，\(row.detail)")
     }
 
-    /// 通过项用中性灰,只有要处理的行才着色 —— 14 行全彩等于没有重点。
+    /// 通过项用中性灰,只有要处理的行才着色 —— 16 行全彩等于没有重点。
     ///
     /// 这是全文件**唯一**允许用 opacity 调灰度的地方:它调的是图标不是文字,
     /// 而且「已跳过」本来就该比「通过」再退后一点。文字一律只走 ink/muted/faint
@@ -3646,7 +3770,7 @@ struct CheckSettingsView: View {
                                         }
                                     }
                                 }
-                                Text("默认 14 项全部拦截启动。这里关掉的项会真正跳过探测，并以灰色「已跳过」显示 —— 那不叫通过，叫放弃验证。只在本机环境确实造成误报时才关。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。")
+                                Text("默认 16 项全部拦截启动。这里关掉的项会真正跳过探测，并以灰色「已跳过」显示 —— 那不叫通过，叫放弃验证。只在本机环境确实造成误报时才关。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。")
                                     .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                             }
                             .padding(.vertical, 6)
@@ -3697,6 +3821,62 @@ struct CheckSettingsView: View {
 }
 
 // MARK: - 设备指纹体检
+
+/// 节点扫描报告。报告本身只读;「应用最优节点」只在报告门禁为 auto-ok 且
+/// 确实存在更优节点时出现(见 VM.canApplyBestNode),已有实例环境一律只出报告。
+/// 切换动作归 VM.applyBestNode / 脚本 node-apply,面板不自己改线路。
+struct NodeScanSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var vm: VM
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Geo.inline) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("可用节点扫描").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
+                    Text("只读 · 不切线路 · 不写 48h IP 漂移记录")
+                        .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
+                }
+                Spacer()
+                Button("关闭") { dismiss() }
+                    .buttonStyle(.borderedProminent).tint(ClaudeTheme.terracottaDeep)
+            }
+            ScrollView {
+                Text(vm.nodeScanBusy ? "正在扫描…" :
+                     (vm.nodeScanReport.isEmpty ? "尚未扫描" : vm.nodeScanReport))
+                    .font(Type.microMono)
+                    .foregroundColor(ClaudeTheme.ink)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack(spacing: 8) {
+                if vm.canApplyBestNode {
+                    Text("门禁允许自动应用；会先停守护、只切一次、复查出口国家，再重新检查")
+                        .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
+                } else {
+                    Text("已有实例环境时只生成报告,不会自动切换节点")
+                        .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
+                }
+                Spacer()
+                if vm.canApplyBestNode {
+                    Button { vm.applyBestNode() } label: {
+                        Text(vm.isBusy ? "应用中…" : "应用最优节点")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(vm.isBusy || vm.nodeScanBusy)
+                    .help("先停守护 → 只切一次 Selector → 复查出口国家 → 重新检查并恢复守护；不达标自动回滚")
+                }
+                Button { vm.scanNodes() } label: {
+                    Text(vm.nodeScanBusy ? "扫描中…" : "重新扫描")
+                }
+                .disabled(vm.nodeScanBusy)
+            }
+        }
+        .padding(20)
+        .frame(width: 620, height: 430)
+        .background(ClaudeTheme.bgTop)
+    }
+}
 
 struct FingerprintView: View {
     @Environment(\.dismiss) private var dismiss
@@ -3863,7 +4043,7 @@ struct NoticeView: View {
 
     let sections: [(String, String)] = [
         ("Full-Tunnel 全流量接管", "基于 TUN 虚拟网卡的内核级流量劫持，配合 Fake-IP DNS 解析机制，包括 UDP 在内的全部出站流量在网络栈底层被强制路由至加密隧道，应用层无法旁路。"),
-        ("Environment Audit 环境一致性审计", "每次启动前执行 14 项环境指纹审计：Egress IP 归属地与 ASN 属性、时区与 Geo-location 一致性、Locale、IPv6 双栈旁路、DNS Leak、WebRTC/STUN 多节点交叉探测等。硬性安全项失败即 Block-on-Fail；仅显式配置的非关键项可跳过或降级，skip 不表示通过。"),
+        ("Environment Audit 环境一致性审计", "每次启动前执行 16 项环境指纹审计：Egress IP 归属地与 ASN 属性、时区与 Geo-location 一致性、Locale、IPv6 双栈旁路、DNS Leak、WebRTC/STUN 多节点交叉探测等。硬性安全项失败即 Block-on-Fail；仅显式配置的非关键项可跳过或降级，skip 不表示通过。"),
         ("Kill-Switch 断网急停", "常驻守护进程以 10 秒周期巡检隧道健康度，隧道中断即刻终止受保护进程，将裸连窗口压缩到秒级。进程级急停，非防火墙级保证，边界详见 SECURITY.md。"),
         ("Pinned Routing 域名置顶路由", "目标服务全家族域名及其生态依赖（Turnstile 人机验证、Telemetry 遥测、Payment 支付、Support 组件）置顶锁定代理路由，优先级高于任何第三方分流规则集，免疫规则库误判。"),
         ("Session Isolation 会话隔离快照", "多账号采用完整快照隔离：各账号持有独立的 Device Fingerprint、OAuth Credential 与本地状态，切换即物理交换数据卷，账号间零交叉污染。"),
@@ -4479,7 +4659,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.delegate = self
             window.center()
             mainWindow = window
-            // 这里不量高。此刻还没开始检查,14 行全是空的,量出来只有 507pt,
+            // 这里不量高。此刻还没开始检查,16 行全是空的,量出来只有 507pt,
             // 窗口一缩就再也长不回来 —— 整轮检查都裁在底边外面。
             // 交给检查落定后的观察者调。
         }

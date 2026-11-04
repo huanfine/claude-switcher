@@ -1,7 +1,7 @@
 import Foundation
 import AppKit
 
-private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性"]
+private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性", "更优节点"]
 
 private struct TestFailure: Error, CustomStringConvertible {
     let description: String
@@ -244,12 +244,12 @@ struct MenuBarModelTests {
                 try f.audit(["WebRTC": "fail:演示失败"])
                 try f.deniedSwitch(f.vm())
             case "check_grouping":
-                // 主界面不再按「能不能关」分组 —— 15 项默认全部拦启动,分组反而让人
+                // 主界面不再按「能不能关」分组 —— 默认全部拦启动,分组反而让人
                 // 以为「有些可以不拦」。但「哪几项允许在设置里关掉」这个数据关系仍然要锁住:
                 // 它必须和设置页的开关完全一致,否则会出现「关不掉」或「关了还拦」。
                 let vm = f.vm()
                 vm.start(); try f.idle(vm)
-                try expect(vm.rows.count == 15, "检查项应为 15 项")
+                try expect(vm.rows.count == 16, "检查项应为 16 项(含新增的「更优节点」)")
                 let soft = Set(vm.rows.filter { $0.canDisable }.map { $0.name })
                 let expected = Set(VM.optionalChecks.map { $0.label })
                 try expect(soft == expected, "可关闭项与设置页不一致:\(soft.sorted()) vs \(expected.sorted())")
@@ -444,7 +444,7 @@ struct MenuBarModelTests {
                 func rows(_ overrides: [String: RowState],
                           details: [String: String] = [:]) -> [CheckRow] {
                     let hard = ["代理内核", "TUN网卡", "出口IP", "时区", "地区", "IPv6", "保镖", "规则置顶"]
-                    let soft = ["IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性"]
+                    let soft = ["IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性", "更优节点"]
                     return (hard.map { ($0, false) } + soft.map { ($0, true) }).map { name, disable in
                         CheckRow(name: name, icon: "circle", canDisable: disable,
                                  state: overrides[name] ?? .ok,
@@ -533,6 +533,15 @@ struct MenuBarModelTests {
                     "保镖": .warn, "规则置顶": .warn, "代理内核": .warn,
                 ], details: ["IP纯净度": "评分 0/100 · 机房"]))
                 try expect(everythingBad.score == 0, "四维全打满应归零，实际 \(everythingBad.score)")
+
+                // (4) 新增的「更优节点」进身份维度,权重 4;它是建议不是故障,
+                //     而且 skip(报告还没生成 / 用户关掉)绝不能算扣分。
+                let betterNode = HealthSummary.evaluate(rows(["更优节点": .warn]))
+                try expect(betterNode.score == 96, "有更优节点应只扣 4 分，实际 \(betterNode.score)")
+                let notScanned = HealthSummary.evaluate(rows(["更优节点": .skip]))
+                try expect(notScanned.score == 100, "没扫描不等于不合格，实际 \(notScanned.score)")
+                let disabled = HealthSummary.evaluate(rows(["IP一致": .skip]))
+                try expect(disabled.score == 100, "用户关掉的检查项不该拉低总分，实际 \(disabled.score)")
 
                 // 硬性项一旦松动,压过任何提示项 —— 它本来就是拦启动的开关
                 let hardWarnFirst = HealthSummary.evaluate(rows(
@@ -693,6 +702,86 @@ struct MenuBarModelTests {
                 try expect(delegate.applicationShouldTerminate(app) == .terminateCancel, "系统退出也必须保护修复操作")
                 try f.idle(vm)
                 try expect(delegate.applicationShouldTerminate(app) == .terminateNow, "修复结束应该解除退出保护")
+            case "node_scan_report_updates_row":
+                // 扫描报告必须能就地更新「更优节点」这一行,且不能把其他行改掉。
+                let vm = f.vm()
+                let before = vm.rows.map { $0.name }
+                let best = """
+                GROUP=🤖 OpenAi
+                CURRENT=鱼1·美国-犹他州
+                CURRENT_SCORE=49
+                BEST=鱼3·美国-犹他州
+                BEST_SCORE=88
+                DELTA=39
+                GATE=report-only
+                ELIGIBLE=4
+                """
+                let info = VM.parseNodeScan(best)
+                try expect(info["BEST"] == "鱼3·美国-犹他州", "没解析出最优节点")
+                try expect(info["BEST_SCORE"] == "88", "没解析出最优节点分数")
+                vm.applyNodeScan(info)
+                guard let row = vm.rows.first(where: { $0.name == "更优节点" }) else {
+                    throw TestFailure(description: "找不到「更优节点」行")
+                }
+                try expect(row.state == .warn, "有更优节点应落到 warn")
+                try expect(row.detail.contains("鱼3·美国-犹他州") && row.detail.contains("88 分"),
+                           "建议里要写清节点名和分数，实际 \(row.detail)")
+                try expect(vm.rows.map { $0.name } == before, "不该动到别的检查行")
+
+                // 差距不够时 BEST 为空:这一行应当是「已是最干净」,不是 warn。
+                vm.applyNodeScan(VM.parseNodeScan("BEST=\nBEST_SCORE=49\nDELTA=0\nELIGIBLE=4\n"))
+                try expect(vm.rows.first(where: { $0.name == "更优节点" })?.state == .ok,
+                           "没有更优节点不该报 warn")
+
+                // 一个过硬门槛的候选都没有:跳过,而不是假绿。
+                vm.applyNodeScan(VM.parseNodeScan("BEST=\nELIGIBLE=0\n"))
+                try expect(vm.rows.first(where: { $0.name == "更优节点" })?.state == .skip,
+                           "没有可用候选应报跳过")
+
+                // 负例:解析不认无关行,免得界面把人话读成键值。
+                let noise = VM.parseNodeScan("节点扫描(只读) · 组 🤖 OpenAi\n门禁:report-only(已有账号槽位)\n")
+                try expect(noise.isEmpty, "人话行不该被当成机器字段: \(noise)")
+
+                // 固定节点:偏离优先于「还有更干净的」,已固定则不误报。
+                vm.applyNodeScan(["PREFERRED": "鱼3", "PREFERRED_MATCH": "1", "BEST": ""])
+                try expect(vm.rows.first(where: { $0.name == "更优节点" })?.state == .ok,
+                           "已固定不该报 warn")
+                vm.applyNodeScan(["PREFERRED": "鱼3", "PREFERRED_MATCH": "0",
+                                  "BEST": "鱼2", "DELTA": "30"])
+                guard let drifted = vm.rows.first(where: { $0.name == "更优节点" }) else {
+                    throw TestFailure(description: "找不到「更优节点」行")
+                }
+                try expect(drifted.state == .warn, "偏离固定节点应报 warn")
+                try expect(drifted.detail.contains("已偏离固定节点 鱼3"), drifted.detail)
+
+                // 门禁按钮只在 auto-ok 且确实有更优节点时出现(用户选的保守并集)。
+                try expect(!vm.canApplyBestNode, "没有报告信息时不该给按钮")
+                vm.setNodeScanInfoForTest(["GATE": "report-only", "BEST": "鱼2", "DELTA": "30"])
+                try expect(!vm.canApplyBestNode, "已有实例环境不该给自动应用按钮")
+                vm.setNodeScanInfoForTest(["GATE": "auto-ok", "BEST": ""])
+                try expect(!vm.canApplyBestNode, "没有更优节点不该给按钮")
+                vm.setNodeScanInfoForTest(["GATE": "auto-ok", "BEST": "鱼2", "DELTA": "30"])
+                try expect(vm.canApplyBestNode, "门禁允许且确有更优节点时该给按钮")
+
+                // 提示词和按钮必须互相印证:auto-ok 时该指向「应用最优节点」,
+                // report-only 时不该许诺一个根本不会出现的按钮。两处文案曾经
+                // 各说各的(界面叫「到客户端切换」,脚本叫「点扫描节点」),
+                // 这里用正例 + 负例把它锁住。
+                let allowedInfo = VM.parseNodeScan(
+                    "BEST=鱼2\nBEST_SCORE=90\nDELTA=30\nGATE=auto-ok\nELIGIBLE=4\n")
+                vm.applyNodeScan(allowedInfo)
+                let allowedDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
+                try expect(allowedDetail.contains("应用最优节点"),
+                           "门禁允许时应告诉用户可以自动应用,实际 \(allowedDetail)")
+
+                let deniedInfo = VM.parseNodeScan(
+                    "BEST=鱼2\nBEST_SCORE=90\nDELTA=30\nGATE=report-only\nELIGIBLE=4\n")
+                vm.applyNodeScan(deniedInfo)
+                let deniedDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
+                try expect(!deniedDetail.contains("应用最优节点"),
+                           "已有实例环境时不该许诺自动应用按钮,实际 \(deniedDetail)")
+                try expect(deniedDetail.contains("手动切换"),
+                           "已有实例环境应指到客户端手动切换,实际 \(deniedDetail)")
             default:
                 throw TestFailure(description: "未知测试场景：\(name)")
             }

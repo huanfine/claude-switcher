@@ -360,7 +360,7 @@ esac''')
         """查不到就不写缓存 —— 否则一次网络抖动会把「未知」钉住一整天。"""
         self.stub_net("", "", "", "")
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v2"
+        cache = self.home / ".claude-switcher" / "purity-cache.v3"
         if cache.exists():
             self.assertNotIn("203.0.113.10", cache.read_text(encoding="utf-8"))
 
@@ -451,6 +451,50 @@ esac''')
         self.run_detail()
         total = (self.root / "calls.log").read_text(encoding="utf-8").count("api.ipquery.io")
         self.assertEqual(total, first, "第二次检查又去打了一次网络")
+
+    def test_cache_keeps_country_code_for_node_hard_gate(self):
+        """国家代码要落进缓存,离线给候选节点排名时才有硬门槛可依。
+
+        它不能靠额外一次网络请求换来 —— ip-api 本来就在查,只是多要一个字段。
+        """
+        self.stub_net(RESIDENTIAL, _ipapi("Denver", countryCode="US"), IPINFO_RESID)
+        self.run_detail()
+        cache = self.home / ".claude-switcher" / "purity-cache.v3"
+        self.assertTrue(cache.exists(), "没写 v3 缓存")
+        fields = cache.read_text(encoding="utf-8").strip().split("|")
+        self.assertEqual(len(fields), 7, "v3 应是 7 列,实际 %d: %s" % (len(fields), fields))
+        self.assertEqual(fields[6], "US")
+
+    def test_degraded_result_expires_quickly_instead_of_a_full_day(self):
+        """风险源全挂那次的 70 分不能被钉住 24 小时。
+
+        实测过:两家源同时超时后,缓存里一直留着「风险源不可达」,
+        之后整整一天每次检查都拿这个降级结论当真,哪怕源早就恢复了。
+        现在给这类结果一个「五分钟后过期」的时间戳,读侧逻辑不用分叉。
+        """
+        self.stub_net("", "", IPINFO_RESID)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("风险源不可达", detail)
+        cache = self.home / ".claude-switcher" / "purity-cache.v3"
+        line = cache.read_text(encoding="utf-8").strip()
+        fields = line.split("|")
+        self.assertEqual(len(fields), 7, fields)
+        import time
+        remaining = 86400 - (int(time.time()) - int(fields[1]))
+        self.assertGreater(remaining, 0, "降级结果不该已经过期")
+        self.assertLessEqual(remaining, 600, "降级结果最多只该留几分钟,实际还剩 %d 秒" % remaining)
+
+        # 负例:证据齐全的结果仍按 24h 缓存,别为了修降级把正常缓存也打短。
+        # 先清掉降级那条,否则它会命中缓存、根本走不到「重新打分」这一步。
+        cache.unlink()
+        self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
+        self.run_detail()
+        fresh = (self.home / ".claude-switcher" / "purity-cache.v3").read_text(encoding="utf-8")
+        rows = [r for r in fresh.strip().splitlines() if r.startswith("203.0.113.10|")]
+        self.assertEqual(len(rows), 1, "同一个 IP 不该留下两条缓存")
+        remaining = 86400 - (int(time.time()) - int(rows[0].split("|")[1]))
+        self.assertGreater(remaining, 80000, "证据齐全时仍应缓存接近 24h,实际 %d" % remaining)
 
     def test_check_and_checkdetail_agree(self):
         """门禁与明细不能各说各话:代理出口在 check 里也必须判不通过。"""

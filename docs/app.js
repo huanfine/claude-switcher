@@ -852,7 +852,7 @@
 
     const notes = [
       "浏览器无法读取系统 DNS 配置，也无法知道域名最终由哪个解析器应答；本项不是 DNS 泄漏结论。",
-      "要确认系统 DNS 是否被代理接管（Fake-IP / DNS 隧道），请使用桌面版的 14 项审计。",
+      "要确认系统 DNS 是否被代理接管（Fake-IP / DNS 隧道），请使用桌面版的 16 项审计。",
     ];
 
     if (cloudflareOk && googleOk) {

@@ -18,9 +18,11 @@ import tempfile
 import zipfile
 
 
-OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性")
+OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性",
+            "更优节点")
 ALL_CHECKS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
-              "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性")
+              "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性",
+              "更优节点")
 DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True}
 LOG_LIMIT = 512 * 1024
 
@@ -758,7 +760,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 
 
 # 内核控制接口限制。大规则集订阅(1 万条以上)的 /rules 响应可达数 MB,
@@ -1143,6 +1145,197 @@ def assess_probe(policy, expected_ip, output, exit_code):
     return "ok:STUN 仅返回代理出口地址"
 
 
+# ---------- 只读节点扫描 ----------
+# 只看「运行中内核里有哪些可手动选的节点」+「这些节点在合并配置里的入口地址」。
+# 订阅里有 uuid / password / 证书,这里一个字段都不读、更不会输出 —— 白名单解析,
+# 读到的键只有下面这几个。输出里只有节点名、入口 IP、出口是否可知、UDP 标记。
+_NODE_KEYS = {"server", "servername", "sni", "host", "Host", "type", "udp", "network"}
+
+
+def _scalar(value):
+    value = value.strip()
+    if re.fullmatch(r"'(?:[^']|'')*'", value):
+        return value[1:-1].replace("''", "'")
+    if re.fullmatch(r'"(?:[^"\\]|\\.)*"', value):
+        return value[1:-1]
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
+def parse_proxy_entries(config_path):
+    """从合并配置的顶层 proxies: 块抠出 name → 非敏感字段。
+
+    故意用逐行白名单,不用 YAML 解析器:这份文件里有凭据,整份反序列化等于把
+    uuid/password 全读进内存,再大的输出白名单也挡不住误打印。顶层块以
+    proxy-groups: 结束,后面的组定义里也有 proxies: 子键,必须截断。
+    """
+    entries = {}
+    current = None
+    in_block = False
+    try:
+        lines = read_text(config_path).splitlines()
+    except OSError:
+        return entries
+    for line in lines:
+        if line.startswith("proxies:"):
+            in_block, current = True, None
+            continue
+        if line.startswith(("proxy-groups:", "proxy-providers:", "rules:", "rule-providers:")):
+            break
+        if not in_block:
+            continue
+        match = re.match(r"^-\s+name:\s*(.+?)\s*$", line)
+        if match:
+            name = _scalar(match.group(1))
+            current = {"name": name}
+            entries[name] = current
+            continue
+        if current is None:
+            continue
+        match = re.match(r"^\s+([\w-]+):\s*(.*?)\s*$", line)
+        if not match or match.group(1) not in _NODE_KEYS:
+            continue
+        key, value = match.group(1), _scalar(match.group(2))
+        if key not in current:
+            current[key] = value
+    return entries
+
+
+def _egress_kind(entry):
+    """server 是不是真实出口。
+
+    直连型节点(实测本机的「鱼」系 75 条):server 就是落地 IP。
+    CDN 前置节点(实测 292 条):server 是 Cloudflare 入口,还带 servername /
+    ws-opts.headers.Host,真正出口在别处 —— 拿入口 IP 去打分是纯噪声,
+    必须标成 fronted 并排除,而不是给一个看似正常的分数。
+    """
+    if not entry:
+        return "missing", ""
+    server = entry.get("server", "")
+    if entry.get("servername") or entry.get("sni") or entry.get("Host") or entry.get("host"):
+        return "fronted", ""
+    try:
+        ipaddress.ip_address(server)
+    except ValueError:
+        return "domain", ""
+    return "known", server
+
+
+def node_scan(clash_dir, group):
+    base, secret = controller_config(clash_dir)
+    data = api_get(base, secret, "/proxies")
+    proxies = data.get("proxies")
+    if not isinstance(proxies, dict):
+        fail("Clash 内核 /proxies 返回格式异常")
+    entries = parse_proxy_entries(clash_dir / "clash-verge.yaml")
+
+    builtin = {"DIRECT", "REJECT", "GLOBAL", "PASS", "COMPATIBLE"}
+    is_group = lambda name: isinstance(proxies.get(name), dict) and "all" in proxies[name]
+
+    def active_leaf(name, seen=None):
+        seen = set() if seen is None else seen
+        item = proxies.get(name)
+        if not isinstance(item, dict) or name in seen:
+            return ""
+        seen.add(name)
+        now = str(item.get("now") or "")
+        if not is_group(name):
+            return name
+        return active_leaf(now, seen) if now else ""
+
+    # 只认「当前真正控路的那一个 Selector」。配置的组常常是层层嵌套的
+    # (本机 🤖 OpenAi → 🧠 AI·干净IP → 叶子),而同一个订阅里还有别的
+    # Selector;递归全列会给出「去改手动切换组」这种建议,等于替用户动了
+    # 他没让我们碰的组。沿 now 链走到最深一层含叶子的 Selector 就停。
+    def controlling_selector():
+        name, best, seen = group, "", set()
+        while is_group(name) and name not in seen:
+            seen.add(name)
+            item = proxies[name]
+            children = item.get("all") or []
+            if str(item.get("type", "")).lower() == "selector" and any(
+                    child not in builtin and not is_group(child) for child in children):
+                best = name
+            nxt = str(item.get("now") or "")
+            if not nxt or not is_group(nxt):
+                break
+            name = nxt
+        return best
+
+    # 只收「直接挂在 Selector 下的叶子」。URLTest / Fallback 会自己选路,
+    # 对它们 PUT /proxies 会被内核覆盖或拒绝,列进候选等于给一个按不动的建议。
+    rows = []
+    if not group or not is_group(group):
+        fail("配置的代理组不存在或不是代理组:" + str(group))
+    selector = controlling_selector()
+    if not selector:
+        fail("当前链路上没有可手动选择的节点组")
+    item = proxies[selector]
+    for child in item.get("all") or []:
+        if child in builtin or is_group(child):
+            continue
+        entry = entries.get(child)
+        egress, server = _egress_kind(entry)
+        udp = str((entry or {}).get("udp", "")).lower() == "true"
+        rows.append((selector, child, server if egress == "known" else "", egress,
+                     "1" if udp else "0"))
+    current = active_leaf(group)
+
+    def clean(value):
+        return re.sub(r"[\t\r\n]", " ", str(value))
+
+    print("SCANv1")
+    print("GROUP\t" + clean(group))
+    print("CURRENT\t" + clean(current))
+    for selector, leaf, server, egress, udp in rows:
+        print("\t".join(("NODE", clean(selector), clean(leaf),
+                         clean(server), egress, udp)))
+
+
+def node_select(clash_dir, group, selector, leaf):
+    """把一个 Selector 切到指定叶子。只允许本机、只允许 Selector。
+
+    预留给第二阶段(用户确认后才允许的自动应用),**当前没有对外命令会调到它**。
+    第一阶段 node-scan 全程只读,不应因为这层能力存在就变成有副作用。
+    """
+    base, secret = controller_config(clash_dir)
+    proxies = api_get(base, secret, "/proxies").get("proxies")
+    if not isinstance(proxies, dict):
+        fail("Clash 内核 /proxies 返回格式异常")
+    item = proxies.get(selector)
+    if not isinstance(item, dict) or "all" not in item:
+        fail("目标代理组不存在:" + selector)
+    if str(item.get("type", "")).lower() != "selector":
+        fail("目标代理组不是 Selector,不能手动固定节点")
+    if leaf not in (item.get("all") or []):
+        fail("目标节点不在该代理组里:" + leaf)
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["Authorization"] = "Bearer " + secret
+    scheme, host, port = base
+    connection = None
+    try:
+        if scheme == "unix":
+            connection = http.client.HTTPConnection("localhost", timeout=API_TIMEOUT)
+            connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.sock.settimeout(API_TIMEOUT)
+            connection.sock.connect(host)
+        else:
+            cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            connection = cls(host, port, timeout=API_TIMEOUT)
+        path = "/proxies/" + quote(selector, safe="")
+        connection.request("PUT", path, body=json.dumps({"name": leaf}), headers=headers)
+        response = connection.getresponse()
+        response.read()
+        if response.status not in (200, 204):
+            fail("切换节点被内核拒绝(HTTP %d)" % response.status)
+    except (http.client.HTTPException, OSError, ValueError) as exc:
+        fail("切换节点失败(" + exc.__class__.__name__ + ")")
+    finally:
+        if connection:
+            connection.close()
+    print("OK:已切换到 " + leaf)
+
+
 def main():
     if len(sys.argv) < 5:
         fail("内部参数不足")
@@ -1163,6 +1356,12 @@ def main():
     if action == "mode":
         base, secret = controller_config(clash_dir)
         print(str(api_get(base, secret, "/configs").get("mode", "")).lower())
+        return 0
+    if action == "node-scan" and len(sys.argv) == 6:
+        node_scan(clash_dir, group)
+        return 0
+    if action == "node-select" and len(sys.argv) == 8:
+        node_select(clash_dir, group, sys.argv[6], sys.argv[7])
         return 0
     if not group or any(char in group for char in ",\r\n"):
         fail("代理组名为空或包含规则分隔符")
@@ -1815,22 +2014,22 @@ ip_purity() {
     local ip="${1:-}" now cip cep cver cscore ctype cdet
     # 字段分隔用 | 而不是 tab:tab 属于 IFS 空白,read 会把前导空字段整个吞掉,
     # 于是「无分数」这条路径会被解析成 score=unknown、detail 为空 —— 静默错位。
-    [ -z "$ip" ] && { printf '|unknown||未取到出口IP'; return 0; }
+    [ -z "$ip" ] && { printf '|unknown||未取到出口IP|'; return 0; }
     now=$(date +%s)
 
     # 同一出口 24h 内复用结果:一次检查要打 4 个网络请求,而出口一天里不会变几十次。
     # 查不到不写缓存,否则一次网络抖动会把「未知」钉住一整天。
-    # 文件名带 v2:第 5 个字段从「扣分标签」换成了「出口类型」,字段数虽然一样,
-    # 混用旧文件会让类型串进错位,宁可让旧缓存作废。
-    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v2" ]; then
-        while IFS='|' read -r cip cep cver cscore ctype cdet || [ -n "$cip" ]; do
+    # 文件名带 v3:第 7 列是出口国家代码。v2 的 6 列没有它,混读会让 detail
+    # 把「|US」吞进去,宁可让旧缓存作废(v3 同时清掉 v2 里被钉住 24h 的降级结果)。
+    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v3" ]; then
+        while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
             case "${cscore:-}" in ''|*[!0-9]*) continue ;; esac
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
-            printf '%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet"
+            printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v2"
+        done < "$BASE/purity-cache.v3"
     fi
 
     local q1 q2 q3 q4 b1 b2 b3 b4 rdns=""
@@ -1840,7 +2039,7 @@ ip_purity() {
     q4=$(mktemp "${TMPDIR:-/tmp}/purity4.XXXXXX") || { rm -f "$q1" "$q2" "$q3"; return 0; }
     # 四个源并行:串行最坏 20 秒,会顶掉 App 的 45 秒检查预算。
     curl -sL --max-time 6 "https://api.ipquery.io/$ip" >"$q1" 2>/dev/null &
-    curl -s --max-time 4 "http://ip-api.com/json/$ip?fields=status,proxy,hosting,mobile,city,regionName,timezone" >"$q2" 2>/dev/null &
+    curl -s --max-time 4 "http://ip-api.com/json/$ip?fields=status,proxy,hosting,mobile,city,regionName,timezone,countryCode" >"$q2" 2>/dev/null &
     curl -sL --max-time 4 "https://ipinfo.io/$ip/json" >"$q3" 2>/dev/null &
     curl -s --max-time 4 "https://api.stopforumspam.org/api?ip=$ip&json" >"$q4" 2>/dev/null &
     wait
@@ -1850,7 +2049,7 @@ ip_purity() {
     # PTR 走本地解析器,不占网络预算。去掉结尾的点,便于按关键词匹配。
     rdns=$(dig +short -x "$ip" +time=2 +tries=1 2>/dev/null | head -1 | sed 's/\.$//')
 
-    local dc="" mob="" px="" tor="" risk="" tzip="" abfreq=""
+    local dc="" mob="" px="" tor="" risk="" tzip="" abfreq="" cc=""
     case "$(_ipfield "$b1" is_datacenter)" in true) dc=1 ;; esac
     case "$(_ipfield "$b1" is_mobile)" in true) mob=1 ;; esac
     case "$(_ipfield "$b1" is_vpn)" in true) px=1 ;; esac
@@ -1862,6 +2061,13 @@ ip_purity() {
     case "$(_ipfield "$b2" hosting)" in true) dc=1 ;; esac
     case "$(_ipfield "$b2" mobile)" in true) mob=1 ;; esac
     abfreq=$(_ipfield "$b4" frequency)
+    # 国家代码只从已经在手的三份响应里取,不为它多发一次请求。离线给候选节点
+    # 排名时,这一列是硬性门槛(COUNTRY_TARGET)的唯一依据:一个再干净的英国
+    # 节点也不能排到美国前面去。取不到就留空,由调用方标「国家待验证」。
+    cc=$(_ipfield "$b2" countryCode)
+    [ -z "$cc" ] && cc=$(_ipfield "$b1" country_code)
+    [ -z "$cc" ] && cc=$(_ipfield "$b3" country)
+    cc=$(printf '%s' "$cc" | tr 'a-z' 'A-Z' | tr -cd 'A-Z')
 
     # PTR 自曝的特征。这一条比任何第三方评分都硬:出口自己把身份写进了反向解析。
     case "$rdns" in
@@ -1894,7 +2100,7 @@ ip_purity() {
     # 可用的线索,不能因为「不在那四份响应里」就当作没有。
     [ -n "$rdns" ] && known=1
     if [ -z "$known" ]; then
-        printf '|unknown||未取到该出口的信誉数据,本次未评级'
+        printf '|unknown||未取到该出口的信誉数据,本次未评级|'
         return 0
     fi
     # 一家风险源都没答上来:进入降级判型,结论只能给到类型这一层。
@@ -2068,13 +2274,32 @@ ip_purity() {
     fi
     local detail="评分 ${score}/100 · ${tlabel} · ${who}${flags}${next:+ · $next}"
 
-    if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
-        { grep -vF "$ip|" "$BASE/purity-cache.v2" 2>/dev/null
-          printf '%s|%s|%s|%s|%s|%s\n' "$ip" "$now" "$verdict" "$score" "$type" "$detail"
-        } | tail -20 > "$BASE/purity-cache.v2.tmp" 2>/dev/null \
-            && mv "$BASE/purity-cache.v2.tmp" "$BASE/purity-cache.v2" 2>/dev/null
+    # 证据不全的结果不能钉住 24h。实测:ipquery / ip-api 同时超时那次,分数被
+    # 降级到 70 并写进缓存,之后整整一天每次检查都拿这句「风险源不可达」当结论,
+    # 哪怕两家源早就恢复了。做法是给这类结果一个已经「快过期」的时间戳:
+    # 读侧仍按 now-epoch < TTL 判,300 秒后自动重查,逻辑不用分叉。
+    # 单源可达同理 —— 代理特征可能被漏判,不该把那次的分数当定论。
+    local cache_epoch="$now" lock="$BASE/.purity-cache.lock" got=0 i
+    if [ -n "$degraded" ] || [ "$src_n" = "1" ]; then
+        cache_epoch=$((now - PURITY_CACHE_TTL + 300))
     fi
-    printf '%s|%s|%s|%s' "$score" "$verdict" "$type" "$detail"
+    if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
+        # 节点扫描会并发给多个 IP 打分,每个后台子 shell 都会落缓存;不锁的话
+        # 两份 grep -v 会各自读同一份旧文件,后写的那份把先写的结果抹掉。
+        for i in 1 2 3 4 5; do
+            mkdir "$lock" 2>/dev/null && { got=1; break; }
+            sleep 1
+        done
+        if [ "$got" = 1 ]; then
+            { grep -vF "$ip|" "$BASE/purity-cache.v3" 2>/dev/null
+              printf '%s|%s|%s|%s|%s|%s|%s\n' \
+                  "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
+            } | tail -20 > "$BASE/purity-cache.v3.tmp" 2>/dev/null \
+                && mv "$BASE/purity-cache.v3.tmp" "$BASE/purity-cache.v3" 2>/dev/null
+            rmdir "$lock" 2>/dev/null
+        fi
+    fi
+    printf '%s|%s|%s|%s|%s' "$score" "$verdict" "$type" "$detail" "$cc"
 }
 
 
@@ -2328,7 +2553,7 @@ check() {
     # 机房节点,把它当硬失败等于把所有人挡在门外;代理特征和 Tor 才拦。
     # 取不到数据同样是 warn 级:网络抖动不该拦住启动,但也不能悄悄算通过。
     if ! check_disabled "IP纯净度"; then
-        IFS='|' read -r pscore pver ptype pdet <<<"$(ip_purity "$ip")"
+        IFS='|' read -r pscore pver ptype pdet pcc <<<"$(ip_purity "$ip")"
         case "${pver:-unknown}" in
             fail) optional_failure "出口纯净度低(${pdet:-评分 $pscore/100})" ;;
         esac
@@ -2815,7 +3040,7 @@ checkdetail() {
         optional_result "IP纯净度" ok
     else
         # 缓存命中时这一项不产生网络请求;换出口或首次才两个源并行问一次。
-        IFS='|' read -r pscore pver ptype pdet <<<"$(ip_purity "$ip")"
+        IFS='|' read -r pscore pver ptype pdet pcc <<<"$(ip_purity "$ip")"
         case "${pver:-unknown}" in
             # 取不到就明说没评级。这里绝不能借 ok 混过去 —— 用户看到绿勾会
             # 以为「出口干净已经验过了」,而实际上什么都没验。
@@ -2856,6 +3081,366 @@ checkdetail() {
             optional_result "生态可达性" fail "$detail · 换条线路后重新检查"
         fi
     fi
+    # 16. 更优节点。读的是 scan-nodes 落下的报告,不在这里发网络请求 ——
+    # 整轮检查有 45 秒预算,给十几个候选 IP 打分会把它吃光。
+    # 没扫过就老老实实报「跳过」,绝不能借 ok 冒充「已经比过了」。
+    if check_disabled "更优节点"; then
+        optional_result "更优节点" ok
+    elif [ ! -f "$NODE_SCAN_FILE" ]; then
+        optional_result "更优节点" skip "尚未扫描 · 点右上角「扫描可用节点」生成候选排名"
+    else
+        local ns_epoch ns_best ns_score ns_cur ns_delta ns_gate ns_now ns_pref ns_match
+        local ns_hint
+        ns_epoch=$(sed -n 's/^EPOCH=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_best=$(sed -n 's/^BEST=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_score=$(sed -n 's/^BEST_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_cur=$(sed -n 's/^CURRENT_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_delta=$(sed -n 's/^DELTA=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_gate=$(sed -n 's/^GATE=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_pref=$(sed -n 's/^PREFERRED=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_match=$(sed -n 's/^PREFERRED_MATCH=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_now=$(date +%s)
+        case "${ns_epoch:-}" in ''|*[!0-9]*) ns_epoch=0 ;; esac
+        if [ $((ns_now - ns_epoch)) -gt "$NODE_SCAN_TTL" ]; then
+            optional_result "更优节点" skip "扫描报告已过期 · 点「扫描可用节点」重新生成"
+        elif [ "$ns_match" = "0" ] && [ -n "$ns_pref" ]; then
+            # 固定过的线路被人/自动选路改回去了,这比「还有更干净的」更要紧。
+            optional_result "更优节点" warn \
+                "已偏离固定节点 ${ns_pref} · 点「扫描可用节点」重新应用"
+        elif [ "$ns_match" = "1" ] && [ -n "$ns_pref" ]; then
+            optional_result "更优节点" ok "已固定在 ${ns_pref} · 后续检查都基于这条线路"
+        elif [ -n "$ns_best" ]; then
+            ns_hint="到客户端手动切换"
+            [ "$ns_gate" = "auto-ok" ] && ns_hint="点「扫描可用节点」→「应用最优节点」自动切换"
+            optional_result "更优节点" warn \
+                "有更干净的节点 ${ns_best}(${ns_score} 分,比当前高 ${ns_delta} 分) · ${ns_hint}"
+        else
+            optional_result "更优节点" ok "当前线路已是候选里最干净的"
+        fi
+    fi
+}
+
+# ---------- 节点扫描(只读) ----------
+# 边界写在前头:不切节点、不重启客户端、不动看门狗、不写 iphistory。
+# ip_purity() 按 IP 打分、按 IP 缓存,和「当前出口」无关 —— 这正是离线扫描
+# 不会污染 48h IP 漂移记录的原因。逐个切节点在线实测那条路会写 N 条漂移,
+# 反而把「IP 与上次一致」扣分,绝不能走。
+NODE_SCAN_FILE="$BASE/node-scan.txt"
+PREFERRED_NODE_FILE="$BASE/preferred-node"   # selector<TAB>leaf<TAB>ip<TAB>epoch
+NODE_SCAN_TTL=86400
+NODE_SCAN_MARGIN=10       # 比当前高至少 10 分才值得建议换,免得天天让用户换线路
+NODE_SCAN_PARALLEL=3      # ip_purity 内部已经 4 路并发,再叠太多会打爆免费数据源
+
+# 读已固定的节点名。文件损坏/缺列一律当「没固定」,不能让半行数据把检查项卡死。
+preferred_node_leaf() {
+    [ -f "$PREFERRED_NODE_FILE" ] || return 0
+    awk -F'\t' 'NF >= 2 && $2 != "" {print $2; exit}' "$PREFERRED_NODE_FILE" 2>/dev/null
+}
+
+# 能不能自动应用,只看「有没有正在使用的实例」。用户定的口径:
+#   没启动、没账号 → 可以扫描并应用;已有实例环境 → 只出报告。
+# 这里取并集的保守侧:Claude 进程 / CLI / 任何已建档槽位 / 看门狗驻守,
+# 四者任一成立就只出报告。宁可少自动一次,不能把用户正在用的会话切掉。
+node_gate() {
+    local st reasons="" active=0 pid=""
+    if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 \
+       || pgrep -f "claude-code/cli.js" >/dev/null 2>&1 \
+       || pgrep -f "@anthropic-ai/claude-code" >/dev/null 2>&1; then
+        active=1; reasons="Claude 正在运行"
+    fi
+    st=$(status)
+    case "$st" in
+        *hasA=1*|*hasB=1*|*hasC=1*|*hasD=1*)
+            active=1; reasons="${reasons:+$reasons、}已有账号槽位" ;;
+    esac
+    pid=$(awk -F'\t' '{print $1; exit}' "$BASE/watch.pid" 2>/dev/null)
+    if [ -n "$pid" ] && watch_pid_is_watchdog "$pid"; then
+        active=1; reasons="${reasons:+$reasons、}看门狗驻守中"
+    fi
+    if [ "$active" = 1 ]; then
+        printf 'report-only|%s\n' "$reasons"
+    else
+        printf 'auto-ok|未启动、无账号槽位、无驻守\n'
+    fi
+}
+
+# node-scan 输出的候选行: NODE <TAB> selector <TAB> leaf <TAB> ip <TAB> egress <TAB> udp
+scan_nodes() {
+    local raw tmp group="" selector="" current="" gate reason="" ip n=0
+    local score verdict ptype detail cc leaf egress udp eligible why
+    local best="" best_score=0 best_ip="" best_cc="" best_sel="" best_leaf=""
+    local cur_score=0 cur_ip="" delta=0 candidates=0 unique=0 eligible_n=0 unknown_n=0
+    local epoch line
+    [ -n "$PROXY_GROUP" ] || { echo "FAIL:未配置代理组,无法扫描节点" >&2; return 1; }
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/node-scan.XXXXXX") || return 1
+    raw="$tmp/raw"
+    if ! clash_rules node-scan >"$raw" 2>"$tmp/err"; then
+        echo "FAIL:读不到运行中的内核节点($(head -1 "$tmp/err" 2>/dev/null))" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    grep -q '^SCANv1$' "$raw" || { echo "FAIL:节点枚举返回格式异常" >&2; rm -rf "$tmp"; return 1; }
+    group=$(awk -F'\t' '$1=="GROUP"{print $2; exit}' "$raw")
+    current=$(awk -F'\t' '$1=="CURRENT"{print $2; exit}' "$raw")
+    selector=$(awk -F'\t' '$1=="NODE"{print $2; exit}' "$raw")
+
+    # 按 IP 去重:本机 11 个叶子只对应 3 个出口,不去重就是 11 次无谓请求。
+    awk -F'\t' '$1=="NODE" && $5=="known" && $4!="" {print $4}' "$raw" \
+        | sort -u > "$tmp/ips"
+    unique=$(wc -l < "$tmp/ips" | tr -d ' ')
+    while IFS= read -r ip; do
+        [ -n "$ip" ] || continue
+        n=$((n + 1))
+        ( ip_purity "$ip" > "$tmp/p_$ip" 2>/dev/null ) &
+        [ $((n % NODE_SCAN_PARALLEL)) -eq 0 ] && wait
+    done < "$tmp/ips"
+    wait
+
+    : > "$tmp/ranked"
+    while IFS=$'\t' read -r tag sel leaf ip egress udp; do
+        [ "$tag" = "NODE" ] || continue
+        candidates=$((candidates + 1))
+        score=""; verdict=""; ptype=""; detail=""; cc=""; why=""; eligible=1
+        case "$egress" in
+            fronted) why="CDN 前置,出口未知"; eligible=0; unknown_n=$((unknown_n + 1)) ;;
+            domain)  why="入口是域名,出口未知"; eligible=0; unknown_n=$((unknown_n + 1)) ;;
+            missing) why="配置里没有 server"; eligible=0; unknown_n=$((unknown_n + 1)) ;;
+            known)
+                if [ -f "$tmp/p_$ip" ]; then
+                    IFS='|' read -r score verdict ptype detail cc < "$tmp/p_$ip"
+                fi
+                case "$score" in
+                    ''|*[!0-9]*) why="未取到评级"; score=""; eligible=0 ;;
+                esac ;;
+            *) why="出口类型未知"; eligible=0 ;;
+        esac
+        if [ "$eligible" = 1 ]; then
+            case "$verdict" in
+                fail) why="风险过高(Tor/代理特征)"; eligible=0 ;;
+            esac
+        fi
+        if [ "$eligible" = 1 ]; then
+            if [ -z "$cc" ]; then
+                why="国家待验证"; eligible=0
+            elif [ -n "$COUNTRY_TARGET" ] && [ "$cc" != "$COUNTRY_TARGET" ]; then
+                why="国家不符($cc≠$COUNTRY_TARGET)"; eligible=0
+            fi
+        fi
+        if [ "$eligible" = 1 ] && [ "$udp" = "0" ]; then
+            why="UDP 未标注"; eligible=0
+        fi
+        [ "$eligible" = 1 ] && eligible_n=$((eligible_n + 1))
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${score:-0}" "$eligible" "$leaf" "$ip" "$cc" "$verdict" "$why" "$sel" \
+            >> "$tmp/ranked"
+        if [ "$leaf" = "$current" ]; then
+            cur_ip="$ip"; cur_score="${score:-0}"
+        fi
+    done < "$raw"
+    # 当前节点没被枚举到(例如它挂在 URLTest 下)时,单独给它打一次分。
+    if [ -n "$cur_ip" ] && [ -f "$tmp/p_$cur_ip" ]; then
+        IFS='|' read -r score verdict ptype detail cc < "$tmp/p_$cur_ip"
+        case "$score" in ''|*[!0-9]*) ;; *) cur_score="$score" ;; esac
+    fi
+
+    sort -t$'\t' -k2,2nr -k1,1nr "$tmp/ranked" > "$tmp/sorted"
+    line=$(awk -F'\t' '$2==1 {print; exit}' "$tmp/sorted")
+    if [ -n "$line" ]; then
+        IFS=$'\t' read -r best_score eligible best_leaf best_ip best_cc verdict why best_sel <<<"$line"
+        delta=$((best_score - cur_score))
+        # BEST 只表示「值得换」的那个节点。差距不够就把整组字段清空,
+        # 别留一个 BEST= 空、BEST_IP 却有值的半截报告给界面读。
+        if [ "$delta" -lt "$NODE_SCAN_MARGIN" ]; then
+            best_leaf=""; best_score=0; best_ip=""; best_cc=""; best_sel=""; delta=0
+        fi
+    fi
+
+    IFS='|' read -r gate reason <<<"$(node_gate)"
+    epoch=$(date +%s)
+    # 「固定最优节点」落在同一份报告里,不新增检查项:当前节点是不是还等于
+    # preferred-node,偏离就报警。校验只靠报告里的 CURRENT,不给 45 秒的
+    # checkdetail 预算再加一次内核枚举。
+    local pref="" pref_match=-1
+    pref=$(preferred_node_leaf)
+    if [ -n "$pref" ]; then
+        if [ "$pref" = "$current" ]; then pref_match=1; else pref_match=0; fi
+    fi
+    {
+        printf 'EPOCH=%s\n' "$epoch"
+        printf 'GROUP=%s\n' "$group"
+        printf 'SELECTOR=%s\n' "$selector"
+        printf 'CURRENT=%s\n' "$current"
+        printf 'CURRENT_SCORE=%s\n' "$cur_score"
+        printf 'BEST=%s\n' "$best_leaf"
+        printf 'BEST_SCORE=%s\n' "$best_score"
+        printf 'BEST_IP=%s\n' "$best_ip"
+        printf 'BEST_SELECTOR=%s\n' "$best_sel"
+        printf 'DELTA=%s\n' "$delta"
+        printf 'GATE=%s\n' "$gate"
+        printf 'GATE_REASON=%s\n' "$reason"
+        printf 'CANDIDATES=%s\n' "$candidates"
+        printf 'UNIQUE_IPS=%s\n' "$unique"
+        printf 'UNKNOWN=%s\n' "$unknown_n"
+        printf 'ELIGIBLE=%s\n' "$eligible_n"
+        printf 'PREFERRED=%s\n' "$pref"
+        printf 'PREFERRED_MATCH=%s\n' "$pref_match"
+        awk -F'\t' 'NR<=3 {printf "TOP%d=%s|%s|%s|%s|%s\n", NR, $3, $1, $5, $6, $7}' "$tmp/sorted"
+    } > "$NODE_SCAN_FILE.tmp" 2>/dev/null && mv "$NODE_SCAN_FILE.tmp" "$NODE_SCAN_FILE"
+
+    # node-apply 切完会静默重扫一次刷新报告,那时不该把整段人话混进应用回执。
+    if [ "${NODE_SCAN_QUIET:-0}" != "1" ]; then
+        echo "节点扫描(只读) · 组 $group"
+        echo "当前 $current · 评分 ${cur_score:-未评级}/100"
+        echo "候选 $candidates 个 → 去重 $unique 个出口 · 过硬门槛 $eligible_n 个 · 出口未知 $unknown_n 个"
+        echo "门禁:$gate($reason)"
+        if [ "$pref_match" = "1" ]; then
+            echo "已固定节点:$pref(当前正在使用)"
+        elif [ "$pref_match" = "0" ]; then
+            echo "已偏离固定节点:$pref · 点「扫描可用节点」重新应用"
+        fi
+        if [ -n "$best_leaf" ]; then
+            echo "建议:$best_leaf · $best_score 分 · 比当前高 $delta 分 · 出口 $best_ip/$best_cc"
+        elif [ "$eligible_n" = 0 ]; then
+            echo "没有过硬门槛的候选,不建议换节点"
+        else
+            echo "当前线路已是候选里最干净的(差距 < ${NODE_SCAN_MARGIN} 分),不建议换"
+        fi
+        echo "--- 排名(前 3) ---"
+        awk -F'\t' 'NR<=3 {printf "  %-52s %4s 分  %-3s  %s\n", $3, $1, $5, ($2==1 ? "可用" : $7)}' "$tmp/sorted"
+        echo "报告:$NODE_SCAN_FILE"
+        # 同一份键值也回给界面:App 就地更新「更优节点」那一行,不必整轮 refresh
+        # (refresh 会先撤守护,只读扫描不该付这个代价)。
+        echo "--- 报告键值 ---"
+        cat "$NODE_SCAN_FILE"
+    fi
+    rm -rf "$tmp"
+    return 0
+}
+
+# ---------- 应用最优节点(有副作用,受门禁) ----------
+# 分工:node-scan 只读;只有这条命令会切线路。
+# 守护不归脚本管 —— App 先 stopWatch() 再调这里,切完由 checkEnvironment
+# 通过后自动 startWatch()。脚本自己去杀 App 持有的守护进程,会让 App 的
+# watchProcess 收到「意外退出」而误报成守护断了,那是假故障。
+#
+# 门禁分两层,别混:
+#   · node_gate()         报告门禁,保守并集(含「看门狗驻守」这个信号),用户选 A;
+#   · node_apply_gate()   执行门禁,只按此刻的真实状态重新判定。看门狗不算
+#                         「实例」,但必须**确实已经不在跑**才放行 —— 把那条
+#                         从信号升级成事实,而不是放宽。
+node_apply_gate() {
+    local st reasons="" pid="" i
+    if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 \
+       || pgrep -f "claude-code/cli.js" >/dev/null 2>&1 \
+       || pgrep -f "@anthropic-ai/claude-code" >/dev/null 2>&1; then
+        reasons="Claude 正在运行"
+    fi
+    st=$(status)
+    case "$st" in
+        *hasA=1*|*hasB=1*|*hasC=1*|*hasD=1*)
+            reasons="${reasons:+$reasons、}已有账号槽位" ;;
+    esac
+    [ -n "$reasons" ] && { printf 'denied|%s\n' "$reasons"; return 0; }
+    # stopWatch() 发完 SIGTERM 后 bash 可能还卡在 sleep 里,App 0.5s 后补 SIGKILL。
+    # 给最多 3 秒等它退干净;pidfile 残留但进程已死,watch_pid_is_watchdog 会返回假。
+    for i in 1 2 3 4 5 6; do
+        pid=$(awk -F'\t' '{print $1; exit}' "$BASE/watch.pid" 2>/dev/null)
+        if [ -z "$pid" ] || ! watch_pid_is_watchdog "$pid"; then
+            printf 'allowed|未启动、无账号槽位、无驻守\n'
+            return 0
+        fi
+        sleep 0.5
+    done
+    printf 'denied|看门狗仍在驻守,请先停止守护(或退出应用)\n'
+}
+
+node_apply() {
+    local epoch now best="" best_score=0 best_ip="" best_sel="" selector="" current=""
+    local gate reason tmp raw="" original="" now_leaf="" trace loc="" ip_after="" i verified=0
+    [ -f "$NODE_SCAN_FILE" ] || { echo "FAIL:还没有扫描报告,请先运行 node-scan" >&2; return 1; }
+    epoch=$(sed -n 's/^EPOCH=//p' "$NODE_SCAN_FILE" | head -1)
+    now=$(date +%s)
+    case "${epoch:-}" in ''|*[!0-9]*) epoch=0 ;; esac
+    [ $((now - epoch)) -le "$NODE_SCAN_TTL" ] || {
+        echo "FAIL:扫描报告已过期,请先重新扫描" >&2; return 1; }
+    best=$(sed -n 's/^BEST=//p' "$NODE_SCAN_FILE" | head -1)
+    [ -n "$best" ] || { echo "FAIL:当前没有值得切换的更优节点,无需应用" >&2; return 1; }
+    best_score=$(sed -n 's/^BEST_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
+    best_ip=$(sed -n 's/^BEST_IP=//p' "$NODE_SCAN_FILE" | head -1)
+    best_sel=$(sed -n 's/^BEST_SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
+    selector=$(sed -n 's/^SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
+    current=$(sed -n 's/^CURRENT=//p' "$NODE_SCAN_FILE" | head -1)
+    [ -n "$best_sel" ] || best_sel="$selector"
+    [ -n "$best_sel" ] || { echo "FAIL:报告里没有可用的 Selector,请重新扫描" >&2; return 1; }
+
+    # 不信报告里的 GATE:它是扫描那一刻的快照。此刻重新判一次,才不会
+    # 拿一份旧报告在用户已经开起 Claude 之后偷偷换线路。
+    IFS='|' read -r gate reason <<<"$(node_apply_gate)"
+    [ "$gate" = "allowed" ] || {
+        echo "FAIL:已有实例环境,按约定只出报告($reason)" >&2; return 1; }
+
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/node-apply.XXXXXX") || return 1
+    raw="$tmp/raw"
+    if ! clash_rules node-scan >"$raw" 2>"$tmp/err"; then
+        echo "FAIL:读不到运行中的内核节点($(head -1 "$tmp/err" 2>/dev/null))" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    original=$(awk -F'\t' '$1=="CURRENT"{print $2; exit}' "$raw")
+    [ -n "$original" ] || original="$current"
+    # 订阅可能已经更新过:候选必须仍是这个 Selector 的叶子,否则 PUT 会失败,
+    # 更糟的是切到一个已经不存在的名字上。
+    if ! awk -F'\t' -v s="$best_sel" -v l="$best" \
+         '$1=="NODE" && $2==s && $3==l {hit=1} END{exit !hit}' "$raw"; then
+        echo "FAIL:候选节点已不在内核里(订阅可能更新过),请重新扫描" >&2
+        rm -rf "$tmp"; return 1
+    fi
+
+    echo "切换:$original → $best (Selector $best_sel)"
+    if ! clash_rules node-select "$best_sel" "$best" >"$tmp/out" 2>&1; then
+        echo "FAIL:内核拒绝切换($(head -1 "$tmp/out"))" >&2
+        rm -rf "$tmp"; return 1
+    fi
+
+    # PUT 成功不等于生效:URLTest / Fallback 会自己把选择覆盖回去。
+    # 先读内核的 now 确认落在目标叶子上,再等真实出口换成目标国家。
+    now_leaf=$(clash_rules node-scan 2>/dev/null \
+        | awk -F'\t' '$1=="CURRENT"{print $2; exit}')
+    if [ "$now_leaf" = "$best" ]; then
+        for i in 1 2 3 4 5; do
+            trace=$(curl -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+            loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -1)
+            ip_after=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -1)
+            if [ -n "$loc" ] && { [ -z "$COUNTRY_TARGET" ] || [ "$loc" = "$COUNTRY_TARGET" ]; }; then
+                verified=1; break
+            fi
+            sleep 2
+        done
+    fi
+    if [ "$verified" != 1 ]; then
+        if [ -n "$original" ]; then
+            if clash_rules node-select "$best_sel" "$original" >/dev/null 2>&1; then
+                echo "已回滚到 $original"
+            else
+                echo "WARN:回滚失败,请手动切回 $original" >&2
+            fi
+        fi
+        echo "FAIL:切换后未能确认 $COUNTRY_TARGET 出口(内核当前 ${now_leaf:-未知},loc=${loc:-未知}),未固定节点" >&2
+        rm -rf "$tmp"; return 1
+    fi
+
+    # 固定下来:后续检查靠 PREFERRED_MATCH 发现「有人把节点改回去了」。
+    printf '%s\t%s\t%s\t%s\n' "$best_sel" "$best" "$best_ip" "$(date +%s)" \
+        > "$PREFERRED_NODE_FILE.tmp" 2>/dev/null \
+        && mv "$PREFERRED_NODE_FILE.tmp" "$PREFERRED_NODE_FILE"
+    echo "OK:已应用并固定 $best($best_score 分) · 出口 ${ip_after:-未知}/${loc:-未知}"
+    echo "已建立的连接不会迁移;启动 Claude 前请在客户端确认线路"
+    # 静默重扫:刷新 CURRENT / 门禁 / PREFERRED_MATCH,让「更优节点」立刻落成真值。
+    NODE_SCAN_QUIET=1 scan_nodes >/dev/null 2>&1 || true
+    echo "APPLY=OK"
+    echo "APPLIED=$best"
+    echo "--- 报告键值 ---"
+    cat "$NODE_SCAN_FILE"
+    rm -rf "$tmp"
+    return 0
 }
 
 # 保留隐藏入口供安装器调用;现在生成全局 Script.js 并迁移旧管理块。
@@ -4034,11 +4619,15 @@ help() {
 用法: claude-switch.sh <命令> [参数]
 
 日常(最常用的五个)
-  checkdetail          逐项检查 14 项环境,每项给出原因和下一步
+  checkdetail          逐项检查 16 项环境,每项给出原因和下一步
   check                只输出一行 OK / FAIL,给 App 当启动前的硬性门禁
   watch [间隔] [整轮周期]
                        运行期看门狗:出口一变或任一项不合格,立刻关掉 Claude
   fix                  一键修复能自动处理的问题(规则、时区、地区、保镖)
+  node-scan            只读扫描当前代理组里的候选节点,按纯净度排名并出报告
+                       不切节点 / 不动看门狗 / 不写 IP 漂移;已有实例时只出报告
+  node-apply           把报告里的最优节点切上去并固定(仅门禁允许时)
+                       切前须已停守护、切后复查出口国家,不达标自动回滚
   switch A|B|C|D       切换到某个账号并启动 Claude
   status               当前账号、出口、代理状态的摘要
 
@@ -4101,6 +4690,8 @@ case "$operation" in
         summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
         ;;
     fix) fix ;;
+    node-scan) scan_nodes ;;
+    node-apply) node_apply ;;
     watch) watch "${2:-10}" "${3:-6}" ;;
     status) status ;;
     switch) switch_to "${2:-}" ;;
