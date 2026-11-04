@@ -782,6 +782,70 @@ struct MenuBarModelTests {
                            "已有实例环境时不该许诺自动应用按钮,实际 \(deniedDetail)")
                 try expect(deniedDetail.contains("手动切换"),
                            "已有实例环境应指到客户端手动切换,实际 \(deniedDetail)")
+            case "menu_bar_brand_icon":
+                // 菜单栏图标以前是系统符号 checkmark.shield.fill；窗口标记与 App 图标
+                // 换成 Claude 星芒后它成了唯一一枚「盾牌 + 对号」。这里锁住新的自绘图标：
+                // 两态同一枚盾牌、同一种「实心 + 挖空」画法、都能当模板图渲染；
+                // 正常态挖的是 Claude 星芒，拦截态换成一枚大感叹号。
+                let normalImage = MenuBarBrand.image(intercepted: false)
+                let blockedImage = MenuBarBrand.image(intercepted: true)
+                // 放在断言之前：断言失败时也要能拿到图做人工复核。
+                if let dir = ProcessInfo.processInfo.environment["CS_ICON_DUMP"] {
+                    for (name, image) in [("normal", normalImage), ("blocked", blockedImage)] {
+                        if let r = image.representations.first as? NSBitmapImageRep,
+                           let data = r.representation(using: .png, properties: [:]) {
+                            try? data.write(to: URL(fileURLWithPath: dir)
+                                .appendingPathComponent("menubar-\(name).png"))
+                        }
+                    }
+                }
+                for image in [normalImage, blockedImage] {
+                    try expect(abs(image.size.width - MenuBarBrand.side) < 0.01
+                               && abs(image.size.height - MenuBarBrand.side) < 0.01,
+                               "菜单栏图标应是 \(MenuBarBrand.side)pt 正方形，实际 \(image.size)")
+                    try expect(image.isTemplate, "菜单栏图标必须是模板图，否则深色菜单栏会糊成黑块")
+                }
+                func rep(_ image: NSImage) throws -> NSBitmapImageRep {
+                    guard let r = image.representations.first as? NSBitmapImageRep else {
+                        throw TestFailure(description: "菜单栏图标没有位图表示")
+                    }
+                    return r
+                }
+                let normalRep = try rep(normalImage)
+                let blockedRep = try rep(blockedImage)
+                for r in [normalRep, blockedRep] {
+                    try expect(r.pixelsWide == 36 && r.pixelsHigh == 36,
+                               "18pt 图标应出 2x 位图，实际 \(r.pixelsWide)×\(r.pixelsHigh)")
+                }
+                // 逐像素统计：不透明像素数 / 中央区透明像素数 / 整图 alpha 指纹。
+                func stats(_ r: NSBitmapImageRep) -> (Int, Int, [UInt8]) {
+                    var opaque = 0, clearCenter = 0, alpha: [UInt8] = []
+                    for y in 0..<r.pixelsHigh {
+                        for x in 0..<r.pixelsWide {
+                            let a = r.colorAt(x: x, y: y)?.alphaComponent ?? 0
+                            let byte = UInt8(min(255, max(0, Int(a * 255))))
+                            alpha.append(byte)
+                            if byte > 216 { opaque += 1 }
+                            if x >= 12 && x < 24 && y >= 12 && y < 24 && byte < 38 {
+                                clearCenter += 1
+                            }
+                        }
+                    }
+                    return (opaque, clearCenter, alpha)
+                }
+                let (normalOpaque, normalHole, normalAlpha) = stats(normalRep)
+                let (blockedOpaque, blockedHole, blockedAlpha) = stats(blockedRep)
+                try expect(normalOpaque > 200,
+                           "盾牌应是实心块，实际只有 \(normalOpaque) 个不透明像素")
+                // 负例对照：如果星芒没画（或挖空被绕向抵消），中心区就是一整块实心，
+                // clearCenter 会是 0 —— 这正是上一版中心留洞 / 无星芒会露出的破绽。
+                try expect(normalHole > 10,
+                           "中心区应有被挖空的 Claude 星芒，实际透明像素 \(normalHole)")
+                try expect(blockedHole > 10,
+                           "拦截态该有一枚挖空的感叹号，实际透明像素 \(blockedHole)")
+                try expect(blockedOpaque != normalOpaque,
+                           "两态的孔不能是同一块，实际 \(blockedOpaque) vs \(normalOpaque)")
+                try expect(blockedAlpha != normalAlpha, "两态图标不能长得一模一样")
             default:
                 throw TestFailure(description: "未知测试场景：\(name)")
             }

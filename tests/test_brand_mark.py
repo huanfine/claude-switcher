@@ -77,6 +77,27 @@ class BrandMarkTests(unittest.TestCase):
             vals[name] = found
         self.assertEqual(vals["app"], vals["gen"], "轮廓参数两处不一致")
 
+    def test_menu_bar_icon_reuses_the_same_brand_geometry(self):
+        """菜单栏状态图标不能退回系统符号，也不能另画一枚「差不多」的近似标。
+
+        窗口标记与 App 图标换成 Claude 星芒之后，状态栏还挂着
+        checkmark.shield.fill —— 那是三处品牌位里唯一不一致的一枚。
+        """
+        text = APP.read_text(encoding="utf-8")
+        self.assertIn("enum MenuBarBrand", text, "菜单栏图标应走自绘品牌标")
+        start = text.index("enum MenuBarBrand")
+        end = text.index("// 生产应用与 UI 测试共用")
+        block = text[start:end]
+        for shape in ("GuardShield().path(in: shield).cgPath",
+                      "ClaudeBurst().path(in: burst).cgPath"):
+            self.assertIn(shape, block, f"菜单栏图标没复用 {shape}，会与窗口标漂移")
+        self.assertIn("image.isTemplate = true", block,
+                      "模板图才能自动适配浅色 / 深色菜单栏")
+        # 负例对照：两枚系统盾牌符号都不该再出现在源码里（空状态插画用的
+        # 非 fill 版 checkmark.shield 不在此列）。
+        for symbol in ('"checkmark.shield.fill"', '"exclamationmark.shield.fill"'):
+            self.assertNotIn(symbol, text, f"状态图标又退回系统符号 {symbol}")
+
 
 if __name__ == "__main__":
     unittest.main()

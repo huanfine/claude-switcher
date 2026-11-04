@@ -4781,27 +4781,95 @@ struct MenuBarContent: View {
     }
 }
 
+// MARK: - 菜单栏品牌图标
+//
+// 之前这里直接拿系统符号 checkmark.shield.fill / exclamationmark.shield.fill。
+// 窗口标记和 App 图标都换成 Claude 星芒之后，它是唯一还停在「盾牌 + 对号」的地方，
+// 偏偏又一直挂在菜单栏上 —— 于是成了最显眼的那枚「不对」的图标。
+//
+// 现在自绘：复用 GuardShield / ClaudeBurst 两张几何表，把星芒用 destinationOut
+// 挖成透明孔，交给 macOS 当模板图渲染（isTemplate）—— 浅色 / 深色菜单栏、点按高亮
+// 都自动适配，不需要为两种外观各存一份颜色。
+//
+// 不用 NSImage.lockFocus()：它按当前屏幕的 backing scale 出图，非 Retina 机器上
+// 会掉一半分辨率。这里显式建 2x 位图，几何全部按 pt 写。
+enum MenuBarBrand {
+    static let side: CGFloat = 18
+    private static let scale: CGFloat = 2
+
+    static func image(intercepted: Bool) -> NSImage {
+        let px = Int(side * scale)
+        // 不能用 NSGraphicsContext(bitmapImageRep:)：它会按 rep.size 自己装一层
+        // 2x CTM，再叠一次缩放 + 翻转就会把图标放大到画布外（实测两态都只剩
+        // 同一块黑角）。直接建 CGContext，坐标系完全由这里说了算。
+        let cg = CGContext(data: nil, width: px, height: px, bitsPerComponent: 8,
+                           bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        // 原点在左下；翻成「pt、y 向下」，和 SwiftUI Shape 的坐标一致。
+        cg.translateBy(x: 0, y: side * scale)
+        cg.scaleBy(x: scale, y: -scale)
+        let opaque = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        cg.setFillColor(opaque)
+        cg.setAllowsAntialiasing(true)
+
+        // 盾牌 16pt 高、宽高比 0.8，和窗口里 GuardMark 是同一套比例。
+        let height = side - 2
+        let shieldWidth = height * 0.8
+        let shield = CGRect(x: (side - shieldWidth) / 2, y: 1,
+                            width: shieldWidth, height: height)
+        cg.addPath(GuardShield().path(in: shield).cgPath)
+        cg.fillPath()
+
+        // 中间那块孔：正常态是 Claude 星芒，拦截态换成一枚大感叹号。
+        // 两态共用同一枚盾牌、同一种「实心块 + 挖空」画法，所以不会像两个应用
+        // （11-03 两态字重不统一踩的就是这个坑）。
+        //
+        // 试过在星芒右下角叠一枚小徽章：18pt 里徽章会盖住星芒右侧的射线，
+        // 而且黑徽章压在黑盾上根本看不出轮廓，只剩一根来路不明的感叹号。
+        // 直接换孔比叠元素清楚得多。
+        cg.setBlendMode(.destinationOut)
+        if intercepted {
+            let bar: CGFloat = 2.2
+            cg.fill(CGRect(x: side / 2 - bar / 2, y: 4.2,
+                           width: bar, height: 5.4))
+            cg.fillEllipse(in: CGRect(x: side / 2 - bar / 2, y: 11.0,
+                                      width: bar, height: bar))
+        } else {
+            // 毂单挖一次：塞进同一个 Shape 会碰上 addEllipse 与手写多边形
+            // 绕向相反、重叠区被抵消的老问题。
+            let burstSide = height * 0.52
+            let centerY = 1 + height / 2 - height * 0.04
+            let burst = CGRect(x: (side - burstSide) / 2, y: centerY - burstSide / 2,
+                               width: burstSide, height: burstSide)
+            cg.addPath(ClaudeBurst().path(in: burst).cgPath)
+            cg.fillPath()
+            let hub = height * 0.156
+            cg.fillEllipse(in: CGRect(x: side / 2 - hub / 2, y: centerY - hub / 2,
+                                      width: hub, height: hub))
+        }
+        cg.setBlendMode(.normal)
+
+        let rep = NSBitmapImageRep(cgImage: cg.makeImage()!)
+        rep.size = NSSize(width: side, height: side)
+        let image = NSImage(size: NSSize(width: side, height: side))
+        image.addRepresentation(rep)
+        image.isTemplate = true
+        return image
+    }
+}
+
 // 生产应用与 UI 测试共用完全相同的菜单和窗口管理。
 struct SwitcherMenu: Scene {
     @ObservedObject var vm: VM
     let controller: AppDelegate
 
-    private static let normalImage: NSImage = {
-        // 用 .fill 不用线框版：菜单栏图标是唯一一直可见的品牌符号，
-        // 细线版在浅色菜单栏上几乎只剩一圈边。而且「被拦截」那枚本来就是填充的
-        // （exclamationmark.shield.fill），两态字重不一致会显得像两个应用。
-        let image = NSImage(systemSymbolName: "checkmark.shield.fill", accessibilityDescription: "Claude 环境检查器")!
-        image.isTemplate = true
-        return image
-    }()
+    /// 菜单栏图标是窗口关着时唯一一直可见的品牌符号，所以必须和窗口 / App 图标
+    /// 是同一枚标（盾牌 + Claude 星芒），不能再退回系统符号。
+    private static let normalImage = MenuBarBrand.image(intercepted: false)
 
-    /// 被拦截时换图标。菜单栏图标是唯一一直可见的东西 —— 窗口关着的时候,
-    /// 它是用户唯一能察觉「出事了」的入口。
-    private static let blockedImage: NSImage = {
-        let image = NSImage(systemSymbolName: "exclamationmark.shield.fill", accessibilityDescription: "已拦截")!
-        image.isTemplate = true
-        return image
-    }()
+    /// 被拦截时加一枚感叹号徽章，星芒仍在。窗口关着的时候，这是用户唯一能察觉
+    /// 「出事了」的入口。
+    private static let blockedImage = MenuBarBrand.image(intercepted: true)
 
     var body: some Scene {
         MenuBarExtra {
