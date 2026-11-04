@@ -12,7 +12,7 @@
 [![Linux](https://img.shields.io/badge/Linux-Beta-lightgrey.svg)](linux/)
 [![UI](https://img.shields.io/badge/UI-SwiftUI-orange.svg)]()
 
-<img src="assets/icon-2048.png" width="128">
+<img src="assets/icon-256.png" width="128" alt="Claude 环境检查器">
 
 </div>
 

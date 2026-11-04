@@ -2,6 +2,13 @@ import Cocoa
 
 // 应用图标生成器。产物：assets/icon-2048.png（2048×2048）。
 //
+// 生成：swift assets/icon-gen.swift assets/icon-2048.png
+//
+// README 首页另有一份 256px 缩略图 assets/icon-256.png，从 2048 缩出来：
+//   sips -z 256 256 assets/icon-2048.png --out assets/icon-256.png
+// 不直接引 2048 那张：README 里只显示 128pt，2 MB 的图纯属白拉。
+// 改了这里的画法，两个文件都要重新生成（tests/test_brand_mark.py 会盯着）。
+//
 // 画什么：石墨灰圆角方块 + 一枚暖白盾牌，盾牌中间用**挖空**的 Claude 星标。
 //
 // 为什么不再是紫靛渐变：那套颜色在 Dock 里太跳，而且和界面本身完全脱节 ——

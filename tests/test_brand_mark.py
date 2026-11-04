@@ -99,5 +99,50 @@ class BrandMarkTests(unittest.TestCase):
             self.assertNotIn(symbol, text, f"状态图标又退回系统符号 {symbol}")
 
 
+def png_size(path):
+    """读 PNG 的 IHDR 拿宽高，不依赖 Pillow。"""
+    raw = path.read_bytes()
+    if raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+        raise AssertionError(f"{path.name} 不是合法 PNG")
+    return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+
+
+class ReadmeIconTests(unittest.TestCase):
+    """README 首页那张图。
+
+    原来两处 README 都直接引 assets/icon-2048.png，还写了 width="128" ——
+    等于每打开一次仓库首页就拉 2 MB 换一个缩略图。缩略图另存一份之后，
+    最怕的就是有人「顺手」把路径改回去，所以钉住。
+    """
+
+    def setUp(self):
+        self.small = ROOT / "assets/icon-256.png"
+        self.large = ROOT / "assets/icon-2048.png"
+
+    def test_the_thumbnail_exists_and_is_256(self):
+        self.assertTrue(self.small.exists(), "缺 assets/icon-256.png（README 用的缩略图）")
+        self.assertEqual(png_size(self.small), (256, 256))
+
+    def test_the_thumbnail_is_actually_small(self):
+        # 2048 原图约 2 MB；缩略图只要几万字节。给一倍余量，正常不会逼近。
+        self.assertLess(self.small.stat().st_size, 120_000,
+                        f"缩略图 {self.small.stat().st_size} 字节，太大了")
+        self.assertGreater(self.large.stat().st_size, self.small.stat().st_size * 10,
+                           "原图反而没比缩略图大多少，缩略图可能不是从它缩出来的")
+
+    def test_readmes_point_at_the_thumbnail(self):
+        for name in ("README.md", "README.en.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("assets/icon-256.png", text, f"{name} 没引用缩略图")
+            self.assertNotIn('src="assets/icon-2048.png"', text,
+                             f"{name} 又直接引了 2 MB 的原图")
+
+    def test_packager_still_uses_the_full_size_original(self):
+        # 打包要的是 1024+ 的源图来生成 .icns，别被缩略图替换掉。
+        text = (ROOT / "scripts/package-macos.sh").read_text(encoding="utf-8")
+        self.assertIn("assets/icon-2048.png", text, "打包脚本应继续用 2048 原图生成 icns")
+
+
+
 if __name__ == "__main__":
     unittest.main()

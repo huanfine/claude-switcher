@@ -8,7 +8,7 @@
 
 > Based on [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) (MIT) — see [Origin and License](#origin-and-license).
 
-<img src="assets/icon-2048.png" width="120">
+<img src="assets/icon-256.png" width="120" alt="Claude 环境检查器">
 
 </div>
 
