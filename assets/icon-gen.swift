@@ -2,16 +2,21 @@ import Cocoa
 
 // 应用图标生成器。产物：assets/icon-2048.png（2048×2048）。
 //
-// 画什么：紫色渐变圆角方块 + 一枚白色盾牌，盾牌中间用**挖空**的 Claude 星标。
+// 画什么：石墨灰圆角方块 + 一枚暖白盾牌，盾牌中间用**挖空**的 Claude 星标。
+//
+// 为什么不再是紫靛渐变：那套颜色在 Dock 里太跳，而且和界面本身完全脱节 ——
+// 主界面是暖纸白（#F9F8F6）+ 石墨字（#1F1D1A）+ 陶土橙点缀，一个紫图标
+// 摆在一排暖色图标里像别人家的。现在只用「深石墨底 + 暖白盾」两级明暗，
+// 不靠色相取胜：缩到 16pt 靠轮廓就认得出来，放大也不吵。
 //
 // 为什么换掉旧图形：旧图形是「盾牌 + 双向箭头 ⇄」，读作「切换」。
 // 应用名是「环境检查」，主诉是「环境干不干净、能不能放行」，
 // 而这一版再换一次（对号 → 星标）：对号说明的是「检查过了」，换个工具也一样；
 // 星标是 Claude 的标，Dock 里一眼能认出这是给谁用的。守护由盾牌承担。
 //
-// 为什么星标是挖空而不是画成紫色：底色是渐变，用固定色去画标记，
-// 在一端会偏色。挖空之后露出来的是垫在底下的同一片渐变，任何位置都不会错。
-// 实现上是把星标「描边后的轮廓」当裁切区，在原坐标上重画一遍同一片渐变。
+// 为什么星标是挖空而不是单独上一个颜色：挖空露出来的是底下的石墨，
+// 与背景天然同色，不需要维护第二个色值；将来换底色也不用改这里。
+// 实现上是把星标「描边后的轮廓」当裁切区，在原坐标上重画一遍同一片底色。
 //
 // 一条通用规则（两次踩坑换来）：图标里**不要叠半透明层**。0.06 的白在渐变上
 // 亮不起来，只会留下一条硬边，缩到 128 就是一块来路不明的浅色方块。
@@ -33,19 +38,21 @@ NSGraphicsContext.saveGraphicsState()
 NSGraphicsContext.current = graphics
 guard let ctx = NSGraphicsContext.current?.cgContext else { exit(1) }
 
-// ---- 背景：圆角方块 + 靛紫渐变（沿用原来的配色，不动） ----
+// ---- 背景：圆角方块 + 石墨渐变 ----
+// 两端只差一档明度（#3A3631 → #232120），是「有一点体积」而不是「一条渐变」；
+// 饱和度压到接近 0，色相留在暖侧，和界面里的石墨字同族。
 let bgRect = NSRect(x: 92 * k, y: 92 * k, width: 840 * k, height: 840 * k)
 let bgPath = NSBezierPath(roundedRect: bgRect, xRadius: 210 * k, yRadius: 210 * k)
 let grad = NSGradient(colors: [
-    NSColor(red: 0.42, green: 0.39, blue: 0.96, alpha: 1),   // 靛
-    NSColor(red: 0.62, green: 0.28, blue: 0.92, alpha: 1),   // 紫
+    NSColor(red: 0.227, green: 0.212, blue: 0.192, alpha: 1),   // #3A3631 石墨
+    NSColor(red: 0.129, green: 0.122, blue: 0.110, alpha: 1),   // #211F1C 深石墨
 ])!
 grad.draw(in: bgPath, angle: -45)
 
 // 这里原来有一层「顶部极淡白椭圆」，想让上门沿不死板。
 // 删了：0.06 的白在渐变上根本不发亮，只会露出一条**弧形硬边**，
 // 缩到 128 就成了图标左上角莫名其妙的一个浅色方块 —— 读起来像没画完的线框。
-// 图标的层次靠「盾牌是实的、对号是挖空的」两件事就已经够了，不需要再加一层。
+// 图标的层次靠「盾牌是实的、星标是挖空的」两件事就已经够了，不需要再加一层。
 
 // ---- 盾牌轮廓 ----
 // 上沿中间留一个很浅的凹点，两侧肩部略高，下沿收成一个圆尖。
@@ -121,9 +128,10 @@ func starPath(cx: CGFloat, cy: CGFloat, R: CGFloat) -> NSBezierPath {
 let shieldCG = shieldPath(scale: k).cgPath
 let starOutline = starPath(cx: 512 * k, cy: 532 * k, R: 192 * k).cgPath
 
-// 先用盾牌填白。
+// 先用盾牌填暖白（#F7F4EF，和界面里的纸白同一个色）。纯白在石墨底上会发灰、
+// 显得脏，暖一档反而更像「纸」。
 ctx.addPath(shieldCG)
-ctx.setFillColor(NSColor.white.cgColor)
+ctx.setFillColor(NSColor(srgbRed: 0.969, green: 0.957, blue: 0.937, alpha: 1).cgColor)
 ctx.fillPath()
 
 // 再把星标挖掉。**不要**用 even-odd 把两条路径并起来填：描边轮廓在

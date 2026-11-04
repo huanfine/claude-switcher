@@ -1,11 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- 配色与 assets/icon-gen.swift 同一套：石墨渐变底 + 暖白盾。
+       图形这里故意用对号而不是 App 图标里的星标 —— 标签页实际只有 16px，
+       盾牌内腔不到 12px，十二道射线的星标在这个尺寸会糊成一团黑点；
+       对号两根笔画还能读出来。放大到 64px 以上时以 App 图标为准。 -->
   <defs>
     <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#7C5CFC"/>
-      <stop offset="1" stop-color="#A855F7"/>
+      <stop offset="0" stop-color="#3A3631"/>
+      <stop offset="1" stop-color="#211F1C"/>
     </linearGradient>
   </defs>
   <rect width="64" height="64" rx="16" fill="url(#g)"/>
-  <path d="M32 12 48 18v12c0 10-7 17.5-16 20-9-2.5-16-10-16-20V18l16-6Z" fill="none" stroke="#fff" stroke-width="3.4" stroke-linejoin="round"/>
-  <path d="m24 32 5.6 5.6L41 26" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M32 12 48 18v12c0 10-7 17.5-16 20-9-2.5-16-10-16-20V18l16-6Z" fill="none" stroke="#F7F4EF" stroke-width="3.4" stroke-linejoin="round"/>
+  <path d="m24 32 5.6 5.6L41 26" fill="none" stroke="#F7F4EF" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
