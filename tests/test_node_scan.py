@@ -197,6 +197,7 @@ esac''')
                   "BEST": "B", "BEST_SCORE": "88", "BEST_IP": "192.0.2.12",
                   "BEST_SELECTOR": "🧠 AI·干净IP",
                   "DELTA": "39", "GATE": "report-only", "ELIGIBLE": "4",
+                  "CANDIDATES": "11", "UNIQUE_IPS": "3", "SCAN_TIME": "11-04 09:52",
                   "PREFERRED": "", "PREFERRED_MATCH": "-1"}
         values.update(overrides)
         (self.home / ".claude-switcher/node-scan.txt").write_text(
@@ -243,6 +244,53 @@ esac''')
         self.report(BEST="", DELTA="0")
         value = self.line(self.run_core("checkdetail").stdout, "更优节点")
         self.assertTrue(value.startswith("ok:"), value)
+
+    def test_no_better_node_detail_carries_real_numbers(self):
+        """「当前线路最干净」必须挂得上依据,不能是一句看不到证据的空话。
+
+        用户原话:「现在显示的是当前线路是候选里面最干净的,没有具体内容」。
+        """
+        self.report(BEST="", DELTA="0")
+        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
+        self.assertTrue(value.startswith("ok:"), value)
+        for piece in ("11 候选", "3 出口", "4 合格", "当前 49 分", "11-04 09:52 扫描"):
+            self.assertIn(piece, value)
+
+    def test_legacy_report_omits_missing_numbers(self):
+        """负例:06:54 那种旧格式报告缺统计字段,逐项省略,不能补 0 冒充实测。"""
+        self.report(BEST="", DELTA="0", CANDIDATES="", UNIQUE_IPS="",
+                    ELIGIBLE="", SCAN_TIME="", CURRENT_SCORE="")
+        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
+        self.assertTrue(value.startswith("ok:"), value)
+        self.assertNotIn("0 候选", value, value)
+        self.assertNotIn("当前  分", value, value)
+
+    def test_no_eligible_candidate_is_skip_not_ok(self):
+        """一个过硬门槛的候选都没有 = 这轮没比成,不能报 ok「当前最干净」。"""
+        self.report(BEST="", DELTA="0", ELIGIBLE="0")
+        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
+        self.assertTrue(value.startswith("skip:"), value)
+        self.assertIn("没有过硬门槛", value)
+        self.assertIn("11 候选", value)
+
+    def test_human_report_lists_all_candidates_and_scan_time(self):
+        """面板里给人看的那段要列全部候选(含排除原因),不能只给前三名。"""
+        src = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("--- 全部候选(可用优先,再按分数;含排除原因) ---", src)
+        self.assertIn("SCAN_TIME=", src)
+        self.assertNotIn("--- 排名(前 3) ---", src,
+                         "只列前三名时,被排除的节点为什么不能选就看不见了")
+
+    def test_conclusion_only_compares_eligible_candidates(self):
+        """列了全部候选之后,68 分被硬门槛排除、当前 49 分,不能还说「最干净」。
+
+        全部排名里一眼能看到分数更高的节点,结论必须说清比较范围,
+        并解释高分候选为什么不算 —— 否则就是自己跟自己打架。
+        """
+        src = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("过硬门槛内没有更优节点", src)
+        self.assertIn("个候选分数更高,但没过硬门槛", src)
+        self.assertNotIn("当前线路已是候选里最干净的", src)
 
     def test_fixed_node_is_ok_and_drift_is_warn(self):
         """固定节点后这一项不能假绿;被人改回去要能发现。"""

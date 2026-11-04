@@ -3090,7 +3090,7 @@ checkdetail() {
         optional_result "更优节点" skip "尚未扫描 · 点右上角「扫描可用节点」生成候选排名"
     else
         local ns_epoch ns_best ns_score ns_cur ns_delta ns_gate ns_now ns_pref ns_match
-        local ns_hint
+        local ns_hint ns_cand ns_unique ns_eligible ns_time ns_stats
         ns_epoch=$(sed -n 's/^EPOCH=//p' "$NODE_SCAN_FILE" | head -1)
         ns_best=$(sed -n 's/^BEST=//p' "$NODE_SCAN_FILE" | head -1)
         ns_score=$(sed -n 's/^BEST_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
@@ -3099,6 +3099,20 @@ checkdetail() {
         ns_gate=$(sed -n 's/^GATE=//p' "$NODE_SCAN_FILE" | head -1)
         ns_pref=$(sed -n 's/^PREFERRED=//p' "$NODE_SCAN_FILE" | head -1)
         ns_match=$(sed -n 's/^PREFERRED_MATCH=//p' "$NODE_SCAN_FILE" | head -1)
+        # 结论不能只有一句「当前线路最干净」:那等于让用户相信一个看不到
+        # 依据的判断。把扫了几个、去重后几个出口、几个过硬门槛、当前多少分、
+        # 什么时候扫的,一并写进这一行。旧格式报告缺这些字段时逐项省略,
+        # 绝不补 0 冒充实测值。
+        ns_cand=$(sed -n 's/^CANDIDATES=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_unique=$(sed -n 's/^UNIQUE_IPS=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_eligible=$(sed -n 's/^ELIGIBLE=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_time=$(sed -n 's/^SCAN_TIME=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_stats=""
+        [ -n "$ns_cand" ] && ns_stats="${ns_cand} 候选"
+        [ -n "$ns_unique" ] && ns_stats="${ns_stats}${ns_stats:+/}${ns_unique} 出口"
+        [ -n "$ns_eligible" ] && ns_stats="${ns_stats}${ns_stats:+/}${ns_eligible} 合格"
+        [ -n "$ns_cur" ] && ns_stats="${ns_stats}${ns_stats:+ · }当前 ${ns_cur} 分"
+        [ -n "$ns_time" ] && ns_stats="${ns_stats}${ns_stats:+ · }${ns_time} 扫描"
         ns_now=$(date +%s)
         case "${ns_epoch:-}" in ''|*[!0-9]*) ns_epoch=0 ;; esac
         if [ $((ns_now - ns_epoch)) -gt "$NODE_SCAN_TTL" ]; then
@@ -3113,9 +3127,17 @@ checkdetail() {
             ns_hint="到客户端手动切换"
             [ "$ns_gate" = "auto-ok" ] && ns_hint="点「扫描可用节点」→「应用最优节点」自动切换"
             optional_result "更优节点" warn \
-                "有更干净的节点 ${ns_best}(${ns_score} 分,比当前高 ${ns_delta} 分) · ${ns_hint}"
+                "有更干净的节点 ${ns_best}(${ns_score} 分,比当前高 ${ns_delta} 分) · ${ns_hint}${ns_stats:+ · $ns_stats}"
+        elif [ "$ns_eligible" = "0" ]; then
+            # 一个过硬门槛的候选都没有时说「当前最干净」是假的,和 App 侧
+            # applyNodeScan 的 .skip 对齐:这轮没比成,不是比完了没事。
+            optional_result "更优节点" skip \
+                "没有过硬门槛的候选节点 · 保持当前线路${ns_stats:+ · $ns_stats}"
         else
-            optional_result "更优节点" ok "当前线路已是候选里最干净的"
+            # 和面板同口径:只比过硬门槛内的候选。报告里那些分数更高但被
+            # 硬门槛排除的不算「更干净」,否则这一行会和排名表打架。
+            optional_result "更优节点" ok \
+                "过硬门槛内没有更优节点${ns_stats:+ · $ns_stats}"
         fi
     fi
 }
@@ -3244,9 +3266,11 @@ scan_nodes() {
 
     sort -t$'\t' -k2,2nr -k1,1nr "$tmp/ranked" > "$tmp/sorted"
     line=$(awk -F'\t' '$2==1 {print; exit}' "$tmp/sorted")
+    local top_eligible=0
     if [ -n "$line" ]; then
         IFS=$'\t' read -r best_score eligible best_leaf best_ip best_cc verdict why best_sel <<<"$line"
         delta=$((best_score - cur_score))
+        top_eligible=$best_score
         # BEST 只表示「值得换」的那个节点。差距不够就把整组字段清空,
         # 别留一个 BEST= 空、BEST_IP 却有值的半截报告给界面读。
         if [ "$delta" -lt "$NODE_SCAN_MARGIN" ]; then
@@ -3266,6 +3290,9 @@ scan_nodes() {
     fi
     {
         printf 'EPOCH=%s\n' "$epoch"
+        # 给人看的时间戳。checkdetail 只读报告文件,拿不到扫描当时的本地时钟;
+        # 用 EPOCH 再转一次要顾 BSD/GNU date 差异,不如写报告时直接落一份。
+        printf 'SCAN_TIME=%s\n' "$(date '+%m-%d %H:%M')"
         printf 'GROUP=%s\n' "$group"
         printf 'SELECTOR=%s\n' "$selector"
         printf 'CURRENT=%s\n' "$current"
@@ -3288,7 +3315,8 @@ scan_nodes() {
 
     # node-apply 切完会静默重扫一次刷新报告,那时不该把整段人话混进应用回执。
     if [ "${NODE_SCAN_QUIET:-0}" != "1" ]; then
-        echo "节点扫描(只读) · 组 $group"
+        echo "节点扫描(只读) · 组 $group · 控路 $selector"
+        echo "扫描时间 $(date '+%Y-%m-%d %H:%M:%S')"
         echo "当前 $current · 评分 ${cur_score:-未评级}/100"
         echo "候选 $candidates 个 → 去重 $unique 个出口 · 过硬门槛 $eligible_n 个 · 出口未知 $unknown_n 个"
         echo "门禁:$gate($reason)"
@@ -3302,10 +3330,20 @@ scan_nodes() {
         elif [ "$eligible_n" = 0 ]; then
             echo "没有过硬门槛的候选,不建议换节点"
         else
-            echo "当前线路已是候选里最干净的(差距 < ${NODE_SCAN_MARGIN} 分),不建议换"
+            # 只比「过硬门槛内」的候选。下面名单里那些分数更高但被硬门槛
+            # 排除的,不能算进「更干净」,否则 68 分 vs 49 分看起来像自相矛盾。
+            echo "过硬门槛内没有更优节点 · 合格最高 ${top_eligible} 分 / 当前 ${cur_score:-0} 分 · 差距 < ${NODE_SCAN_MARGIN} 分"
+            local excluded_high
+            excluded_high=$(awk -F'\t' -v cur="${cur_score:-0}" \
+                '$2==0 && ($1+0)>(cur+0) {n++} END {print n+0}' "$tmp/sorted")
+            if [ "$excluded_high" -gt 0 ]; then
+                echo "另有 ${excluded_high} 个候选分数更高,但没过硬门槛(原因见下表),不参与比较"
+            fi
         fi
-        echo "--- 排名(前 3) ---"
-        awk -F'\t' 'NR<=3 {printf "  %-52s %4s 分  %-3s  %s\n", $3, $1, $5, ($2==1 ? "可用" : $7)}' "$tmp/sorted"
+        # 全部候选,不是前 3 名。用户问「有没有具体内容」时,被排除的那些
+        # 恰恰是最需要解释的:为什么 CDN 前置 / 国家不符 / UDP 没标注不能选。
+        echo "--- 全部候选(可用优先,再按分数;含排除原因) ---"
+        awk -F'\t' '{printf "  %-52s %4s 分  %-3s  %-15s  %s\n", $3, $1, $5, ($4=="" ? "出口未知" : $4), ($2==1 ? "可用" : ($7=="" ? "不可用" : $7))}' "$tmp/sorted"
         echo "报告:$NODE_SCAN_FILE"
         # 同一份键值也回给界面:App 就地更新「更优节点」那一行,不必整轮 refresh
         # (refresh 会先撤守护,只读扫描不该付这个代价)。

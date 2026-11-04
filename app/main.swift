@@ -1183,11 +1183,42 @@ final class VM: ObservableObject {
                 || key.hasPrefix("GATE") || key.hasPrefix("CANDIDATES")
                 || key.hasPrefix("UNIQUE_IPS") || key.hasPrefix("UNKNOWN")
                 || key.hasPrefix("ELIGIBLE") || key.hasPrefix("PREFERRED")
+                || key.hasPrefix("SCAN_TIME")
                 || key.hasPrefix("APPLY") || key.hasPrefix("APPLIED") {
                 result[key] = String(parts[1])
             }
         }
         return result
+    }
+
+    /// 结论后面必须挂得上证据,不能只丢一句「没有更优节点」却看不到扫了什么。
+    /// 旧格式报告缺字段时逐项省略 —— 拿 0 冒充实测值比没有数字更糟。
+    /// 格式与 core/claude-switch.sh 的 checkdetail 第 16 项保持一致。
+    static func nodeScanEvidence(_ info: [String: String]) -> String {
+        var parts: [String] = []
+        for (key, suffix) in [("CANDIDATES", " 候选"), ("UNIQUE_IPS", " 出口"), ("ELIGIBLE", " 合格")] {
+            if let v = info[key], !v.isEmpty { parts.append(v + suffix) }
+        }
+        var out = ""
+        if !parts.isEmpty { out += " · " + parts.joined(separator: "/") }
+        if let v = info["CURRENT_SCORE"], !v.isEmpty { out += " · 当前 \(v) 分" }
+        if let v = info["SCAN_TIME"], !v.isEmpty { out += " · \(v) 扫描" }
+        return out
+    }
+
+    /// 脚本 stdout 末尾那段 KEY=VALUE 是给 App 解析的,不是给用户读的。
+    /// 面板里混着十几行英文键,人话报告反而被挤到上面看不见。
+    static func displayableNodeReport(_ output: String) -> String {
+        let human: String
+        if let marker = output.range(of: "--- 报告键值 ---") {
+            human = String(output[..<marker.lowerBound])
+        } else {
+            human = output
+        }
+        return human.split(separator: "\n")
+            .filter { !$0.hasPrefix("APPLY=") && !$0.hasPrefix("APPLIED=") }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// 扫描完就地更新「更优节点」这一行,不做整轮 refresh。
@@ -1212,12 +1243,13 @@ final class VM: ObservableObject {
             rows[idx].state = .warn
             let hint = autoOK ? "点「扫描可用节点」→「应用最优节点」自动切换" : "到客户端手动切换"
             rows[idx].detail = "有更干净的节点 \(best)(\(info["BEST_SCORE"] ?? "?") 分,比当前高 \(delta) 分) · \(hint)"
+                + Self.nodeScanEvidence(info)
         } else if info["ELIGIBLE"] == "0" {
             rows[idx].state = .skip
-            rows[idx].detail = "没有过硬门槛的候选节点 · 保持当前线路"
+            rows[idx].detail = "没有过硬门槛的候选节点 · 保持当前线路" + Self.nodeScanEvidence(info)
         } else {
             rows[idx].state = .ok
-            rows[idx].detail = "当前线路已是候选里最干净的"
+            rows[idx].detail = "过硬门槛内没有更优节点" + Self.nodeScanEvidence(info)
         }
     }
 
@@ -1229,12 +1261,14 @@ final class VM: ObservableObject {
         run(["node-scan"], timeout: 90) { [weak self] result in
             guard let self else { return }
             self.nodeScanBusy = false
-            self.nodeScanReport = result.succeeded ? result.output
-                : "扫描失败：\(result.output.isEmpty ? "脚本没有返回结果" : result.output)"
             if result.succeeded {
+                // 先拿完整 stdout 解析,再把人话部分留给用户看。
                 let info = Self.parseNodeScan(result.output)
                 self.nodeScanInfo = info
                 self.applyNodeScan(info)
+                self.nodeScanReport = Self.displayableNodeReport(result.output)
+            } else {
+                self.nodeScanReport = "扫描失败：\(result.output.isEmpty ? "脚本没有返回结果" : result.output)"
             }
             self.showNodeScan = true
         }
@@ -1248,7 +1282,7 @@ final class VM: ObservableObject {
         stopWatch()
         run(["node-apply"], timeout: 120) { [weak self] result in
             guard let self else { return }
-            self.nodeScanReport = result.output
+            self.nodeScanReport = Self.displayableNodeReport(result.output)
             if result.succeeded {
                 let info = Self.parseNodeScan(result.output)
                 self.nodeScanInfo = info

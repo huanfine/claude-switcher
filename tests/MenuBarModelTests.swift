@@ -733,6 +733,35 @@ struct MenuBarModelTests {
                 try expect(vm.rows.first(where: { $0.name == "更优节点" })?.state == .ok,
                            "没有更优节点不该报 warn")
 
+                // 结论必须挂得上证据。用户反馈:「显示的是当前线路是候选里面
+                // 最干净的,没有具体内容」—— 一句结论看不到扫了几个、多少分、
+                // 什么时候扫的,读起来就像功能根本没跑。
+                let evidence = VM.parseNodeScan(
+                    "BEST=\nBEST_SCORE=49\nDELTA=0\nELIGIBLE=4\nCANDIDATES=11\n" +
+                    "UNIQUE_IPS=3\nCURRENT_SCORE=49\nSCAN_TIME=11-04 09:52\n")
+                vm.applyNodeScan(evidence)
+                let cleanDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
+                try expect(cleanDetail.contains("过硬门槛内没有更优节点"),
+                           "结论要写明比较范围，否则会和排名表里更高分但被排除的节点打架，实际 \(cleanDetail)")
+                for piece in ["11 候选", "3 出口", "4 合格", "当前 49 分", "11-04 09:52 扫描"] {
+                    try expect(cleanDetail.contains(piece),
+                               "结论里缺 \(piece)，实际 \(cleanDetail)")
+                }
+                // 负例:旧格式报告没这些字段,不能拿 0 冒充实测值。
+                vm.applyNodeScan(VM.parseNodeScan("BEST=\nDELTA=0\nELIGIBLE=4\n"))
+                let legacyDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
+                try expect(!legacyDetail.contains("0 候选") && !legacyDetail.contains("扫描"),
+                           "旧报告不该凭空造数字，实际 \(legacyDetail)")
+                try expect(VM.nodeScanEvidence([:]).isEmpty, "空报告不该造出证据")
+
+                // 面板只给人话:脚本 stdout 末尾的 KEY=VALUE 是给 App 解析的。
+                let fullOutput = "节点扫描(只读)\n候选 11 个\n--- 报告键值 ---\nBEST=\nEPOCH=1\n"
+                let shown = VM.displayableNodeReport(fullOutput)
+                try expect(shown.contains("候选 11 个") && !shown.contains("EPOCH="),
+                           "面板不该把机器键值混给人看，实际 \(shown)")
+                try expect(!VM.displayableNodeReport("OK:已应用\nAPPLY=OK\nAPPLIED=鱼3\n")
+                            .contains("APPLY="), "应用回执里的机器行也要收掉")
+
                 // 一个过硬门槛的候选都没有:跳过,而不是假绿。
                 vm.applyNodeScan(VM.parseNodeScan("BEST=\nELIGIBLE=0\n"))
                 try expect(vm.rows.first(where: { $0.name == "更优节点" })?.state == .skip,
