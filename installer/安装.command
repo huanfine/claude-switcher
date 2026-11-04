@@ -313,7 +313,7 @@ sed "s|__HOME__|$H|g" "$REPO/daemons/local.claude-update.plist" > "$H/.local/bin
 echo "✓ 核心文件已安装"
 
 # ---- 4. 现场编译 App 到桌面 ----
-APP="$H/Desktop/Claude切换器.app"
+APP="$H/Desktop/Claude 环境检查器.app"
 mkdir -p "$H/Desktop"
 pkill -x ClaudeSwitcher 2>/dev/null
 rm -rf "$APP"
@@ -347,8 +347,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 <dict>
 	<key>CFBundleExecutable</key><string>ClaudeSwitcher</string>
 	<key>CFBundleIdentifier</key><string>local.claude-switcher</string>
-	<key>CFBundleName</key><string>Claude切换器</string>
-	<key>CFBundleDisplayName</key><string>Claude切换器</string>
+	<key>CFBundleName</key><string>Claude 环境检查器</string>
+	<key>CFBundleDisplayName</key><string>Claude 环境检查器</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>1.0</string>
 	<key>CFBundleVersion</key><string>1</string>
@@ -432,7 +432,7 @@ echo "=================================="
 echo ""
 echo "=================================="
 echo "  ✅ 安装完成!"
-echo "  使用: 双击桌面「Claude切换器」"
+echo "  使用: 双击桌面「Claude 环境检查器」"
 echo "  首次使用: 打开后选账号A(自动收编当前登录)"
 echo "  换了其他国家节点后: 运行 claude-switch.sh set-region 一键重新适配"
 echo "  自动更新已启用(每12小时检查一次),也可手动: claude-switch.sh update"

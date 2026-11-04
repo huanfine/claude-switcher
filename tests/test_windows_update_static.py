@@ -293,5 +293,57 @@ class WindowsUpdateStaticTests(unittest.TestCase):
                 self.assertIsNone(error, f"{path.name}: {error}")
 
 
+class InstallerBrandingStaticTests(unittest.TestCase):
+    """产物名统一为「Claude 环境检查器」,别让安装器装出一个旧名字的 App。
+
+    应用真名改过之后,release.yml / 安装器 / 卸载器 / Windows 快捷方式里还留着
+    「Claude切换器」。CI 的 Info.plist 校验甚至会因此指向一个根本不存在的文件。
+    这类残留不会让本机测试变红,只有用户装完才发现桌面上是两个名字。
+    """
+
+    BRANDED = (
+        ROOT / ".github/workflows/release.yml",
+        ROOT / "installer/安装.command",
+        ROOT / "installer/卸载.command",
+        ROOT / "windows/install.ps1",
+    )
+
+    def test_no_legacy_product_name_in_shipped_artifacts(self):
+        for path in self.BRANDED:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                self.assertNotIn("Claude切换器", read(path))
+
+    def test_release_checks_the_app_the_packager_really_builds(self):
+        """release.yml 的 PLIST 路径必须和 package-macos.sh 的 APP_NAME 对齐。"""
+        packaging = read(ROOT / "scripts/package-macos.sh")
+        match = re.search(r'^APP_NAME="([^"]+)"', packaging, re.M)
+        self.assertIsNotNone(match, "打包脚本里找不到 APP_NAME")
+        expected = 'build/%s.app/Contents/Info.plist' % match.group(1)
+        self.assertIn(expected, read(RELEASE))
+
+    def test_installer_and_uninstaller_use_the_same_app_name(self):
+        installer = read(ROOT / "installer/安装.command")
+        uninstaller = read(ROOT / "installer/卸载.command")
+        self.assertIn('Desktop/Claude 环境检查器.app', installer)
+        self.assertIn('Desktop/Claude 环境检查器.app', uninstaller)
+        self.assertIn('<string>Claude 环境检查器</string>', installer)
+
+    def test_windows_shortcut_uses_the_same_name(self):
+        self.assertIn(r'Desktop\Claude 环境检查器.lnk', read(INSTALL))
+
+    def test_sha256sums_match_the_files_on_disk(self):
+        """改了 core / 安装器 / 卸载器却忘了同步校验和,CI 第一步就会拒收。"""
+        import hashlib
+        lines = read(ROOT / "SHA256SUMS").splitlines()
+        self.assertTrue(lines)
+        for line in lines:
+            digest, _, name = line.partition("  ")
+            with self.subTest(path=name):
+                self.assertEqual(
+                    hashlib.sha256((ROOT / name.strip()).read_bytes()).hexdigest(),
+                    digest.strip(),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

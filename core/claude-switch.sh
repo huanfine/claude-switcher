@@ -2008,7 +2008,35 @@ _ipfield() {
     printf '%s' "${1:-}" | grep -o "\"$2\":[^,}]*" | head -1 | cut -d: -f2- | tr -d '" '
 }
 
-# 输出一行: <score>|<verdict>|<flags>|<detail>
+# 「分数」和「判定」是两把尺子,别把它们揉成一句「风险过高」:
+#   score   —— IP 信誉(宽口径),对齐 net.coffee 的 Trust Score,连 Tor 都能拿 50 分;
+#   verdict —— 能不能拿这个出口开 Claude 的硬门槛,比分数严得多。
+# 代理/VPN 基线 75 分,扣完风险分完全可能是 68 分,但代理特征本身就直接判 fail。
+# 旧版 node-scan 把所有 fail 一律写成「风险过高」,还统一扣上「Tor/代理特征」
+# 的帽子,于是「68 分」旁边挂着「风险过高」,用户只会以为算错了;
+# 非 Tor/代理的 fail 也被一并错标。
+# check / checkdetail / node-scan 统一从这里取原因,口径只留一份。
+# $1=类型 $2=分数 $3=判定;只有判定为 fail 才输出。
+purity_fail_reason() {
+    local ptype="${1:-}" pscore="${2:-}" pver="${3:-}" gate=""
+    [ "$pver" = fail ] || return 0
+    case "$ptype" in
+        tor)     gate="Tor 出口" ;;
+        vpn)     gate="代理/VPN 特征" ;;
+        hosting) gate="机房转租段" ;;
+        *)       gate="信誉分偏低" ;;
+    esac
+    case "$pscore" in
+        ''|*[!0-9]*) printf '%s' "$gate" ;;
+        *)  if [ "$pscore" -ge 50 ]; then
+                printf '%s(信誉 %s 分,分数与判定分开)' "$gate" "$pscore"
+            else
+                printf '%s(信誉 %s 分)' "$gate" "$pscore"
+            fi ;;
+    esac
+}
+
+# 输出一行: <score>|<verdict>|<flags>|<detail>|<cc>
 # verdict 取 ok|warn|fail|unknown;unknown = 没拿到数据,由调用方决定怎么报。
 ip_purity() {
     local ip="${1:-}" now cip cep cver cscore ctype cdet
@@ -2555,7 +2583,9 @@ check() {
     if ! check_disabled "IP纯净度"; then
         IFS='|' read -r pscore pver ptype pdet pcc <<<"$(ip_purity "$ip")"
         case "${pver:-unknown}" in
-            fail) optional_failure "出口纯净度低(${pdet:-评分 $pscore/100})" ;;
+            # 不能写成「纯净度低」:68 分的代理/VPN 出口是被硬门槛拦下的,
+            # 分数并不低。把命中的门槛和分数口径一起写进门禁结论。
+            fail) optional_failure "出口未过使用门槛 · $(purity_fail_reason "$ptype" "$pscore" "$pver")${pdet:+ · $pdet}" ;;
         esac
     fi
 
@@ -3045,6 +3075,10 @@ checkdetail() {
             # 取不到就明说没评级。这里绝不能借 ok 混过去 —— 用户看到绿勾会
             # 以为「出口干净已经验过了」,而实际上什么都没验。
             unknown) optional_result "IP纯净度" warn "${pdet:-未取到信誉数据}" ;;
+            # fail 时明说命中的是哪条硬门槛。分数高却红叉时(例如 68 分的
+            # 代理/VPN 出口),这一句就是用户要的解释,不能只丢一个数字。
+            fail)    optional_result "IP纯净度" "$pver" \
+                        "${pdet:-评分 ${pscore:-?}/100} · 硬门槛:$(purity_fail_reason "$ptype" "$pscore" "$pver")" ;;
             *)       optional_result "IP纯净度" "$pver" "$pdet" ;;
         esac
     fi
@@ -3237,7 +3271,10 @@ scan_nodes() {
         esac
         if [ "$eligible" = 1 ]; then
             case "$verdict" in
-                fail) why="风险过高(Tor/代理特征)"; eligible=0 ;;
+                # 不再把所有 fail 一律叫「风险过高」:分数是信誉分,判定是硬门槛。
+                # 68 分的代理/VPN 节点要写清「硬门槛:代理/VPN 特征(信誉 68 分,
+                # 分数与判定分开)」,既解释高分为何被排除,也不给非代理的 fail 扣错帽子。
+                fail) why="硬门槛:$(purity_fail_reason "$ptype" "${score:-}" "$verdict")"; eligible=0 ;;
             esac
         fi
         if [ "$eligible" = 1 ]; then
@@ -3340,6 +3377,9 @@ scan_nodes() {
                 echo "另有 ${excluded_high} 个候选分数更高,但没过硬门槛(原因见下表),不参与比较"
             fi
         fi
+        # 分数是宽口径 IP 信誉,不是「能不能开 Claude」。68 分的代理特征节点
+        # 照样被硬门槛排除。把口径放在表格前,用户不用盯着高分和「不可用」猜。
+        echo "口径:分数 = IP 信誉(0-100,宽口径) · 是否可推荐另看硬门槛(Tor/代理/VPN、机房转租段<30 分、信誉<50 分);分数不低仍可能被排除"
         # 全部候选,不是前 3 名。用户问「有没有具体内容」时,被排除的那些
         # 恰恰是最需要解释的:为什么 CDN 前置 / 国家不符 / UDP 没标注不能选。
         echo "--- 全部候选(可用优先,再按分数;含排除原因) ---"

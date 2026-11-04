@@ -2,7 +2,7 @@
 
 零安装的浏览器侧环境自检页：手机 / 平板浏览器打开即测。纯静态、无构建、无第三方 JS/CSS 依赖，可直接由 GitHub Pages 托管。
 
-线上地址：<https://huanfine.github.io/claude-switcher/>（由本仓库 `docs/` 目录经 GitHub Pages 发布；首次使用需先在仓库 Settings → Pages 启用，见下）
+线上地址：<https://huanfine.github.io/claude-switcher/>（已启用：由本仓库 `main` 分支的 `docs/` 目录经 GitHub Pages 发布，HTTPS 强制开启；若站点回 404，按下方步骤检查 Pages 配置）
 
 ## 检测项
 
@@ -30,13 +30,13 @@ python3 -m http.server 8000 --directory docs
 
 ## 部署到 GitHub Pages
 
-推荐直接从 `docs/` 目录发布，不需要 Actions：
+当前配置为 **Deploy from a branch → `main` + `/docs`**（`build_type: legacy`，不需要 Actions）。站点若回 404，按下面重设一次：
 
-1. 将仓库推送到 GitHub。
+1. 将 `docs/` 推送到 GitHub 的 `main`。
 2. 仓库 **Settings → Pages → Build and deployment**。
 3. Source 选择 **Deploy from a branch**。
 4. Branch 选择 `main`，Folder 选择 **`/docs`**，保存。
-5. 等待 Pages 构建完成，访问 <https://huanfine.github.io/claude-switcher/>。
+5. 等待 Pages 构建完成后访问 <https://huanfine.github.io/claude-switcher/>；也可用 `gh api repos/huanfine/claude-switcher/pages --jq .status` 查构建状态（`built` 即就绪）。
 
 如果使用自定义 Actions 发布，也只需要把 `docs/` 作为站点根目录发布，无需构建步骤。
 

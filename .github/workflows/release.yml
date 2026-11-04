@@ -44,7 +44,7 @@ jobs:
       - name: Verify Info.plist version
         run: |
           set -euo pipefail
-          PLIST="build/Claude切换器.app/Contents/Info.plist"
+          PLIST="build/Claude 环境检查器.app/Contents/Info.plist"
           test "$(plutil -extract CFBundleShortVersionString raw "$PLIST")" = "$VERSION"
           test "$(plutil -extract CFBundleVersion raw "$PLIST")" = "$VERSION"
 

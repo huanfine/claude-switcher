@@ -375,6 +375,62 @@ esac''')
         self.assertTrue(value.startswith("skip:"), value)
 
 
+class PurityFailReasonTests(unittest.TestCase):
+    """68 分被排除时,报告必须写清「命中的是哪条硬门槛」,不是「风险过高」。
+
+    score 是宽口径 IP 信誉,verdict 是能不能拿它开 Claude 的硬判定。
+    代理/VPN 基线 75 分,扣完风险分仍可能 68 分,但代理特征直接判 fail。
+    旧版把所有 fail 写成「风险过高(Tor/代理特征)」,高分与结论并排自相矛盾,
+    连 Tor、机房转租段、低信誉分这些非代理的 fail 也被错标成代理特征。
+    """
+
+    @staticmethod
+    def helper(*args):
+        """把纯函数从脚本里抠出来单独跑,不触发脚本的其它动作。"""
+        src = SOURCE.read_text(encoding="utf-8")
+        start = src.index("purity_fail_reason() {")
+        end = src.index("\n}\n", start) + len("\n}\n")
+        script = src[start:end] + '\npurity_fail_reason "$@"\n'
+        run = subprocess.run(["/bin/bash", "-c", script, "bash", *args],
+                             text=True, capture_output=True, timeout=10)
+        return run.stdout.strip()
+
+    def test_high_score_proxy_fail_names_the_real_gate(self):
+        out = self.helper("vpn", "68", "fail")
+        self.assertIn("代理/VPN 特征", out)
+        self.assertIn("信誉 68 分", out)
+        self.assertIn("分数与判定分开", out)
+        self.assertNotIn("风险过高", out)
+
+    def test_other_fail_types_are_not_mislabelled_as_proxy(self):
+        tor = self.helper("tor", "47", "fail")
+        self.assertIn("Tor 出口", tor)
+        self.assertNotIn("代理/VPN 特征", tor)
+        hosting = self.helper("hosting", "26", "fail")
+        self.assertIn("机房转租段", hosting)
+        self.assertNotIn("代理/VPN 特征", hosting)
+        low = self.helper("unknown", "42", "fail")
+        self.assertIn("信誉分偏低", low)
+        self.assertNotIn("代理/VPN 特征", low)
+
+    def test_non_fail_and_bad_score_are_safe(self):
+        """只给 fail 加解释;分数不是数字时不能让 bash 算术报错。"""
+        self.assertEqual("", self.helper("vpn", "68", "warn"))
+        self.assertEqual("", self.helper("residential", "100", "ok"))
+        self.assertEqual("代理/VPN 特征", self.helper("vpn", "", "fail"))
+        self.assertEqual("代理/VPN 特征", self.helper("vpn", "n/a", "fail"))
+        self.assertIn("信誉 49 分", self.helper("vpn", "49", "fail"))
+
+    def test_scan_report_uses_one_shared_reason_and_explains_the_scales(self):
+        src = SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn("风险过高(Tor/代理特征)", src,
+                         "旧文案把 68 分也写成风险过高,且给非代理 fail 扣错帽子")
+        self.assertNotIn("出口纯净度低", src)
+        self.assertIn('fail) why="硬门槛:$(purity_fail_reason', src)
+        self.assertIn("口径:分数 = IP 信誉", src)
+        self.assertIn("分数不低仍可能被排除", src)
+
+
 def _optional_keys(source):
     """从脚本里抠出 OPTIONAL 元组,免得测试和源码各存一份清单慢慢走偏。"""
     text = source.read_text(encoding="utf-8")

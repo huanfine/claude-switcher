@@ -250,7 +250,7 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 **除非维护者在当次对话中明确要求，否则不得更新/部署维护者本机的已安装版本。** 具体包括：
 
 - 不得覆盖 `~/.local/bin/claude-switch.sh`、`~/.local/bin/local.claude-*.plist`
-- 不得重新编译或替换桌面 App（安装器产物 `~/Desktop/Claude切换器.app`，打包脚本产物名为「Claude 环境检查器.app」；两者的窗口标题都是「Claude 环境检查器」）
+- 不得重新编译或替换桌面 App（安装器、`scripts/package-macos.sh` 与 Windows 快捷方式统一为 `~/Desktop/Claude 环境检查器.app` / 「Claude 环境检查器」；窗口标题同名）
 - 不得改动 `/Library/Application Support/claude-switcher/`、`/Library/LaunchDaemons/local.claude-*`、`~/Library/LaunchAgents/local.claude-*`
 - 不得触发本机 `update`、不得执行安装器/卸载器
 

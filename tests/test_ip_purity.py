@@ -409,7 +409,7 @@ esac''')
         self.stub_net("", "", IPINFO_RESID)
         run = subprocess.run(["/bin/bash", str(SOURCE), "check"], text=True,
                              capture_output=True, env=self.env, timeout=180)
-        self.assertNotIn("出口纯净度低", run.stdout, run.stdout + run.stderr)
+        self.assertNotIn("出口未过使用门槛", run.stdout, run.stdout + run.stderr)
 
     def test_risk_sources_down_falls_back_to_ptr(self):
         """连 ipinfo 也挂了时,PTR 是最后一根线索 —— 而且它常常直接写着出口类型。
@@ -502,7 +502,45 @@ esac''')
         run = subprocess.run(["/bin/bash", str(SOURCE), "check"], text=True,
                              capture_output=True, env=self.env, timeout=180)
         self.assertNotEqual(run.returncode, 0)
-        self.assertIn("出口纯净度低", run.stdout)
+        self.assertIn("出口未过使用门槛", run.stdout)
+
+    def test_high_score_fail_explains_the_hard_gate(self):
+        """68 分却红叉不是算错:分数是信誉分,判定是能否开 Claude 的硬门槛。
+
+        用户原话:「我们这个纯净度为什么我看你68分会提示风险过高」。
+        代理/VPN 基线 75 分,扣完风险分仍有 60~70 分,但代理特征直接判 fail。
+        以前一律写「风险过高(Tor/代理特征)」,分数与结论并排看着自相矛盾;
+        现在必须写清命中的门槛,并说明分数与判定是两把尺子。
+        """
+        self.stub_net(PROXY, _ipapi("Denver", proxy=True, hosting=True), IPINFO_PROXY)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "fail", detail)
+        self.assertGreaterEqual(self.score(detail), 50, detail)
+        self.assertIn("硬门槛:代理/VPN 特征", detail)
+        self.assertIn("分数与判定分开", detail)
+        self.assertNotIn("风险过高", detail)
+        self.assertNotIn("纯净度低", detail)
+
+    def test_tor_and_low_score_fail_name_their_own_gate(self):
+        """非代理的 fail 不能被错标成「Tor/代理特征」。"""
+        self.stub_net(TOR, _ipapi("Denver"), _ipinfo("AS0 Tor Exit"))
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "fail", detail)
+        self.assertIn("硬门槛:Tor 出口", detail)
+        self.assertNotIn("代理/VPN 特征(信誉", detail)
+
+    def test_warn_and_ok_never_gain_a_hard_gate_note(self):
+        """只给 fail 加解释;warn / ok 不能凭空多出「硬门槛」。"""
+        self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "ok", detail)
+        self.assertNotIn("硬门槛:", detail)
+        # 两次跑的是同一个夹具 IP,不删缓存第二次会直接读到住宅那条结果。
+        (self.home / ".claude-switcher/purity-cache.v3").unlink(missing_ok=True)
+        self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertNotIn("硬门槛:", detail)
 
 
 if __name__ == "__main__":

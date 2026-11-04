@@ -290,7 +290,7 @@ Write-Host "[OK] 核心文件已安装到 $BASE (代理模式: $PROXY_MODE)" -Fo
 
 # ---- 5. 桌面快捷方式 ----
 $ws = New-Object -ComObject WScript.Shell
-$sc = $ws.CreateShortcut("$env:USERPROFILE\Desktop\Claude切换器.lnk")
+$sc = $ws.CreateShortcut("$env:USERPROFILE\Desktop\Claude 环境检查器.lnk")
 $sc.TargetPath = "powershell.exe"
 $sc.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BASE\SwitcherUI.ps1`""
 $sc.WorkingDirectory = $BASE
@@ -335,7 +335,7 @@ if ($PROXY_MODE -eq 'clash-verge') {
 
 Write-Host ""
 Write-Host "==================================" -ForegroundColor Green
-Write-Host "  安装完成! 双击桌面「Claude切换器」使用" -ForegroundColor Green
+Write-Host "  安装完成! 双击桌面「Claude 环境检查器」使用" -ForegroundColor Green
 Write-Host "  首次使用: 打开后选账号A(自动收编当前登录)" -ForegroundColor Green
 Write-Host "==================================" -ForegroundColor Green
 pause
