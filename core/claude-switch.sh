@@ -2036,6 +2036,21 @@ purity_fail_reason() {
     esac
 }
 
+# 分数落在哪个区间。用户看排名表时最常问的一句是「多少算好」——
+# 只给一个 49 / 68,没有参照系,没法判断。区间只回答「分数本身好看不好看」,
+# 不回答「能不能用」:后者看硬门槛,两套尺子会背离(见 purity_fail_reason)。
+# 阈值与 verdict 的分数线对齐:75 是 ok 线、50 是 warn 线、30 是机房转租段的拦线。
+purity_band() {
+    case "${1:-}" in
+        ''|*[!0-9]*) printf '未评级' ;;
+        *)  if   [ "$1" -ge 90 ]; then printf '优秀'
+            elif [ "$1" -ge 75 ]; then printf '良好'
+            elif [ "$1" -ge 50 ]; then printf '一般'
+            elif [ "$1" -ge 30 ]; then printf '偏差'
+            else printf '差'; fi ;;
+    esac
+}
+
 # 输出一行: <score>|<verdict>|<flags>|<detail>|<cc>
 # verdict 取 ok|warn|fail|unknown;unknown = 没拿到数据,由调用方决定怎么报。
 ip_purity() {
@@ -3207,11 +3222,11 @@ node_gate() {
     st=$(status)
     case "$st" in
         *hasA=1*|*hasB=1*|*hasC=1*|*hasD=1*)
-            active=1; reasons="${reasons:+$reasons、}已有账号槽位" ;;
+            active=1; reasons="${reasons:+${reasons}、}已有账号槽位" ;;
     esac
     pid=$(awk -F'\t' '{print $1; exit}' "$BASE/watch.pid" 2>/dev/null)
     if [ -n "$pid" ] && watch_pid_is_watchdog "$pid"; then
-        active=1; reasons="${reasons:+$reasons、}看门狗驻守中"
+        active=1; reasons="${reasons:+${reasons}、}看门狗驻守中"
     fi
     if [ "$active" = 1 ]; then
         printf 'report-only|%s\n' "$reasons"
@@ -3224,7 +3239,7 @@ node_gate() {
 scan_nodes() {
     local raw tmp group="" selector="" current="" gate reason="" ip n=0
     local score verdict ptype detail cc leaf egress udp eligible why
-    local best="" best_score=0 best_ip="" best_cc="" best_sel="" best_leaf=""
+    local best="" best_score=0 best_ip="" best_cc="" best_sel="" best_leaf="" best_band=""
     local cur_score=0 cur_ip="" delta=0 candidates=0 unique=0 eligible_n=0 unknown_n=0
     local epoch line
     [ -n "$PROXY_GROUP" ] || { echo "FAIL:未配置代理组,无法扫描节点" >&2; return 1; }
@@ -3281,16 +3296,18 @@ scan_nodes() {
             if [ -z "$cc" ]; then
                 why="国家待验证"; eligible=0
             elif [ -n "$COUNTRY_TARGET" ] && [ "$cc" != "$COUNTRY_TARGET" ]; then
-                why="国家不符($cc≠$COUNTRY_TARGET)"; eligible=0
+                why="国家不符(${cc}≠${COUNTRY_TARGET})"; eligible=0
             fi
         fi
         if [ "$eligible" = 1 ] && [ "$udp" = "0" ]; then
             why="UDP 未标注"; eligible=0
         fi
         [ "$eligible" = 1 ] && eligible_n=$((eligible_n + 1))
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        # 第 9 列是分数区间,给排名表一个参照系。放在最后,前面各列的
+        # 序号和 sort 键都不受影响。
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "${score:-0}" "$eligible" "$leaf" "$ip" "$cc" "$verdict" "$why" "$sel" \
-            >> "$tmp/ranked"
+            "$(purity_band "${score:-}")" >> "$tmp/ranked"
         if [ "$leaf" = "$current" ]; then
             cur_ip="$ip"; cur_score="${score:-0}"
         fi
@@ -3305,7 +3322,9 @@ scan_nodes() {
     line=$(awk -F'\t' '$2==1 {print; exit}' "$tmp/sorted")
     local top_eligible=0
     if [ -n "$line" ]; then
-        IFS=$'\t' read -r best_score eligible best_leaf best_ip best_cc verdict why best_sel <<<"$line"
+        # 第 9 列(区间)必须有变量接住:read 的最后一个变量会吞掉剩余整段,
+        # 少写一个就会把「优秀」拼进 BEST_SELECTOR,切节点时找不到那个名字。
+        IFS=$'\t' read -r best_score eligible best_leaf best_ip best_cc verdict why best_sel best_band <<<"$line"
         delta=$((best_score - cur_score))
         top_eligible=$best_score
         # BEST 只表示「值得换」的那个节点。差距不够就把整组字段清空,
@@ -3316,6 +3335,12 @@ scan_nodes() {
     fi
 
     IFS='|' read -r gate reason <<<"$(node_gate)"
+    # 门禁输出为空说明 node_gate 自己崩了(例如变量展开写错被 set -u 打断)。
+    # 空门禁比报错更危险:界面读不到 GATE 只会静默不应用,没人知道判定其实没跑成。
+    case "$gate" in
+        report-only|auto-ok) ;;
+        *) gate="unknown"; reason="${reason:-门禁判定失败}" ;;
+    esac
     epoch=$(date +%s)
     # 「固定最优节点」落在同一份报告里,不新增检查项:当前节点是不是还等于
     # preferred-node,偏离就报警。校验只靠报告里的 CURRENT,不给 45 秒的
@@ -3354,9 +3379,15 @@ scan_nodes() {
     if [ "${NODE_SCAN_QUIET:-0}" != "1" ]; then
         echo "节点扫描(只读) · 组 $group · 控路 $selector"
         echo "扫描时间 $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "当前 $current · 评分 ${cur_score:-未评级}/100"
+        # 当前分也带上区间:这是用户第一眼看的那行,只给数字仍然没有参照系。
+        local cur_note=""
+        case "${cur_score:-}" in
+            ''|0|*[!0-9]*) ;;
+            *) cur_note="($(purity_band "$cur_score"))" ;;
+        esac
+        echo "当前 $current · 评分 ${cur_score:-未评级}/100${cur_note}"
         echo "候选 $candidates 个 → 去重 $unique 个出口 · 过硬门槛 $eligible_n 个 · 出口未知 $unknown_n 个"
-        echo "门禁:$gate($reason)"
+        echo "门禁:${gate}${reason:+($reason)}"
         if [ "$pref_match" = "1" ]; then
             echo "已固定节点:$pref(当前正在使用)"
         elif [ "$pref_match" = "0" ]; then
@@ -3378,12 +3409,14 @@ scan_nodes() {
             fi
         fi
         # 分数是宽口径 IP 信誉,不是「能不能开 Claude」。68 分的代理特征节点
-        # 照样被硬门槛排除。把口径放在表格前,用户不用盯着高分和「不可用」猜。
-        echo "口径:分数 = IP 信誉(0-100,宽口径) · 是否可推荐另看硬门槛(Tor/代理/VPN、机房转租段<30 分、信誉<50 分);分数不低仍可能被排除"
+        # 照样被硬门槛排除,49 分的机房反而可用 —— 用户看到的就是这个背离,
+        # 所以区间和「先看哪一列」必须写在同一屏里。
+        echo "口径:分数 = IP 信誉(90-100 优秀 · 75-89 良好 · 50-74 一般 · 30-49 偏差 · 0-29 差),不决定能不能用"
+        echo "读法:先看「可用/不可用」——由硬门槛决定(Tor/代理/VPN、机房转租段<30 分、信誉<50 分、国家不符、UDP 未标注);没命中硬门槛的,分数低也仍然可用"
         # 全部候选,不是前 3 名。用户问「有没有具体内容」时,被排除的那些
         # 恰恰是最需要解释的:为什么 CDN 前置 / 国家不符 / UDP 没标注不能选。
-        echo "--- 全部候选(可用优先,再按分数;含排除原因) ---"
-        awk -F'\t' '{printf "  %-52s %4s 分  %-3s  %-15s  %s\n", $3, $1, $5, ($4=="" ? "出口未知" : $4), ($2==1 ? "可用" : ($7=="" ? "不可用" : $7))}' "$tmp/sorted"
+        echo "--- 全部候选(可用优先,再按分数;含区间与排除原因) ---"
+        awk -F'\t' '{printf "  %-52s %4s 分 %-6s %-3s  %-15s  %s\n", $3, $1, $9, $5, ($4=="" ? "出口未知" : $4), ($2==1 ? "可用" : ($7=="" ? "不可用" : $7))}' "$tmp/sorted"
         echo "报告:$NODE_SCAN_FILE"
         # 同一份键值也回给界面:App 就地更新「更优节点」那一行,不必整轮 refresh
         # (refresh 会先撤守护,只读扫描不该付这个代价)。
@@ -3415,7 +3448,7 @@ node_apply_gate() {
     st=$(status)
     case "$st" in
         *hasA=1*|*hasB=1*|*hasC=1*|*hasD=1*)
-            reasons="${reasons:+$reasons、}已有账号槽位" ;;
+            reasons="${reasons:+${reasons}、}已有账号槽位" ;;
     esac
     [ -n "$reasons" ] && { printf 'denied|%s\n' "$reasons"; return 0; }
     # stopWatch() 发完 SIGTERM 后 bash 可能还卡在 sleep 里,App 0.5s 后补 SIGKILL。

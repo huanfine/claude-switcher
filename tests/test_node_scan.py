@@ -276,7 +276,7 @@ esac''')
     def test_human_report_lists_all_candidates_and_scan_time(self):
         """面板里给人看的那段要列全部候选(含排除原因),不能只给前三名。"""
         src = SOURCE.read_text(encoding="utf-8")
-        self.assertIn("--- 全部候选(可用优先,再按分数;含排除原因) ---", src)
+        self.assertIn("--- 全部候选(可用优先,再按分数;含区间与排除原因) ---", src)
         self.assertIn("SCAN_TIME=", src)
         self.assertNotIn("--- 排名(前 3) ---", src,
                          "只列前三名时,被排除的节点为什么不能选就看不见了")
@@ -385,15 +385,18 @@ class PurityFailReasonTests(unittest.TestCase):
     """
 
     @staticmethod
-    def helper(*args):
+    def call(fn, *args):
         """把纯函数从脚本里抠出来单独跑,不触发脚本的其它动作。"""
         src = SOURCE.read_text(encoding="utf-8")
-        start = src.index("purity_fail_reason() {")
+        start = src.index(fn + "() {")
         end = src.index("\n}\n", start) + len("\n}\n")
-        script = src[start:end] + '\npurity_fail_reason "$@"\n'
+        script = src[start:end] + '\n%s "$@"\n' % fn
         run = subprocess.run(["/bin/bash", "-c", script, "bash", *args],
                              text=True, capture_output=True, timeout=10)
         return run.stdout.strip()
+
+    def helper(self, *args):
+        return self.call("purity_fail_reason", *args)
 
     def test_high_score_proxy_fail_names_the_real_gate(self):
         out = self.helper("vpn", "68", "fail")
@@ -428,7 +431,36 @@ class PurityFailReasonTests(unittest.TestCase):
         self.assertNotIn("出口纯净度低", src)
         self.assertIn('fail) why="硬门槛:$(purity_fail_reason', src)
         self.assertIn("口径:分数 = IP 信誉", src)
-        self.assertIn("分数不低仍可能被排除", src)
+        self.assertIn("90-100 优秀", src)
+        self.assertIn("读法:先看「可用/不可用」", src)
+
+    def test_score_bands_answer_how_good_is_good(self):
+        """用户原话:「这几个看不懂,多少是好,多少是不好」。
+
+        区间必须能和 verdict 的分数线对上:75 是 ok 线、50 是 warn 线、
+        30 是机房转租段的拦线。只给分数不给参照系,49 和 68 就没法判断。
+        """
+        for score, band in (("100", "优秀"), ("90", "优秀"), ("89", "良好"),
+                            ("75", "良好"), ("74", "一般"), ("50", "一般"),
+                            ("49", "偏差"), ("30", "偏差"), ("29", "差"),
+                            ("0", "差")):
+            self.assertEqual(self.call("purity_band", score), band, score)
+        for bad in ("", "n/a", "未评级"):
+            self.assertEqual(self.call("purity_band", bad), "未评级", bad)
+
+    def test_no_bare_variable_glued_to_a_multibyte_char(self):
+        """bash 3.2 会把 `$var` 后面紧跟的顿号/≠ 并进变量名,set -u 下直接 unbound。
+
+        实测:node-scan 报 `line 3214: reasons<乱码>: unbound variable`,
+        连带 node_gate 整段输出为空,报告里出现 `门禁:()` 并静默不肯应用。
+        中文标点紧跟在变量后面时,一律写成 ${var}。
+        """
+        pattern = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]")
+        for path in (SOURCE, ROOT / "installer/安装.command", ROOT / "installer/卸载.command"):
+            hits = ["L%d %s" % (i, m.group(0))
+                    for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+                    for m in [pattern.search(line)] if m]
+            self.assertEqual(hits, [], "%s 里变量名粘上了中文标点: %s" % (path.name, hits))
 
 
 def _optional_keys(source):
