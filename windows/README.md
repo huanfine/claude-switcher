@@ -1,4 +1,4 @@
-# Claude 切换器 · Windows 版 (Beta)
+# Claude 环境检查器 · Windows 版 (Beta)
 
 > ⚠️ **本版本为 Beta,未经大规模真机测试**。核心逻辑移植自 macOS 稳定版,但 Windows 环境差异大,遇到问题请到 [Issues](https://github.com/huanfine/claude-switcher/issues) 反馈。
 
@@ -25,7 +25,7 @@
    ```powershell
    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
    ```
-4. 按提示确认/选择代理客户端，走完流程后桌面会出现「Claude切换器」快捷方式
+4. 按提示确认/选择代理客户端，走完流程后桌面会出现应用快捷方式
 
 ## 更新
 

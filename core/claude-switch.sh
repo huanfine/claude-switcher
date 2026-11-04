@@ -3884,9 +3884,8 @@ self_update() {
         echo "# $(date '+%F %T') update --auto 开始"
     fi
 
-    # 更新源。本仓库是 YOURSJEYO/claude-switcher 的 fork(MIT 许可),默认指向本 fork,
-    # 否则自动更新会把上游版本盖回来、本地改动全部丢失。
-    # 可用 CLAUDE_SWITCHER_UPDATE_REPO=owner/name 临时改指其他仓库(例如临时对比上游)。
+    # 更新源默认指向本仓库,否则自动更新会把其它仓库的版本盖回来、本地改动全部丢失。
+    # 可用 CLAUDE_SWITCHER_UPDATE_REPO=owner/name 临时改指其他仓库。
     UPD_REPO="${CLAUDE_SWITCHER_UPDATE_REPO:-huanfine/claude-switcher}"
     UPD_ZIP="https://codeload.github.com/$UPD_REPO/zip/refs/heads/main"
     UPD_SUMS="https://raw.githubusercontent.com/$UPD_REPO/main/SHA256SUMS"
@@ -4011,7 +4010,7 @@ fingerprint() {
         *)
             [ "$virt" = "1" ] && echo "虚拟机=warn:运行在虚拟机中" || echo "虚拟机=ok:物理机" ;;
     esac
-    echo "CanvasWebGL=info:原生检查读不到 Claude Electron 的渲染特征,请打开 Web 检测页 https://yoursjeyo.github.io/claude-switcher/ 查看 Canvas/WebGL 指纹"
+    echo "CanvasWebGL=info:原生检查读不到 Claude Electron 的渲染特征,请打开 Web 检测页 https://huanfine.github.io/claude-switcher/ 查看 Canvas/WebGL 指纹"
 }
 
 # 账号快照加密导出/导入(macOS):AES-256 加密 DMG,密码只经 stdin 传递
@@ -4676,12 +4675,12 @@ help() {
                        演练:关掉 TUN 后看流量是否真的出不去(fail-closed)
   diagnose-proxy [--proxy URL|--config FILE]
                        代理链路诊断,定位是节点、规则还是本地代理的问题
-  fingerprint          打印环境指纹(时区、地区、语言、出口、客户端版本)
-  cli-info             当前代理客户端的版本与配置路径
+  fingerprint          设备指纹体检(地区特征字体 / GPU / 虚拟机;Canvas/WebGL 见 Web 检测页)
+  cli-info             Claude Code CLI 只读体检(版本 / 安装方式 / 多份安装冲突)
 
 区域与客户端
   set-region           按当前出口对齐时区 / 地区 / 语言
-  set-client <mode>    指定代理客户端(clash-verge / shadowrocket / sing-box …)
+  set-client <mode>    指定代理客户端(clash-verge / flclash / shadowrocket / sing-box …)
   get-client           打印当前选定的代理客户端
   open-safe <url>      在受控环境里打开链接
 

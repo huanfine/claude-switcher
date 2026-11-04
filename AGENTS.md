@@ -2,19 +2,20 @@
 
 > 这份文件写给 AI Agent。用户把本项目交给你时，请按本文档执行安装与配置。
 > 用户也可以直接把本文件内容粘贴给任意本地模型（Kimi Code / Cursor / Claude Code 等）作为指令。
+> 本项目基于 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)（MIT）二次开发，本文件为当前仓库维护者续写的操作手册。
 
 ---
 
 ## 你的任务
 
-帮助用户在 macOS 上安装并配置「Claude 切换器」：一个带环境安检的 Claude 账号启动/切换工具。目标状态是：**用户双击桌面图标，16 项检查均已完成，硬性安全项全部通过；仅用户显式配置的非关键项可显示跳过或警告，且可以正常启动 Claude**。
+帮助用户在 macOS 上安装并配置「Claude 环境检查器」：一个带环境安检的 Claude 账号启动/切换工具。目标状态是：**用户双击桌面图标，16 项检查均已完成，硬性安全项全部通过；仅用户显式配置的非关键项可显示跳过或警告，且可以正常启动 Claude**。
 
 ## 开始之前：必须先确认的前置条件
 
 逐项检查，缺哪项就先补哪项：
 
 1. **macOS**（Apple Silicon 或 Intel 均可）
-2. **代理客户端**已安装且代理可用，支持 Clash Verge / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）。Clash Verge 的配置目录应存在于 `~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/`；Shadowrocket 以 VPN 配置形式存在（`scutil --nc list` 可见）
+2. **代理客户端**已安装且代理可用，支持 Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）。Clash Verge 的配置目录应存在于 `~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/`；Shadowrocket 以 VPN 配置形式存在（`scutil --nc list` 可见）
 3. **Claude 桌面版** 在 `/Applications/Claude.app`
 4. **python3** 可用（`python3 --version` 能输出版本号；没有则引导用户运行 `xcode-select --install`）
 5. **当前出口 IP 所在国家不能是 CN**——先跑 `curl -s https://www.cloudflare.com/cdn-cgi/trace | grep loc=`，返回的 `loc` 不是 `CN` 才能继续。是 CN 就停下，让用户先把代理调好（安装程序会按出口 IP 自动锁定地区目标：国家/时区/地区格式三件套，裸连时装机会把它们锁错）
@@ -54,13 +55,13 @@
 首选引导用户运行安装器（双击 `installer/安装.command`，或终端执行它）。如果安装器环境受限，按下面的手动等效步骤执行：
 
 1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch.sh`（可执行），把 `core/stun-probe.py` 放到 `~/.claude-switcher/`。**核心脚本原样落地，不要再用 sed 改写它**——环境值走下一步的 `env.json`
-2. 探测代理客户端，用 `claude-switch.sh _support env-set "proxy_mode=..."` 写进 `~/.claude-switcher/env.json`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/shadowrocket/sing-box/clashx/surge/auto 中选择
+2. 探测代理客户端，用 `claude-switch.sh _support env-set "proxy_mode=..."` 写进 `~/.claude-switcher/env.json`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/flclash/shadowrocket/sing-box/clashx/surge/auto 中选择
 3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名，同样用 `env-set "proxy_group=..."` 写入（其他客户端跳过）
 4. 按出口 IP 自动锁定地区目标：多源依次尝试 ipinfo.io（country/timezone）→ ipapi.co（country_code/timezone）→ ifconfig.co（country_iso/timezone）→ Cloudflare trace（loc，时区用国家默认映射），全失败时让用户在 US/JP/TW/HK/SG/GB/DE/FR/KR/AU/CA 中手动选，`FORCE=1` 按 US + America/New_York；country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ locale，然后用 `env-set "country=..." "timezone=..." "locale=..."` 写入 env.json
 5. 参照 `daemons/` 目录的模板，物化保镖与时区看门狗脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` 替换为实际值），用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher/`（chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon 安装到 `/Library/LaunchDaemons/`（plist 的 ProgramArguments 已写死指向系统目录，直接 cp 即可）。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto`）
 6. 现场编译界面 App（需要 Xcode 命令行工具，必须带 `-target` 否则新 SDK 产物在老系统拒启动）：
    ```bash
-   swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o Claude切换器.app/Contents/MacOS/ClaudeSwitcher -framework SwiftUI -framework AppKit
+   swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o "Claude 环境检查器.app/Contents/MacOS/ClaudeSwitcher" -framework SwiftUI -framework AppKit
    ```
    图标用 `assets/icon-2048.png` 经 sips 生成 iconset 再 `iconutil -c icns` 打进 `Contents/Resources/AppIcon.icns`，`Info.plist` 声明 `CFBundleIconFile`，最后 `codesign --force --deep -s -`
 7. Clash Verge 模式下通过核心脚本的 `write-merge-rules` 隐藏入口生成「全局扩展脚本」(profiles/Script.js)，直接前置 `config.rules`，保留已有 main，备份并迁移 Merge.yaml 中本项目旧标记块；重启 Clash Verge 后必须验证内核 `/rules`。其他客户端提示用户自行添加 DOMAIN-SUFFIX 置顶规则
@@ -101,7 +102,7 @@
 
 **不要把「可关闭」摆到主界面上**：16 项默认全部拦启动，按能不能关分组会让人以为「有些可以不拦」，等于把降级当选项推荐。主界面只列一份清单；关闭入口只在设置页的「降级防护（不推荐）」里。关掉之后必须持续可见——主界面常驻橙色「防护已降级：…」，`check` 输出追加 `|防护降级:…`，否则命令行、日志、自动化这些看不到界面的地方完全无从判断。
 
-出口身份归一：`IP一致` 与 48h 变化统计都不直接比原始地址，而是比归一身份——v4 原样，v6 取 `/64` 前缀。`lastip` 按协议族各存一行，两族互不覆盖；历史统计先按族去重再取最大值。这样同一节点双栈交替（先报 v4 再报 v6、或 v6 在同一 /64 内换接口标识）不会被判成「出口在漂移」或「IP 变了」。旧版写下的裸地址在读取时自动迁移，升级后第一次检查不会误报。`出口IP` 走 v6 时行尾标注 `(IPv6 出口)`，免得用户以为地址有问题。
+出口身份归一：`IP一致` 与 48h 变化统计都不直接比原始地址，而是比归一身份——v4 原样，v6 取 `/64` 前缀。`lastip` 按协议族各存一行，两族互不覆盖；历史统计先按族去重再取最大值。这样同一节点双栈交替（先报 v4 再报 v6、或 v6 在同一 /64 内换接口标识）不会被判成「出口在漂移」或「IP 变了」。旧版写下的裸地址在读取时自动迁移，升级后第一次检查不会误报。`出口IP` 走 v6 时**不再**额外标注「IPv6 出口」——冒号地址本身已说明协议族，补这一句反而容易让用户误以为自己开了本机 IPv6。三条相关行各说各的层，不要合并：`IPv6` 查本机网卡（出口是 v6 时写「本机已关闭 · 节点出口为 IPv6」）；`出口IP` 报节点侧对 Cloudflare 呈现的地址；`WebRTC` 的 STUN 探针只走 v4，无 v4 出口时写「节点无 IPv4 出口，STUN 只回 IPv4，无法比对(非泄漏)」。
 
 客户端日志与诊断：默认在 `~/Library/Logs/claude-switcher/client.log` 记录脱敏命令元数据，512 KiB 后轮转为 `client.log.1`，可用配置中的 `logging` 关闭。`export-diagnostics <file>` 与 App「导出诊断日志」生成 zip，只含客户端日志、检查设置和脱敏环境/状态摘要。不得把公网/住宅/代理 IP、Bearer/token/session/cookie、账号内容、Clash 配置、`lastip`、`iphistory` 或原始 `last-check.txt` 写入日志或诊断包。
 
@@ -129,9 +130,9 @@
 
 出口判定不再取单次样本。`check` 对同一域名连采 3 次，全部一致才判 `ok`；采样间不一致判 `fail`（节点在漂移，同一账号的来源在变，比单点异常更危险）；一次都没取到判 `unknown`，只出警告、不拦启动。放宽的前提是连采两轮、共 6 次全空才认 `unknown`——单次空返回多半是网络抖动，之前正是它把抖动误判成「出口IP异常」并拦住 Claude 启动。
 
-`drill [--yes]` 是 fail-closed 演练。平时的检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。它先记录基准出口，请用户手动停掉内核，然后同时用域名和裸 IP 各探 3 次：任何一条还能出去就是漏，判 `violated` 并报出直连 IP；全部无响应才算 `established`。停核需要 sudo，断网时机也不该由脚本替用户决定，所以内核一律由用户手动停；全程挂着提醒恢复的 trap，结果追加到 `~/.claude-switcher/drill.log`。
+`drill [--auto|--manual] [--yes]` 是 fail-closed 演练。平时的检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。它先记录基准出口，同时用域名和裸 IP 各探 3 次：任何一条还能出去就是漏，判 `violated` 并报出直连 IP；全部无响应才算 `established`。**默认 `--auto`** 通过内核接口关 TUN，效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 才是手动停核那条路。全程挂着提醒恢复的 trap，结果追加到 `~/.claude-switcher/drill.log`。2026-11-01 本机实测结论为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去。
 
-`verdict [报告]` 离线复核 `last-check.txt`（或指定报告），只读不探测，输出 `VERDICT:established|violated` 与 blockers/advisories/skipped 三行。`warn` 与 `skip` 既不会被提升成 pass，也不会被当成 fail。`evidence <file>` 把最近一次检查写成 JSON（时间、主机、环境、逐项状态、判定），权限 0600，只新建不覆盖——证据被覆盖就失去追溯意义。
+`verdict [报告]` 离线复核 `last-check.txt`（或指定报告），只读不探测，输出 `VERDICT:established|violated|incomplete` 与 blockers/advisories/skipped 三行。`warn` 与 `skip` 既不会被提升成 pass，也不会被当成 fail。`evidence <file>` 把最近一次检查写成 JSON（时间、主机、环境、逐项状态、判定），权限 0600，只新建不覆盖——证据被覆盖就失去追溯意义。
 
 ## 运行期出口看门狗（watch）
 
@@ -163,10 +164,10 @@ App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是
 
 | 症状 | 根因 | 处理 |
 |---|---|---|
-| TUN 网卡消失、出口变回国内 | **Clash Verge 更新/异常重启会把 `enable_tun_mode` 重置为 false**（生产环境已发生 4 次） | 退出 App → 改 `verge.yaml` 为 true → 重启 App。切换器的一键修复已内置此逻辑 |
-| 时区总是自己变回去 | macOS 自动时区或未知程序改动（生产环境已抓 8 次） | 看门狗会自动回滚；查 `~/Library/Logs/tz-watchdog.log` 留痕 |
+| TUN 网卡消失、出口变回国内 | **Clash Verge 更新/异常重启会把 `enable_tun_mode` 重置为 false** | 退出 App → 改 `verge.yaml` 为 true → 重启 App。切换器的一键修复已内置此逻辑 |
+| 时区总是自己变回去 | macOS 自动时区或未知程序改动 | 看门狗会自动回滚；查 `~/Library/Logs/tz-watchdog.log` 留痕 |
 | 检查结果显示 0/11、数据为空 | 中文日志被 `cut -c` 按字节截断产生非法 UTF-8，Swift 严格解码整体失败 | 脚本必须 `export LC_ALL=en_US.UTF-8`；界面端用容错解码 `String(decoding:as:)` |
-| 修改 App 后界面没变化 | 菜单栏版本关闭窗口仅隐藏；`pkill` 匹配中文路径还可能因 Unicode NFD 编码失配而静默失败 | 先从盾牌菜单选「退出 Claude 切换器」，再替换 App；开发排障也可按进程名退出测试实例。不要把关窗改回退出，以免破坏菜单栏驻留 |
+| 修改 App 后界面没变化 | 菜单栏版本关闭窗口仅隐藏；`pkill` 匹配中文路径还可能因 Unicode NFD 编码失配而静默失败 | 先从盾牌菜单选「退出 Claude 环境检查器」，再替换 App；开发排障也可按进程名退出测试实例。不要把关窗改回退出，以免破坏菜单栏驻留 |
 | headless Chrome 做 WebRTC 检测无结果 | headless 模式 ICE 子系统不产出候选 | 不要走浏览器路线，用本项目的纯 Python STUN 探针 |
 | 代理节点报错但流量没泄漏 | 节点被重置时隧道内请求失败≠泄漏；Fail-Closed 下流量只断不绕 | 换线路即可 |
 | 切换账号报「存在待恢复快照，拒绝覆盖」 | 上次归档被中断，`~/.claude-switcher/accounts/<账号>.new` 或 `.previous` 残留（可能是唯一副本） | 先确认 `<账号>/` 是否完整；若有 `.previous` 且正式目录缺失，用它恢复；确认无价值后再删除 `.new`/`.previous` 重试 |
@@ -211,7 +212,7 @@ Windows 用户请使用 `windows/` 下的 PowerShell 版本。关键差异与注
 - **账号数据目录**：传统 EXE 版为 `%APPDATA%\Claude`；旧目录不存在时自动发现 MSIX/Appx 的 `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>`（不是 macOS 的 `~/Library/Application Support/Claude`）。WPF 与 `status` 均支持 A–D、快照大小和日期；切换前必须重新完成审计。`keep-in-workspace.txt` 的语义与 macOS 相同，但 Windows 还需拒绝重解析点。
 - **代理客户端**：支持 `clash-verge` / `flclash` / `sing-box` / `clashx` / `surge` / `wireguard` / `other` / `auto`。`set-client` 同时更新核心脚本与 `proxy-mode.txt`，保镖每轮重新读取该文件；不要套用 macOS 的 root 守护同步方式。
 - **工具与快照**：`fingerprint`、`cli-info`、`open-safe`、`diagnose-proxy` 均已提供 Windows 实现。`snapshot-export` / `snapshot-import` 使用流式 `.csnap`（PBKDF2-HMAC-SHA256 200,000 轮、AES-256-CBC、HMAC-SHA256），不与 macOS DMG 兼容；密码仅经 stdin，先认证再解压，目标槽位非空或包路径越界必须拒绝。隔离回归另有 `tests\windows-snapshot-integration.ps1`。
-- **检查设置与日志**：与 macOS 使用相同的 6 项非关键检查白名单和 `allowOptionalFailures` 边界；配置在 `%USERPROFILE%\.claude-switcher\checks.json`，脱敏日志在 `%USERPROFILE%\.claude-switcher\logs\client.log`，512 KiB 轮转。WPF 设置窗口和 `export-diagnostics` 可导出脱敏诊断 zip，不得包含账号、IP、凭据、Clash 配置或原始检查详情。独立代理诊断不得创建账号状态或写客户端日志。
+- **检查设置与日志**：Windows 有自己的 6 项非关键检查白名单（macOS 为 8 项），`allowOptionalFailures` 的作用边界与 macOS 一致；配置在 `%USERPROFILE%\.claude-switcher\checks.json`，脱敏日志在 `%USERPROFILE%\.claude-switcher\logs\client.log`，512 KiB 轮转。WPF 设置窗口和 `export-diagnostics` 可导出脱敏诊断 zip，不得包含账号、IP、凭据、Clash 配置或原始检查详情。独立代理诊断不得创建账号状态或写客户端日志。
 - **已知限制**：新 WPF、FlClash、隔离浏览器、代理诊断、加密快照、安装与更新流程尚未做 Windows 真机验收，静态/XAML 测试不能冒充真机测试；Clash Verge 的 TUN 开关被更新重置后在 Windows 端需手动重开。
 - **自动更新**：启动时静默检查 GitHub 最新 Release，有新版显示提示条；一键更新会下载 zip、校验 SHA256、备份并替换用户目录脚本、重启保镖任务和界面，失败自动回滚，不需要管理员。发布 zip 根必须带 `VERSION`（`release.yml` 已写入），安装后落到 `%USERPROFILE%\.claude-switcher\version.txt`。
 - **Clash 规则**：一键修复先识别 Clash 模式（Mihomo API `/configs`，失败回退 `clash-verge.yaml`/`config.yaml`/`verge.yaml` 的 `mode:`）。全局/直连模式不写规则，仅清理旧 Merge；规则模式只写 `profiles\Script.js` 托管块，重启后用内核 `/rules` 验证前 16 条，失败回滚。安装器不再写 `Merge.yaml`，旧 `prepend-rules`/`---` 会被清理并备份。控制接口地址从 `clash-verge.yaml` → `config.yaml` → `verge.yaml` 依次查找（不支持 unix socket）；「规则置顶」告警括号里会带原因（未配置/拒绝连接/鉴权失败/超时），只读排查用 `rules-status`。
@@ -249,7 +250,7 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 **除非维护者在当次对话中明确要求，否则不得更新/部署维护者本机的已安装版本。** 具体包括：
 
 - 不得覆盖 `~/.local/bin/claude-switch.sh`、`~/.local/bin/local.claude-*.plist`
-- 不得重新编译或替换桌面 App（`~/Desktop/Claude切换器.app`）
+- 不得重新编译或替换桌面 App（安装器产物 `~/Desktop/Claude切换器.app`，打包脚本产物名为「Claude 环境检查器.app」；两者的窗口标题都是「Claude 环境检查器」）
 - 不得改动 `/Library/Application Support/claude-switcher/`、`/Library/LaunchDaemons/local.claude-*`、`~/Library/LaunchAgents/local.claude-*`
 - 不得触发本机 `update`、不得执行安装器/卸载器
 

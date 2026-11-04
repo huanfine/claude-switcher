@@ -2,7 +2,7 @@
 
 零安装的浏览器侧环境自检页：手机 / 平板浏览器打开即测。纯静态、无构建、无第三方 JS/CSS 依赖，可直接由 GitHub Pages 托管。
 
-线上地址：<https://yoursjeyo.github.io/claude-switcher/>
+线上地址：<https://huanfine.github.io/claude-switcher/>（由本仓库 `docs/` 目录经 GitHub Pages 发布；首次使用需先在仓库 Settings → Pages 启用，见下）
 
 ## 检测项
 
@@ -23,8 +23,8 @@
 必须通过 HTTP 访问。`file://` 下浏览器会拦截跨域请求，页面虽能打开但检测结果不可用。
 
 ```bash
-cd /Users/mac/Documents/claude-switcher
-python3 -m http.server 8000 --directory web
+cd claude-switcher
+python3 -m http.server 8000 --directory docs
 # 打开 http://127.0.0.1:8000
 ```
 
@@ -35,8 +35,8 @@ python3 -m http.server 8000 --directory web
 1. 将仓库推送到 GitHub。
 2. 仓库 **Settings → Pages → Build and deployment**。
 3. Source 选择 **Deploy from a branch**。
-4. Branch 选择 `main`，Folder 选择 **`/web`**，保存。
-5. 等待 Pages 构建完成，访问 <https://yoursjeyo.github.io/claude-switcher/>。
+4. Branch 选择 `main`，Folder 选择 **`/docs`**，保存。
+5. 等待 Pages 构建完成，访问 <https://huanfine.github.io/claude-switcher/>。
 
 如果使用自定义 Actions 发布，也只需要把 `docs/` 作为站点根目录发布，无需构建步骤。
 

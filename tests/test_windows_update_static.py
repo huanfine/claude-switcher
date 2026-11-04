@@ -146,8 +146,8 @@ class WindowsUpdateStaticTests(unittest.TestCase):
 
     def test_check_update_contract(self):
         text = read(CORE)
-        # 更新源必须是本 fork。这条断言以前写死的是上游 YOURSJEYO,等于把
-        # 「自动更新把上游整包拉下来覆盖本地改动」这个 bug 固化成预期行为。
+        # 更新源必须指向本仓库。下面这条负例断言防止「自动更新把外部仓库整包
+        # 拉下来覆盖本地改动」这个 bug 被固化成预期行为。
         self.assertIn(
             "https://api.github.com/repos/huanfine/claude-switcher/releases/latest",
             text,
@@ -155,7 +155,7 @@ class WindowsUpdateStaticTests(unittest.TestCase):
         self.assertNotIn(
             "api.github.com/repos/YOURSJEYO/",
             text,
-            "Windows 自动更新不得指回上游仓库,否则会覆盖本 fork 的改动",
+            "Windows 自动更新不得指向非本仓库的更新源,否则会覆盖本地改动",
         )
         self.assertIn("-UserAgent 'ClaudeSwitcher'", text)
         self.assertIn("-TimeoutSec 8", text)

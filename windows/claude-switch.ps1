@@ -1762,7 +1762,7 @@ function Get-Fingerprint {
     } else {
         '虚拟机=ok:未发现常见虚拟化特征'
     }
-    'CanvasWebGL=info:请打开 Web 检测页 https://yoursjeyo.github.io/claude-switcher/ 查看 Canvas/WebGL 指纹'
+    'CanvasWebGL=info:请打开 Web 检测页 https://huanfine.github.io/claude-switcher/ 查看 Canvas/WebGL 指纹'
 }
 
 function Invoke-ExternalCapture([string]$FilePath, [string[]]$Arguments, [int]$TimeoutMs = 5000) {
@@ -2261,7 +2261,7 @@ function Get-ReleaseInfo {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         # GitHub 要求 User-Agent;PowerShell 5.1 的 -Headers 不允许改它,-UserAgent 等价写入请求头
-        # 更新源必须指本 fork。指回上游(YOURSJEYO)的话,每次自动更新都会把上游
+        # 更新源必须指向本仓库。指向其它仓库的话,每次自动更新都会把外部版本
         # 整包拉下来覆盖本地改动 —— macOS 侧靠 core 里的 UPD_REPO 挡住了,这里之前漏了。
         # 本仓库暂未发布 Release,接口会返回 404,由下面的 catch 转成人话提示。
         $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/huanfine/claude-switcher/releases/latest' -UserAgent 'ClaudeSwitcher' -TimeoutSec 8

@@ -1,4 +1,4 @@
-# Claude 切换器 · Linux 版 (Beta)
+# Claude 环境检查器 · Linux 版 (Beta)
 
 > ⚠️ **本版本为 Beta**。核心逻辑移植自 macOS 稳定版,但 Linux 发行版差异大,遇到问题请到 [Issues](https://github.com/huanfine/claude-switcher/issues) 反馈。
 

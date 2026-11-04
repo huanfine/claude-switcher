@@ -11,4 +11,5 @@ _trash/
 .worktrees/
 
 .superpowers/
+.workbuddy/
 __pycache__/
