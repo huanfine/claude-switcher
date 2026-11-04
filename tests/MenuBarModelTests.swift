@@ -1,7 +1,7 @@
 import Foundation
 import AppKit
 
-private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性"]
+private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性"]
 
 private struct TestFailure: Error, CustomStringConvertible {
     let description: String
@@ -48,7 +48,7 @@ private final class Fixture {
           get-check-config) cat "$root/check-config"; result get-config ;;
           set-check-config) printf '%s\n' "$2" > "$root/saved-config"; result set-config ;;
           switch) delay switch; cat "$root/switch-output"; result switch ;;
-          fix) delay fix; echo 'FIX:演示修复完成'; result fix ;;
+          fix) delay fix; if [ -f "$root/fix-output" ]; then cat "$root/fix-output"; else echo 'FIX:演示修复完成'; fi; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
           watch)
             # 常驻,直到测试写出 watch-stop 才吐 STOP 行。真脚本靠 curl 判定,
@@ -148,13 +148,29 @@ struct MenuBarModelTests {
                 try expect(vm.stamps["A"] == AccountStamp(size: "1.2G", date: "2026-10-20"), "应解析账号大小与日期")
                 let card = ContentView(vm: vm)
                 // 卡片是两行:第一行状态,第二行体积和日期。两行都要断言,
-                // 否则「当前账号」和它的存档信息对不上也发现不了。
-                try expect(card.accountStateLabel("A") == "当前账号" && card.accountSubtitle("A") == "1.2G · 10-20",
-                           "当前账号卡片文案不正确")
-                try expect(card.accountStateLabel("B") == "已建档" && card.accountSubtitle("B") == "900M · 10-19",
-                           "已建档卡片应带大小与日期")
-                try expect(card.accountStateLabel("D") == "未初始化" && card.accountSubtitle("D") == "空",
-                           "空槽位卡片文案不正确")
+                // 否则状态和它的存档信息对不上也发现不了。
+                //
+                // 状态词描述的是**槽位此刻的事实**,不是「你在用哪个账号」:
+                // Claude 关着就是「未运行」,开着才是「使用中」。
+                // 之前这里断言的是「当前账号」—— 那只是切换器的指针,
+                // 用户没登录、没打开 Claude 也会看到「当前账号」,会误以为在用它。
+                // 再之前断言的是「上次使用」—— 那是历史,用户问的是现在。
+                try expect(card.accountStateLabel("A") == "未运行" && card.accountSubtitle("A") == "1.2G · 10-20",
+                           "Claude 未运行时,当前槽位应写「未运行」")
+                #if CLAUDE_SWITCHER_TESTS
+                vm.setClaudeRunningForTest(true)
+                try expect(card.accountStateLabel("A") == "使用中",
+                           "Claude 在运行时,当前槽位应写「使用中」")
+                try expect(card.accountStateLabel("B") == "已保存",
+                           "非当前槽位不应跟着变成「使用中」")
+                vm.setClaudeRunningForTest(false)
+                #endif
+                try expect(card.accountStateLabel("B") == "已保存" && card.accountSubtitle("B") == "900M · 10-19",
+                           "已保存的槽位应带大小与日期")
+                // 空槽位不再给占位文字:卡片上「未初始化」+「点击绑定」已经说完了,
+                // 再来一行「空」是同一件事的第三种说法。副标题返回空串,视图整行省略。
+                try expect(card.accountStateLabel("D") == "未初始化" && card.accountSubtitle("D").isEmpty,
+                           "空槽位不应再有第三句「空」")
                 vm.switchTo("C"); try f.idle(vm)
                 try expect(vm.current == "C" && vm.note.isEmpty, "已建档的 C 不应提示首次登录")
                 try expect(f.calls.contains("switch C"), "C 应被允许切换")
@@ -228,12 +244,12 @@ struct MenuBarModelTests {
                 try f.audit(["WebRTC": "fail:演示失败"])
                 try f.deniedSwitch(f.vm())
             case "check_grouping":
-                // 主界面不再按「能不能关」分组 —— 14 项默认全部拦启动,分组反而让人
+                // 主界面不再按「能不能关」分组 —— 15 项默认全部拦启动,分组反而让人
                 // 以为「有些可以不拦」。但「哪几项允许在设置里关掉」这个数据关系仍然要锁住:
-                // 它必须和设置页的 6 个开关完全一致,否则会出现「关不掉」或「关了还拦」。
+                // 它必须和设置页的开关完全一致,否则会出现「关不掉」或「关了还拦」。
                 let vm = f.vm()
                 vm.start(); try f.idle(vm)
-                try expect(vm.rows.count == 14, "检查项应为 14 项")
+                try expect(vm.rows.count == 15, "检查项应为 15 项")
                 let soft = Set(vm.rows.filter { $0.canDisable }.map { $0.name })
                 let expected = Set(VM.optionalChecks.map { $0.label })
                 try expect(soft == expected, "可关闭项与设置页不一致:\(soft.sorted()) vs \(expected.sorted())")
@@ -425,12 +441,14 @@ struct MenuBarModelTests {
                 // 因为分数只按「项数」扣 —— 等于告诉用户「小毛病,能用」。
                 // 硬性项(不可关闭的那 8 项)是「Claude 能不能启动」的开关,
                 // 一失败就必须塌到低位,并且结论要直说「不会启动」。
-                func rows(_ overrides: [String: RowState]) -> [CheckRow] {
+                func rows(_ overrides: [String: RowState],
+                          details: [String: String] = [:]) -> [CheckRow] {
                     let hard = ["代理内核", "TUN网卡", "出口IP", "时区", "地区", "IPv6", "保镖", "规则置顶"]
-                    let soft = ["IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性"]
+                    let soft = ["IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性"]
                     return (hard.map { ($0, false) } + soft.map { ($0, true) }).map { name, disable in
                         CheckRow(name: name, icon: "circle", canDisable: disable,
-                                 state: overrides[name] ?? .ok)
+                                 state: overrides[name] ?? .ok,
+                                 detail: details[name] ?? "")
                     }
                 }
 
@@ -439,12 +457,89 @@ struct MenuBarModelTests {
                 try expect(clean.score == 100 && clean.level == .ok, "全通过应满分且判定为 ok")
                 try expect(clean.headline.contains("可以正常启动"), "全通过要直说能启动")
 
-                // 只掉提示项:还能启动,分数只是略降
+                // 只掉提示项:还能启动,分数只是略降。
+                //
+                // 四维加权之后这一格是 90(旧口径是「每条警告一律 6 分」→ 88):
+                //   · ASN 属性  → 身份维度 −6
+                //   · 生态可达性 → 一致维度 −4
+                // 两条都是「离散事实」,没有实测分可折算,所以按固定权重扣。
+                // 旧口径的毛病不在数字大小,在于**所有警告等价** —— 车库里那台
+                // 转租机房(纯净度 49)和「时区格式不对」扣一样多,于是最该被看见的
+                // 那件事被摊平了。现在重的东西在身份维度里按实测分折算,见下一格。
                 let notices = HealthSummary.evaluate(rows(["ASN属性": .warn, "生态可达性": .warn]))
                 try expect(notices.level == .notice, "提示项不该被判成无法启动")
-                try expect(notices.score == 88, "两个提示项应扣到 88，实际 \(notices.score)")
+                try expect(notices.score == 90, "ASN −6、生态 −4，应为 90，实际 \(notices.score)")
                 try expect(notices.badge == "可以启动", "提示项的徽章要直说「可以启动」")
-                try expect(notices.headline.contains("2 项建议处理"), "正文要说清要处理几项")
+                // 结论要点名最重的那一项,而不是只报项数 ——
+                // 只报「2 项建议处理」等于让用户自己去猜哪个要紧。
+                try expect(notices.headline.contains("ASN属性"), "结论要点最重的那一项，实际 \(notices.headline)")
+                try expect(notices.headline.contains("另有 1 项提示"), "其余项一句话带过，实际 \(notices.headline)")
+                try expect(notices.headline.contains("不影响启动"), "要说清不拦启动，实际 \(notices.headline)")
+
+                // 真机那一次:三个警告,最重的是纯净度 49 分(转租机房)。
+                // 旧结论只说「3 项建议处理,不影响使用」,把「出口是机房」这件事压掉了 ——
+                // 这正是用户当场质疑「49 分和 82 分放一起不合理」的地方。
+                //
+                // 第一次修只改了结论那句话(点名纯净度),分数仍是 82 —— 用户的
+                // 第二次反馈是「我们 ip 评分这么低但是还有 88 分,会误会以为特别安全」。
+                // 第二次修把总分压成 min(扣分结果, 各实测分) = 49,结果用户第三次说
+                // 「不能只是拿 ip 纯净度做评分」—— 那个写法等于总分**就是**纯净度分,
+                // 一个维度吞掉了另外三个。
+                //
+                // 现在是四维加权,这一格的算术(可以逐项复核):
+                //   身份:纯净度 round((100−49) × 0.4) = 20  ← 单项里最重的一笔
+                //        + ASN 属性 6 + IP 一致 4 = 30
+                //   其余三维全通过 = 0
+                //   → 100 − 30 = 70
+                // 也就是说:纯净度 49 分这件事**确实**把总分从 94 拖到 70(比两条
+                // 提示加起来还重四倍),但它不再是全部 —— 这正是「综合考量」要的形状。
+                let three = HealthSummary.evaluate(rows(
+                    ["IP一致": .warn, "ASN属性": .warn, "IP纯净度": .warn],
+                    details: ["IP纯净度": "评分 49/100 · 机房 · RouterHosting LLC · 地理模糊"]))
+                try expect(three.score == 70, "纯净度 49 → 身份 30 分，应为 70，实际 \(three.score)")
+                try expect(three.headline.contains("IP 纯净度") || three.headline.contains("IP纯净度"),
+                           "结论要点纯净度，实际 \(three.headline)")
+                try expect(three.headline.contains("49 分"), "量级要带出来，实际 \(three.headline)")
+                try expect(three.headline.contains("另有 2 项提示"), "另外两项一句话带过，实际 \(three.headline)")
+
+                // 权重的三条性质,分开钉住 —— 以后谁调权重,这几条会立刻告诉他
+                // 调坏了哪一条:
+                //
+                // (1) 幂等:分数只由行状态决定,和顺序无关。
+                let reordered = HealthSummary.evaluate(rows(
+                    ["IP纯净度": .warn, "ASN属性": .warn, "IP一致": .warn],
+                    details: ["IP纯净度": "评分 49/100 · 机房 · RouterHosting LLC · 地理模糊"]))
+                try expect(reordered.score == three.score, "同样的行换个顺序不该换分数")
+
+                // (2) 纯净度是**单项最重**:它一个人(80)比两条离散提示加起来(90)还低。
+                let purityOnly = HealthSummary.evaluate(rows(
+                    ["IP纯净度": .warn], details: ["IP纯净度": "评分 49/100 · 机房"]))
+                try expect(purityOnly.score == 80, "纯净度 49 单独应为 80，实际 \(purityOnly.score)")
+                try expect(purityOnly.score < notices.score,
+                           "纯净度 49 一个人要比两条提示加起来更重（\(purityOnly.score) vs \(notices.score)）")
+
+                // (3) 四个维度的上限加起来正好 100:每个维度都打到上限时总分归零,
+                //     不会出现「什么都错了还剩 40 分」这种事。
+                //     注意这里全用 warn 而不是 fail —— 硬性项一 fail 就走短路(≤28),
+                //     走不到加权分支;能让四个维度同时打满的只有「一堆 warn + 几个软 fail」。
+                let everythingBad = HealthSummary.evaluate(rows([
+                    // 身份 = 40(纯净度 0 分折算满) + 6 + 4 = 50 → 封顶 40
+                    "IP纯净度": .warn, "ASN属性": .warn, "IP一致": .warn,
+                    // 隔离 = 10 + 10 + 8 + 12 = 40 → 封顶 30
+                    "IPv6": .warn, "TUN网卡": .warn, "DNS": .fail, "WebRTC": .fail,
+                    // 一致 = 6 + 4 + 3 + 4 = 17 → 封顶 15
+                    "时区": .warn, "地区": .warn, "客户端语言": .fail, "生态可达性": .warn,
+                    // 守护 = 8 + 7 + 8 = 23 → 封顶 15
+                    "保镖": .warn, "规则置顶": .warn, "代理内核": .warn,
+                ], details: ["IP纯净度": "评分 0/100 · 机房"]))
+                try expect(everythingBad.score == 0, "四维全打满应归零，实际 \(everythingBad.score)")
+
+                // 硬性项一旦松动,压过任何提示项 —— 它本来就是拦启动的开关
+                let hardWarnFirst = HealthSummary.evaluate(rows(
+                    ["时区": .warn, "IP纯净度": .warn],
+                    details: ["IP纯净度": "评分 49/100 · 机房"]))
+                try expect(hardWarnFirst.headline.contains("时区"),
+                           "硬性项的警告要先说，实际 \(hardWarnFirst.headline)")
 
                 // 硬性项失败:必须塌到 30 分以下,并且说「不会启动」
                 let broken = HealthSummary.evaluate(rows(["代理内核": .fail]))
@@ -479,6 +574,71 @@ struct MenuBarModelTests {
                 // 没有 ✓/✗ 但明显是失败的行(脚本里真有),整句就是原因
                 try expect(VM.fixNote(from: "FlClash 未能退出，请手动退出后重试")
                            == "FlClash 未能退出，请手动退出后重试", "无符号的失败行要整句保留")
+            case "fix_warn_is_note":
+                // ⚠ 这一档既不是「已修复」也不是「需手动」。
+                // 实测:节点没有 IPv4 出口时 WebRTC 打的是「无法比对(非泄漏)」——
+                // 它天然带「无法」两个字,先跑失败词表就会判成 ✗ 需手动,红色徽章,
+                // 而用户没有任何手动动作可做。
+                try f.write("fix-output", """
+                FIX:WebRTC ⚠ 节点无 IPv4 出口，STUN 只回 IPv4，无法比对(非泄漏)
+                FIX:出口IP ✓ (144.172.103.106/US)
+                """)
+                let vm = f.vm()
+                vm.fixAll()
+                // 回执只活在「修复跑完 → 1.6 秒后再查」这个窗口里:
+                // checkEnvironment 一开跑就会清空 fixStates(那是设计)。所以
+                // 状态断言必须落在这个窗口内,不能等 idle。
+                try spin(until: { vm.fixStates["WebRTC"] != nil })
+                guard case .note(let note)? = vm.fixStates["WebRTC"] else {
+                    throw TestFailure(description: "⚠ 应落成「未验证」这一档，实际 \(String(describing: vm.fixStates["WebRTC"]))")
+                }
+                try expect(note.contains("非泄漏"), "附注要带出原因，实际 \(note)")
+                try expect(!(vm.fixStates["代理内核"]?.isFailed ?? false),
+                           "STUN 不该把代理内核打成失败")
+                try f.idle(vm)
+                try expect(vm.phase != .failed, "⚠ 不算整轮失败，实际 \(vm.phase)")
+                try expect(vm.fixNotice.contains("未能验证"), "汇总要单独说未能验证，实际 \(vm.fixNotice)")
+                try expect(!vm.fixNotice.contains("需要你手动处理"), "没有可手动动作时不该甩一句「需手动」")
+            case "fix_targets_cover_fixable_names":
+                // 可修清单里的每一项,都得有至少一条 FIX 输出能认领它。漏一个,
+                // 那一行就永远停在「修复中」,「N 项已修复」的计数也把它漏掉 ——
+                // 地区就漏过:它是唯一问题时,用户点完修复连一句回执都看不到。
+                let lines = [
+                    "代理内核+TUN ✓",
+                    "修复时区/IPv6/保镖(需要密码) ✓",
+                    "地区格式 → en_US ✓",
+                    "Claude 客户端语言 → en-US ✓",
+                    "置顶规则 ✓ 已验证内核加载",
+                    "WebRTC ✓ 仅返回代理出口地址",
+                ]
+                let reached = Set(lines.flatMap { VM.fixTargets(of: $0) })
+                let missed = VM.fixableNames.subtracting(reached)
+                try expect(missed.isEmpty, "可修清单里这些项没有能认领它的 FIX 输出:\(missed.sorted())")
+
+                // DNS 修不了,所以不该在可修清单里(给了按钮就是假承诺);
+                // 但 fix() 仍会为它打一句「改不了」,这句必须还能落到 DNS 那一行,
+                // 用户才知道为什么点了没变化、下一步该去哪儿改。
+                try expect(!VM.fixableNames.contains("DNS 走隧道"), "修不了的项不该给「修复」按钮")
+                try expect(VM.fixTargets(of: "DNS 未走隧道(8.8.8.8) · 一键修复改不了这项")
+                           == ["DNS 走隧道"], "修不了也要把回执落到对应行")
+
+                // 「修不了」不等于「换节点」:DNS 要去客户端改设置,别把用户支错方向。
+                try expect(!VM.nodeBoundNames.contains("DNS 走隧道"), "DNS 不属于换节点就能解决的项")
+                try expect(VM.nodeBoundNames.contains("IP 纯净度"), "机房 IP 只能靠换住宅节点")
+
+                // STUN ≠ TUN。`STUN` 里含 `TUN`,用子串认领会把 WebRTC 的结果
+                // **同时挂到代理内核和 TUN 网卡名下**——实测那一屏是三行说同一件事,
+                // 其中两行还是冤的(内核和 TUN 明明都好的)。这一条钉住它。
+                for line in ["WebRTC ✗ 节点无 IPv4 出口，STUN 只回 IPv4，无法比对(非泄漏)",
+                             "WebRTC ✓ STUN 仅返回代理出口地址"] {
+                    try expect(VM.fixTargets(of: line) == ["WebRTC"],
+                               "STUN 不该被认成 TUN 网卡:\(line) → \(VM.fixTargets(of: line))")
+                }
+                // 反过来:真的报 TUN 的那两句还得认得出(代理内核+TUN / 代理内核/TUN)。
+                for line in ["代理内核+TUN ✓", "代理内核/TUN ✗(请打开 Clash Verge 检查节点/线路)"] {
+                    try expect(Set(VM.fixTargets(of: line)) == ["代理内核", "TUN 网卡"],
+                               "内核/TUN 那一行要认领两项:\(line)")
+                }
             case "failed_fix":
                 try f.write("fix-exit", "1")
                 let vm = f.vm()

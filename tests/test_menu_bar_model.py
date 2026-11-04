@@ -19,6 +19,10 @@ SCENARIOS = (
     "health_score_gates_on_hard_failure",
     # 修复失败要说清为什么,不能只丢一句「需手动处理」
     "fix_note_explains_failure",
+    # ⚠(没法验证)既不能标成「已修复」,也不能标成红色「需手动」
+    "fix_warn_is_note",
+    # 可修清单里的每一项都必须有能认领它的 FIX 输出,否则修完没有回执
+    "fix_targets_cover_fixable_names",
     "checking_allows_quit", "hide_after_success", "reopen_cancels_hide",
     "window_lifecycle", "termination_guard",
     # 运行期看门狗:通过才起、没通过不起、收到 STOP 要拦、重新检查要撤掉旧的。

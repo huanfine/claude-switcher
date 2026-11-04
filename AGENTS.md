@@ -7,7 +7,7 @@
 
 ## 你的任务
 
-帮助用户在 macOS 上安装并配置「Claude 切换器」：一个带环境安检的 Claude 账号启动/切换工具。目标状态是：**用户双击桌面图标，14 项检查均已完成，硬性安全项全部通过；仅用户显式配置的非关键项可显示跳过或警告，且可以正常启动 Claude**。
+帮助用户在 macOS 上安装并配置「Claude 切换器」：一个带环境安检的 Claude 账号启动/切换工具。目标状态是：**用户双击桌面图标，15 项检查均已完成，硬性安全项全部通过；仅用户显式配置的非关键项可显示跳过或警告，且可以正常启动 Claude**。
 
 ## 开始之前：必须先确认的前置条件
 
@@ -69,11 +69,37 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
+日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（15 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
 
-检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 6 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
+检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`IP纯净度`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 7 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
-**不要把「可关闭」摆到主界面上**：14 项默认全部拦启动，按能不能关分组会让人以为「有些可以不拦」，等于把降级当选项推荐。主界面只列一份清单；关闭入口只在设置页的「降级防护（不推荐）」里。关掉之后必须持续可见——主界面常驻橙色「防护已降级：…」，`check` 输出追加 `|防护降级:…`，否则命令行、日志、自动化这些看不到界面的地方完全无从判断。
+关于 IP 纯净度（第 14 项，`ip_purity`）：口径是**类型基线 − 扣分**，基线对齐 ip.net.coffee 的实测落点（住宅 100 / 移动 85 / VPN 75 / 机房 60 / Tor 50），判定阈值比分数严。六条不能改回去的口径：
+
+1. **不要改回单源。** 四个源交叉：`api.ipquery.io`（风险标志+风险分）、`ip-api.com`（proxy/hosting/mobile+城市，免费档只支持 http）、`ipinfo.io`（ASN+城市，顺带省掉一次请求）、`api.stopforumspam.org`（滥用频次）。任一源报出 `is_proxy` / `is_vpn` / `is_tor` 即算命中——实测 Cloudflare WARP 只有 ip-api 报 `proxy:true`，ipquery 只报 `datacenter`，单源会把这类出口当普通机房放过，而它恰好是最该拦的一类。
+2. **不要丢掉 `dig +short -x`。** PTR 是出口自己写下的身份（`tor-exit-read-me.dfri.se`、`…static.cloudzy.com`、`c-73-158-10-5.hsd1.ca.comcast.net`），比任何第三方评分都硬；实测 fake-ip 不劫持反向解析。但也**不要加 DNSBL**：fake-ip 劫持所有 A 查询统一回 `198.18.0.x`，黑名单结果全是假的。
+3. **风险分与滥用记录取较大者，不许相加。** 两者都是历史信誉信号且高度相关（Tor 出口天然两项都高），相加等于同一个事实罚两次，会让 51 分和 49 分的机房得到相反结论。
+4. **地理那一维只对机房/移动/类型不明成立，必须先查三源城市是否一致。** 实测 RouterHosting `144.172.103.106` 被 ipquery/ipinfo 报犹他、被 ip-api 报内华达，跨了州；这时拿任一源的时区去要求用户对齐就是冤枉人，只能标「地理模糊」。住宅整段跳过（家宽注册地≠接入地不是风险，且另有时区项在管）；**Tor 与代理也必须跳过**——它们的「城市」是数据中心位置，三源按各自出口点库去标必然不一致（实测两个随机 Tor 出口全部命中），挂这个标记是纯噪声。
+
+5. **运营商名要有三级兜底。** ipinfo 免费额度会被打满并回 429（实测连续查询就会），那时 `ip_org` 也跟着空；只用 ipinfo 会让一个干净的 Comcast 退化成「类型不明」70 分 warn 并建议用户换住宅 IP。顺序是 ipinfo 响应的 `org` → **ipquery 响应里的 `org`（零成本）** → `ip_org`。中间的这层不能删。
+
+6. **「数据源认识这个地址吗」与「拿到几个风险信号」必须分开判（`known` 与 `src_n`），不要合并成一个布尔。** 前者回答地址是否真实存在，用来挡空壳响应（ipquery 对 `192.0.2.55` 会回结构完整、标志全 false、风险分 0 的空壳，和「住宅且毫无风险」长得一模一样）；后者回答证据够不够。合并之后两侧都会错：空壳拿到 100 分，或者在有运营商名、有 PTR 的情况下只回一句没有信息量的「未评级」。
+
+   四档结论：
+
+   | 情形 | 结论 |
+   |---|---|
+   | `src_n == 2` | 正常评分 |
+   | `src_n == 1` | 正常评分 + 标 `·仅一家风险源可达`（缺一家就可能漏判代理特征，但不改判定） |
+   | `src_n == 0` 且 `known` | **降级判型**：按运营商名 / PTR 定类型，`base` 封顶 70、判定封顶 warn，标 `·风险源不可达`，下一句换成「仅按运营商名或反向解析判型,稍后重查」 |
+   | `known` 为空 | 「未评级」+ warn，且不写缓存 |
+
+   降级判型的两个封顶都不能拆：报 100 分是用「没查」冒充「查干净了」；把 warn 升成 fail 是拿我们自己的网络抖动去堵用户（IP 纯净度是可关闭的软信号，不是 Kill-Switch）。另外 PTR 能解出来本身就证明地址存在，所以 `rdns` 非空也算 `known` —— 三家 HTTP 源全挂时它是最后一根线索。
+
+机房出口只给 warn 不拦启动（大量用户就用机房节点），代理特征与 Tor 才拦；机房只有掉到 30 分以下（转租段+滥用记录）才拦。
+
+结果缓存 24 小时（`~/.claude-switcher/purity-cache.v2`），**查不到不写缓存**，否则一次网络抖动会把「未知」钉住一整天。缓存五个字段的顺序是 `ip|时间戳|判定|分数|类型|detail`，分隔符是 `|`：不要改回 tab，tab 属于 IFS 空白，`read` 会把前导空字段整个吞掉，导致 score 与 detail 静默错位。文件名带 `v2` 是因为第 5 个字段从「扣分标签」换成了「出口类型」，混用旧文件会串位。
+
+**不要把「可关闭」摆到主界面上**：15 项默认全部拦启动，按能不能关分组会让人以为「有些可以不拦」，等于把降级当选项推荐。主界面只列一份清单；关闭入口只在设置页的「降级防护（不推荐）」里。关掉之后必须持续可见——主界面常驻橙色「防护已降级：…」，`check` 输出追加 `|防护降级:…`，否则命令行、日志、自动化这些看不到界面的地方完全无从判断。
 
 出口身份归一：`IP一致` 与 48h 变化统计都不直接比原始地址，而是比归一身份——v4 原样，v6 取 `/64` 前缀。`lastip` 按协议族各存一行，两族互不覆盖；历史统计先按族去重再取最大值。这样同一节点双栈交替（先报 v4 再报 v6、或 v6 在同一 /64 内换接口标识）不会被判成「出口在漂移」或「IP 变了」。旧版写下的裸地址在读取时自动迁移，升级后第一次检查不会误报。`出口IP` 走 v6 时行尾标注 `(IPv6 出口)`，免得用户以为地址有问题。
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Claude 切换器 - macOS 打包脚本（本地与 CI 共用）
+# Claude 环境检查器 - macOS 打包脚本（本地与 CI 共用）
 # 用法: bash scripts/package-macos.sh [版本号]
 # 产物: build/ClaudeSwitcher-<版本>-macos-<架构>.zip
 #       build/ClaudeSwitcher-<版本>-macos-<架构>.dmg
@@ -17,7 +17,7 @@ case "$VERSION" in
         ;;
 esac
 
-APP_NAME="Claude切换器"
+APP_NAME="Claude 环境检查器"
 BUILD="$ROOT/build"
 APP="$BUILD/$APP_NAME.app"
 ARCH="$(uname -m)"
@@ -69,8 +69,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 <dict>
 	<key>CFBundleExecutable</key><string>ClaudeSwitcher</string>
 	<key>CFBundleIdentifier</key><string>local.claude-switcher</string>
-	<key>CFBundleName</key><string>Claude切换器</string>
-	<key>CFBundleDisplayName</key><string>Claude切换器</string>
+	<key>CFBundleName</key><string>Claude 环境检查器</string>
+	<key>CFBundleDisplayName</key><string>Claude 环境检查器</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
 	<key>CFBundleVersion</key><string>$VERSION</string>

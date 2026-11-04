@@ -183,6 +183,7 @@ class IpIdentityTests(unittest.TestCase):
     def test_history_counts_one_node_once(self):
         # 同一节点的 v4/v6 两种形态在 48h 统计里必须算一个出口,
         # 否则双栈机器「变化次数」翻倍,把正常使用报成账号画像风险。
+        # 这里故意传裸地址:旧版本历史文件里存的就是裸地址,升级后要能继续读。
         with tempfile.TemporaryDirectory() as tmp:
             src = "BASE=%s\n%s\n%s\n" % (tmp, IP_HELPERS, extract("iphist_count")) + \
                 "iphist_count 198.51.100.2 >/dev/null\n" \
@@ -192,6 +193,50 @@ class IpIdentityTests(unittest.TestCase):
             out = subprocess.run(["/bin/bash", "-c", src], text=True,
                                  capture_output=True, timeout=20).stdout.strip()
         self.assertEqual(out, "2", "v4 + v6 同一节点算一个出口,另一个节点算第二个")
+
+    def test_history_accepts_normalised_keys(self):
+        # 生产路径传进来的是 curkey,已经是 v4:/v6: 归一后的形态,不是裸地址。
+        # 回归点:这里若再套一层 ip_key,v4:1.2.3.4 含冒号会被当成 v6 地址,
+        # 归一成 v6:v4:1.2.3.4 —— 所有 v4 记录塌进 v6 一族,「按族取最大」失效,
+        # 一个没换过的节点被数成多次变动并报 warn,而这项用户无从修复。
+        with tempfile.TemporaryDirectory() as tmp:
+            src = "BASE=%s\n%s\n%s\n" % (tmp, IP_HELPERS, extract("iphist_count")) + \
+                "iphist_count v4:198.51.100.2 >/dev/null\n" \
+                "iphist_count v6:2602:fa59:10:503 >/dev/null\n" \
+                "iphist_count v6:2602:fa59:10:503 >/dev/null\n" \
+                "iphist_count v4:198.51.100.2\n"
+            out = subprocess.run(["/bin/bash", "-c", src], text=True,
+                                 capture_output=True, timeout=20).stdout.strip()
+        self.assertEqual(out, "1", "同一出口反复记录,两族各一个身份,取最大仍是 1")
+
+    def test_history_mixes_legacy_and_normalised_keys(self):
+        # 升级现场:同一个出口既有旧版写的裸地址,又有新版写的归一键,
+        # 还可能夹着另一族的写法。三种形态必须归到同一个身份,不能各算一次。
+        with tempfile.TemporaryDirectory() as tmp:
+            hist = Path(tmp) / "iphistory.log"
+            now = int(time.time())
+            hist.write_text("".join("%s %d\n" % (k, now) for k in (
+                "144.172.103.106",          # 旧版裸 v4
+                "v4:144.172.103.106",       # 新版归一 v4
+                "2602:fa59:10:503::1",      # 旧版裸 v6
+                "v6:2602:fa59:10:503",      # 新版归一 v6
+            )), encoding="utf-8")
+            src = "BASE=%s\n%s\n%s\n" % (tmp, IP_HELPERS, extract("iphist_count")) + \
+                "iphist_count v4:144.172.103.106\n"
+            out = subprocess.run(["/bin/bash", "-c", src], text=True,
+                                 capture_output=True, timeout=20).stdout.strip()
+        self.assertEqual(out, "1", "两种写法的同一个出口只能算一个身份")
+
+    def test_history_separates_real_exit_changes(self):
+        # 真正的换出口必须照实统计 —— 修复不能顺手把告警也一起改没了。
+        with tempfile.TemporaryDirectory() as tmp:
+            src = "BASE=%s\n%s\n%s\n" % (tmp, IP_HELPERS, extract("iphist_count")) + \
+                "iphist_count v4:198.51.100.2 >/dev/null\n" \
+                "iphist_count v4:198.51.100.3 >/dev/null\n" \
+                "iphist_count v4:198.51.100.4\n"
+            out = subprocess.run(["/bin/bash", "-c", src], text=True,
+                                 capture_output=True, timeout=20).stdout.strip()
+        self.assertEqual(out, "3", "48h 内三个不同 v4 出口,就是 3 次")
 
 
 class CheckEgressGateTests(unittest.TestCase):

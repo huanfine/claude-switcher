@@ -26,7 +26,7 @@ closing the window in which traffic could leave outside the proxy.
 
 ## Features
 
-- **14-point preflight audit** — proxy core, TUN interface, exit country, IP stability, time zone, locale, IPv6, DNS leakage, WebRTC candidates, bodyguard status, pinned routing, browser language, ASN type, and Claude reachability.
+- **15-point preflight audit** — proxy core, TUN interface, exit country, IP stability, time zone, locale, IPv6, DNS leakage, WebRTC candidates, bodyguard status, pinned routing, browser language, ASN type, IP purity score, and Claude reachability.
 - **Snapshot switching** — archives and restores whole account directories; APFS copy-on-write cloning avoids duplicating unchanged data.
 - **Fail-closed bodyguard** — checks the proxy kernel and virtual interface every ten seconds and terminates protected processes when the tunnel is lost.
 - **Drift watchdog** — records a baseline for time zone and proxy settings and rolls back silent changes made by other software.
@@ -84,7 +84,7 @@ Artifacts are written to `build/`.
 
 ## Usage
 
-1. Open **Claude切换器** and wait for the 14 checks.
+1. Open **Claude切换器** and wait for the 15 checks.
 2. If everything is green, choose an account and launch Claude. If a blocking
    check is red, use the one-click repair action.
 3. Sign in once for each additional account; later switches keep sessions

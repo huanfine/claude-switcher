@@ -450,9 +450,17 @@ curl() { ''' + curl_body + r'''; }
     def test_v6_only_exit_is_warn_not_fail(self):
         # 真的只有 v6 出口时,IPv4 的 STUN 结果本来就无从比对:
         # 这不是泄漏,但也不能当作已验证。
+        #
+        # 文案刻意**不写**「出口只有 IPv6」。原因不是风格,是同一屏会打架:
+        # 出口IP那一行显示的是 v6 地址,「IPv6 关闭」那一行又是通过 ——
+        # 此时再来一句「只有 IPv6」,读者只能判成「你们检查不准」
+        # (用户原话:「出口ip显示id是ipv6,但是ipv6是关闭的,这个webrtc又显示只有ipv6,很乱」)。
+        # 现在只说我们这一侧的因果:STUN 探针只走 v4,没有可比对的对象。
         run = self.run_status_with_exit("2602:fa59:10:503::1", "printf ''")
         self.assertTrue(run.stdout.startswith("warn:"), run.stdout + run.stderr)
-        self.assertIn("IPv6", run.stdout)
+        self.assertIn("节点无 IPv4 出口", run.stdout)
+        self.assertIn("非泄漏", run.stdout)
+        self.assertNotIn("IPv6", run.stdout, "别把出口的地址族再报一遍,会和「IPv6 关闭」那一行打架")
 
     def test_v6_only_node_ignores_curl_dash4(self):
         # 节点本身是 v6-only 出口时,curl -4 拿回来的还是 v6 地址
@@ -461,7 +469,8 @@ curl() { ''' + curl_body + r'''; }
         run = self.run_status_with_exit("2602:fa59:10:503::1",
                                         "printf 'ip=2602:fa59:10:503::1\\nloc=US\\n'")
         self.assertTrue(run.stdout.startswith("warn:"), run.stdout + run.stderr)
-        self.assertIn("IPv6", run.stdout)
+        self.assertIn("节点无 IPv4 出口", run.stdout)
+        self.assertIn("非泄漏", run.stdout)
 
     def test_flclash_no_response_is_unverified_not_safely_rejected(self):
         run = self.run_status(result="RESULT:NONE", mode="flclash")

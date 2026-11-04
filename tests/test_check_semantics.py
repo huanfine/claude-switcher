@@ -183,7 +183,28 @@ esac''')
   -getinfo) case "$2" in Wi-Fi) echo "IPv6: Off" ;; *) echo "IPv6: Automatic" ;; esac ;;
 esac''')
         run = self.run_core(self.core(), "checkdetail")
-        self.assertEqual(self.line(run.stdout, "IPv6"), "ok:已关闭", run.stdout)
+        value = self.line(run.stdout, "IPv6")
+        # 出口是 v4 时不多话:那时没有可误会的地方,「已关闭」就是全部信息。
+        self.assertEqual(value, "ok:已关闭", run.stdout)
+
+    def test_ipv6_off_row_names_the_layer_it_talks_about(self):
+        """本机 IPv6 关掉 + 节点是 v6 出口,不是自相矛盾,是两层。
+
+        实测反馈:「出口 IP 是 ipv6,IPv6 关闭又通过,WebRTC 还说只有 IPv6,很乱」。
+        三行说的是三件事(本机网卡 / 节点出口 / STUN 探针只走 v4),界面必须
+        各自交代主语,否则读者只能判成「检查不准」。
+        """
+        self.stub("curl", '''case "$*" in
+  *cdn-cgi/trace*) printf 'ip=2602:fa59:10:503::1\\nloc=US\\n' ;;
+  *ipinfo.io*) printf '{"org":"Example Hosting"}' ;;
+  *claude.ai*|*api.anthropic.com*) printf '200' ;;
+esac''')
+        run = self.run_core(self.core(), "checkdetail")
+        # 出口报的是事实地址,不再挂「(IPv6 出口)」—— 冒号已经说明了一切,
+        # 而那句补充读起来像「你开了 IPv6」,和下面一行当场矛盾。
+        self.assertEqual(self.line(run.stdout, "出口IP"), "ok:2602:fa59:10:503::1/US", run.stdout)
+        self.assertIn("节点出口为 IPv6", self.line(run.stdout, "IPv6") or "",
+                      "本机已关闭要和节点出口同时说清,否则两行自相矛盾")
 
     def test_rule_hint_turns_kernel_errors_into_actions(self):
         """内核校验的错误要翻成「缺什么 + 点哪里」,而不是原样抛给用户。"""

@@ -1,69 +1,149 @@
 import Cocoa
 
-let S: CGFloat = 1024
-let img = NSImage(size: NSSize(width: S, height: S))
-img.lockFocus()
+// 应用图标生成器。产物：assets/icon-2048.png（2048×2048）。
+//
+// 画什么：紫色渐变圆角方块 + 一枚白色盾牌，盾牌中间用**挖空**的 Claude 星标。
+//
+// 为什么换掉旧图形：旧图形是「盾牌 + 双向箭头 ⇄」，读作「切换」。
+// 应用名是「环境检查」，主诉是「环境干不干净、能不能放行」，
+// 而这一版再换一次（对号 → 星标）：对号说明的是「检查过了」，换个工具也一样；
+// 星标是 Claude 的标，Dock 里一眼能认出这是给谁用的。守护由盾牌承担。
+//
+// 为什么星标是挖空而不是画成紫色：底色是渐变，用固定色去画标记，
+// 在一端会偏色。挖空之后露出来的是垫在底下的同一片渐变，任何位置都不会错。
+// 实现上是把星标「描边后的轮廓」当裁切区，在原坐标上重画一遍同一片渐变。
+//
+// 一条通用规则（两次踩坑换来）：图标里**不要叠半透明层**。0.06 的白在渐变上
+// 亮不起来，只会留下一条硬边，缩到 128 就是一块来路不明的浅色方块。
+// 层次只靠「实心块 + 挖空块」两级，不要第三层。
 
-// ---- 背景: 圆角方块 + 靛紫渐变 ----
-let bgRect = NSRect(x: 92, y: 92, width: 840, height: 840)
-let bgPath = NSBezierPath(roundedRect: bgRect, xRadius: 210, yRadius: 210)
+let S: CGFloat = 2048
+let k = S / 1024          // 下面所有坐标都按 1024 的设计稿写，乘 k 得到实际像素
+
+// 用固定的位图上下文，而不是 NSImage.lockFocus()：后者在 Retina 上会按
+// 屏幕缩放因子出图，实测拿到 4096×4096，再降采样回 2048 白掉一层细节。
+let px = Int(S)
+guard let rep = NSBitmapImageRep(
+    bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+      let graphics = NSGraphicsContext(bitmapImageRep: rep) else { exit(1) }
+
+NSGraphicsContext.saveGraphicsState()
+NSGraphicsContext.current = graphics
+guard let ctx = NSGraphicsContext.current?.cgContext else { exit(1) }
+
+// ---- 背景：圆角方块 + 靛紫渐变（沿用原来的配色，不动） ----
+let bgRect = NSRect(x: 92 * k, y: 92 * k, width: 840 * k, height: 840 * k)
+let bgPath = NSBezierPath(roundedRect: bgRect, xRadius: 210 * k, yRadius: 210 * k)
 let grad = NSGradient(colors: [
-    NSColor(red: 0.42, green: 0.39, blue: 0.96, alpha: 1), // 靛
-    NSColor(red: 0.62, green: 0.28, blue: 0.92, alpha: 1), // 紫
+    NSColor(red: 0.42, green: 0.39, blue: 0.96, alpha: 1),   // 靛
+    NSColor(red: 0.62, green: 0.28, blue: 0.92, alpha: 1),   // 紫
 ])!
 grad.draw(in: bgPath, angle: -45)
 
-// 顶部微光
-if let hi = NSGraphicsContext.current {
-    hi.saveGraphicsState()
-    bgPath.addClip()
-    NSColor.white.withAlphaComponent(0.06).setFill()
-    NSBezierPath(ovalIn: NSRect(x: 240, y: 760, width: 544, height: 220)).fill()
-    hi.restoreGraphicsState()
+// 这里原来有一层「顶部极淡白椭圆」，想让上门沿不死板。
+// 删了：0.06 的白在渐变上根本不发亮，只会露出一条**弧形硬边**，
+// 缩到 128 就成了图标左上角莫名其妙的一个浅色方块 —— 读起来像没画完的线框。
+// 图标的层次靠「盾牌是实的、对号是挖空的」两件事就已经够了，不需要再加一层。
+
+// ---- 盾牌轮廓 ----
+// 上沿中间留一个很浅的凹点，两侧肩部略高，下沿收成一个圆尖。
+// 不是直线拼出来的多边形 —— 每一段都带控制点，缩到 16pt 才不会出现折角。
+func shieldPath(scale: CGFloat) -> NSBezierPath {
+    let p = NSBezierPath()
+    func pt(_ x: CGFloat, _ y: CGFloat) -> NSPoint { NSPoint(x: x * scale, y: y * scale) }
+    p.move(to: pt(512, 792))
+    p.curve(to: pt(724, 716), controlPoint1: pt(600, 782), controlPoint2: pt(700, 752))
+    p.line(to: pt(724, 520))
+    p.curve(to: pt(512, 262), controlPoint1: pt(724, 420), controlPoint2: pt(640, 322))
+    p.curve(to: pt(300, 520), controlPoint1: pt(384, 322), controlPoint2: pt(300, 420))
+    p.line(to: pt(300, 716))
+    p.curve(to: pt(512, 792), controlPoint1: pt(324, 752), controlPoint2: pt(424, 782))
+    p.close()
+    return p
 }
 
-// ---- 白色盾牌 ----
-let shield = NSBezierPath()
-shield.move(to: NSPoint(x: 512, y: 736))                       // 顶部中央凹点
-shield.curve(to: NSPoint(x: 316, y: 690), controlPoint1: NSPoint(x: 452, y: 724), controlPoint2: NSPoint(x: 330, y: 706))
-shield.line(to: NSPoint(x: 316, y: 500))                       // 左上→左侧
-shield.curve(to: NSPoint(x: 512, y: 288), controlPoint1: NSPoint(x: 316, y: 396), controlPoint2: NSPoint(x: 408, y: 330)) // 左侧→底部尖
-shield.curve(to: NSPoint(x: 708, y: 500), controlPoint1: NSPoint(x: 616, y: 330), controlPoint2: NSPoint(x: 708, y: 396)) // 底部尖→右侧
-shield.line(to: NSPoint(x: 708, y: 690))                       // 右侧→右上
-shield.curve(to: NSPoint(x: 512, y: 736), controlPoint1: NSPoint(x: 694, y: 706), controlPoint2: NSPoint(x: 572, y: 724))
-shield.close()
-NSColor.white.setFill()
-shield.fill()
+// ---- Claude 星标 ----
+//
+// 星标是 Claude 的标:Dock 里一眼能认出这是给谁用的;守护的意思由盾牌承担。
+//
+// **几何是从官方图标上量下来的,不是凭印象画的。**
+// 取 /Applications/Claude.app/Contents/Resources/electron.icns 的 1024 稿,
+// 做极坐标扫描:每 0.25° 找「白色最远到哪儿」得到半径剖面(峰=射线),
+// 再在固定半径处横向扫过每根射线、把角宽换成线性宽度,得到锥度。
+// 结论:12 根、角度不均匀(8.5°…333°)、每根**等宽**(不是花瓣形)、
+// 端头是斜切的平口、中心一块实体毂。
+// 12 根等分就变成太阳/齿轮 —— 不均匀才是这枚标的样子。
+//
+// 用像素重合度(IoU)把参数打到 0.86(对齐圆心后),再往上就是在拟合抗锯齿噪点了。
+// 关键参数:宽度系数 1.03 / 毂半径 0.30R / 收口 0.015R / 平口宽 0.45×射線宽。
+let starRays: [(deg: Double, len: Double, w: Double, slant: Double)] = [
+    (8.50, 0.881, 0.141,  0.6), (40.25, 0.908, 0.205, -0.5),
+    (79.75, 0.881, 0.131,  0.5), (103.00, 0.899, 0.131, -0.7),
+    (133.25, 0.908, 0.099,  0.4), (149.25, 0.881, 0.146, -0.4),
+    (184.75, 0.908, 0.115,  0.7), (214.00, 0.905, 0.115, -0.6),
+    (237.25, 0.875, 0.131,  0.4), (271.75, 0.926, 0.099, -0.5),
+    (303.25, 0.938, 0.162,  0.6), (333.00, 1.000, 0.183, -0.4),
+]
 
-// ---- 双箭头 ⇄ (靛色) ----
-let arrowColor = NSColor(red: 0.36, green: 0.33, blue: 0.88, alpha: 1)
-arrowColor.setFill()
-
-func arrow(y: CGFloat, pointingRight: Bool) {
-    let bar = NSBezierPath(roundedRect: NSRect(x: 396, y: y, width: 176, height: 34), xRadius: 17, yRadius: 17)
-    bar.fill()
-    let head = NSBezierPath()
-    if pointingRight {
-        head.move(to: NSPoint(x: 566, y: y - 22))
-        head.line(to: NSPoint(x: 648, y: y + 17))
-        head.line(to: NSPoint(x: 566, y: y + 56))
-    } else {
-        head.move(to: NSPoint(x: 458, y: y - 22))
-        head.line(to: NSPoint(x: 376, y: y + 17))
-        head.line(to: NSPoint(x: 458, y: y + 56))
+func starPath(cx: CGFloat, cy: CGFloat, R: CGFloat) -> NSBezierPath {
+    let widthScale: CGFloat = 1.03, hub: CGFloat = 0.30
+    let bevel: CGFloat = 0.015, capRatio: CGFloat = 0.45
+    let p = NSBezierPath()
+    p.windingRule = .nonZero
+    // 中心毂:12 根射线在中间本来就糊成一块,单独画个圆比让它们互相重叠更干净
+    p.appendOval(in: NSRect(x: cx - hub * R, y: cy - hub * R,
+                            width: hub * R * 2, height: hub * R * 2))
+    for ray in starRays {
+        let a = CGFloat.pi / 2 - CGFloat(ray.deg) * .pi / 180   // 0° = 正上,顺时针
+        let tip = CGFloat(ray.len) * R
+        let w = CGFloat(ray.w) * widthScale * R
+        func q(_ r: CGFloat, _ off: CGFloat) -> NSPoint {
+            NSPoint(x: cx + cos(a) * r + cos(a + .pi / 2) * off,
+                    y: cy + sin(a) * r + sin(a + .pi / 2) * off)
+        }
+        let shoulder = tip - bevel * R
+        let inner = hub * R * 0.6      // 起点埋进毂里,保证连成一体
+        p.move(to: q(inner, -w / 2))
+        p.line(to: q(shoulder, -w / 2))
+        p.line(to: q(shoulder + CGFloat(ray.slant) * bevel * R * 0.5, -w / 2 * capRatio))
+        p.line(to: q(shoulder - CGFloat(ray.slant) * bevel * R * 0.5,  w / 2 * capRatio))
+        p.line(to: q(shoulder, w / 2))
+        p.line(to: q(inner, w / 2))
+        p.close()
     }
-    head.close()
-    head.fill()
+    return p
 }
-arrow(y: 550, pointingRight: true)   // 上箭头 →
-arrow(y: 428, pointingRight: false)  // 下箭头 ←
 
-img.unlockFocus()
+// 盾牌内腔:上宽下尖(300…724 横向、262…792 纵向),星标居中略偏下 ——
+// 盾牌是梨形,几何中点在视觉上偏低。
+let shieldCG = shieldPath(scale: k).cgPath
+let starOutline = starPath(cx: 512 * k, cy: 532 * k, R: 192 * k).cgPath
 
-// 保存 PNG
-if let tiff = img.tiffRepresentation,
-   let rep = NSBitmapImageRep(data: tiff),
-   let png = rep.representation(using: .png, properties: [:]) {
-    try? png.write(to: URL(fileURLWithPath: "/tmp/switcher-icon-1024.png"))
-    print("saved")
+// 先用盾牌填白。
+ctx.addPath(shieldCG)
+ctx.setFillColor(NSColor.white.cgColor)
+ctx.fillPath()
+
+// 再把星标挖掉。**不要**用 even-odd 把两条路径并起来填：描边轮廓在
+// 交叉处会自交，even-odd 会把自交出来的那一小块当成「洞里面的实心」，
+// 结果星标中心多长出一个白三角（第一版对号就是这样，放大一眼能看见）。
+// 正确做法是把星标当裁切区，在原坐标上再画一遍同一片渐变 —— 露出来的
+// 颜色和周围严丝合缝，因为画的就是同一个渐变。
+ctx.saveGState()
+ctx.addPath(starOutline)
+ctx.clip()
+grad.draw(in: bgPath, angle: -45)
+ctx.restoreGState()
+
+NSGraphicsContext.restoreGraphicsState()
+
+// ---- 保存 ----
+let out = CommandLine.arguments.count > 1
+    ? CommandLine.arguments[1]
+    : "/tmp/switcher-icon.png"
+if let png = rep.representation(using: .png, properties: [:]) {
+    try? png.write(to: URL(fileURLWithPath: out))
+    print("saved \(out) \(rep.pixelsWide)×\(rep.pixelsHigh)")
 }

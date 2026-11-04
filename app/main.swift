@@ -18,15 +18,34 @@ enum FixState: Equatable {
     case running
     case done(String)
     case failed(String)
+    /// 脚本跑完了,但这一项**没法验证** —— 不是没修成,也不是修好了。
+    /// 实测来源:节点没有 IPv4 出口时,WebRTC 的 STUN 探针没有可比对象。
+    /// 以前这一档被塞进 `.failed`,徽章打「需手动」并标红,可用户**没有任何
+    /// 手动动作可做**;红色的「需手动」只会让他去翻设置找一个不存在的开关。
+    case note(String)
 
     var isDone: Bool { if case .done = self { return true }; return false }
     var isFailed: Bool { if case .failed = self { return true }; return false }
+    var isNote: Bool { if case .note = self { return true }; return false }
+
+    /// 回执附注行前面的小符号与颜色。和 `fixChip` 共用同一套语义:
+    /// 绿勾 = 修好了,红叹 = 要你动手,灰问号 = 没法验证。
+    var noteMark: (symbol: String, color: Color, help: String) {
+        switch self {
+        case .running: return ("", ClaudeTheme.muted, "")
+        case .done: return ("checkmark.circle.fill", ClaudeTheme.ok, "")
+        case .failed:
+            return ("exclamationmark.circle.fill", ClaudeTheme.bad, "脚本没能自动修好这一项：")
+        case .note:
+            return ("questionmark.circle.fill", ClaudeTheme.muted, "这一项没法验证：")
+        }
+    }
 
     /// 回执附注。修好了常带「重启 Claude 后生效」这类前提,别让它丢了。
     var note: String {
         switch self {
         case .running: return ""
-        case .done(let n), .failed(let n): return n
+        case .done(let n), .failed(let n), .note(let n): return n
         }
     }
 }
@@ -69,11 +88,147 @@ struct HealthSummary {
         }
     }
 
-    /// 纯函数:输入 14 行检查结果,输出分数和一句话结论。
+    /// 圆环的颜色只由**分数**决定，不由「能不能启动」决定。
+    ///
+    /// 之前 ring 是「全对 → 品牌陶土橙，否则 → 状态色」，而 88 分带两条提示走的是
+    /// `notice` 档 —— 于是 88 分套了一圈**警告色**。百分制里 88 是高分，
+    /// 高分配警告色，颜色语义就反了：用户看到橙色环，读到的却是「快出事了」。
+    ///
+    /// 现在按分档：≥85 绿、60–84 琥珀、<60 红。能不能启动由徽章和结论那句话负责，
+    /// 两件事各说各的，不再共用一个颜色。
+    var scoreColor: Color {
+        if score >= 85 { return ClaudeTheme.success }
+        if score >= 60 { return ClaudeTheme.warning }
+        return ClaudeTheme.error
+    }
+
+    /// 提示项的轻重顺序。分数对每个警告一视同仁(各扣 6),但「一句话结论」不能一视同仁 ——
+    /// 用户看到的第一个词,决定他会不会继续往下看。
+    ///
+    /// 顺序按「对 Claude 账号的实际影响」排,不是按检查项编号:
+    /// 出口纯净度直接决定 Claude 怎么对待这个账号,而且是唯一带 0-100 量化分的项;
+    /// ASN 属性常常和它是同一个事实(机房),但只报类型、不报程度;
+    /// 其余几项要么是稳定性,要么是可达性 —— 真出问题时用户自己会立刻感觉到。
+    private static let warningOrder = [
+        "IP纯净度", "ASN属性", "WebRTC", "DNS", "IP一致", "客户端语言", "生态可达性",
+    ]
+
+    /// 排序键统一去掉空格:界面显示「IP 纯净度」,检查协议里是「IP纯净度」。
+    private static func severity(_ row: CheckRow) -> Int {
+        let key = row.name.replacingOccurrences(of: " ", with: "")
+        return warningOrder.firstIndex(of: key) ?? warningOrder.count
+    }
+
+    /// 从明细里抠出量化分。目前只有纯净度有(`评分 49/100 · 机房 · …`)。
+    /// 抠不到就只报项名 —— 结论里宁可少一个数字,也不能自己编一个。
+    private static func shortScore(_ detail: String) -> String? {
+        guard let hit = detail.range(of: "评分 ") else { return nil }
+        let digits = detail[hit.upperBound...].prefix { $0.isNumber }
+        return digits.isEmpty ? nil : String(digits)
+    }
+
+    /// 同一段文字里的那个数字，返回 Int。
+    private static func measuredScore(_ detail: String) -> Int? {
+        shortScore(detail).flatMap(Int.init)
+    }
+
+    // 这里曾经有一条 cappedByMeasured（总分 = min(扣分结果, 各实测分)）。
+    // 它解决了「88 分 vs IP 49 分」那一次，但代价是总分**等于**纯净度分 ——
+    // 圈里那个数字成了 IP 分的复制品，不再是「整体」。用户第二次反馈的
+    // 「不能只是拿 ip 纯净度做评分」说的就是这件事。现在换成四维加权:
+    // 纯净度仍然是最重的一项（40 分里按实测折算），但不再是唯一决定项。
+
+    /// 检查项名归一:界面用「IP 与上次一致」、检查协议用「IP一致」、测试夹具又用「IP纯净度」。
+    /// 加权表按归一后的名字取项 —— 三种写法必须落到同一个 key,否则某一项在线上永远
+    /// 匹配不到、静默不扣分,而测试却是绿的。
+    static func key(_ name: String) -> String {
+        switch name.replacingOccurrences(of: " ", with: "") {
+        case "IP一致", "IP与上次一致": return "IP一致"
+        case "TUN网卡": return "TUN网卡"
+        case "IPv6关闭": return "IPv6"
+        case "DNS走隧道": return "DNS"
+        case "IP纯净度": return "IP纯净度"
+        case "ASN属性": return "ASN属性"
+        case "保镖在线": return "保镖"
+        case "规则置顶": return "规则置顶"
+        case "客户端语言": return "客户端语言"
+        case "生态可达性": return "生态可达性"
+        case "代理内核": return "代理内核"
+        case "出口IP": return "出口IP"
+        default: return name.replacingOccurrences(of: " ", with: "")
+        }
+    }
+
+    /// 四个维度各自的**扣分上限**，加起来正好 100。
+    ///
+    /// 为什么分维度而不是「每个警告扣 6 分」:后者把「出口是转租机房、纯净度 49」
+    /// 和「时区格式不对」当成同一件事,两项都只值 6 分。实测反馈就是这个 ——
+    /// 「ip 评分这么低但是还有 88 分」。
+    ///
+    /// 权重的依据取自同类风控产品的公开口径（IPQS / Scamalytics / ip.net.coffee）:
+    ///   · 归属属性是**最大的一项**。机房/托管段对消费级产品天然高风险,
+    ///     实测即使是从未使用过的新机房 IP,初始风险也已到 50 上下;
+    ///   · 匿名化要分类型。Tor > 住宅代理 > 商业 VPN > 机房;
+    ///   · 地理位置完整性(时区/地区/语言和出口对不对得上)是独立一档,
+    ///     因为它是「同一时刻自相矛盾」的证据,而不是「这个 IP 好不好」;
+    ///   · 它们都不给单一因子一票否决 —— 所以这里也没有任何一项能独占 100 分。
+    ///
+    /// 我们的四维对应到 Claude 的场景:
+    ///   身份 40  —— 出口本身:纯净度实测 + 是否机房 + 出不出海
+    ///   隔离 30  —— 本机会不会把真实地址漏出去:IPv6 / DNS / WebRTC / TUN
+    ///   一致 15  —— 自相矛盾:时区 / 地区 / 客户端语言 / 生态可达性
+    ///   守护 15  —— 这套护栏本身还生效吗:保镖 / 规则置顶 / 内核
+    enum Weight {
+        static let identityCap = 40
+        static let isolationCap = 30
+        static let consistencyCap = 15
+        static let guardCap = 15
+    }
+
+    /// 分维度扣分。返回 (总扣分, 各维度明细) —— 明细只用于注释与调试,
+    /// 界面里不展示,免得又变成一屏数字。
+    static func deductions(_ rows: [CheckRow]) -> (total: Int, breakdown: [String: Int]) {
+        func row(_ key: String) -> CheckRow? { rows.first { self.key($0.name) == key } }
+        func penalty(_ key: String, _ weight: Int) -> Int {
+            guard let r = row(key) else { return 0 }
+            return r.state == .ok || r.state == .pending ? 0 : weight
+        }
+
+        // 身份：纯净度按「离满分的距离」线性折算，这是唯一有实测分的项；
+        // 其余是离散事实（机房、出口在漂）。
+        var identity = 0
+        if let purity = row("IP纯净度"), purity.state != .ok,
+           let measured = measuredScore(purity.detail) {
+            identity += Int((Double(100 - measured) * 0.4).rounded())
+        } else {
+            identity += penalty("IP纯净度", 6)   // 没拿到分，也说明这一项没验成
+        }
+        identity += penalty("ASN属性", 6)
+        identity += penalty("IP一致", 4)
+        identity = min(identity, Weight.identityCap)
+
+        let isolation = min(
+            penalty("IPv6", 10) + penalty("DNS", 8) + penalty("WebRTC", 12) + penalty("TUN网卡", 10),
+            Weight.isolationCap)
+
+        let consistency = min(
+            penalty("时区", 6) + penalty("地区", 4) + penalty("客户端语言", 3) + penalty("生态可达性", 4),
+            Weight.consistencyCap)
+
+        let guardScore = min(
+            penalty("保镖", 8) + penalty("规则置顶", 7) + penalty("代理内核", 8),
+            Weight.guardCap)
+
+        let breakdown = ["身份": identity, "隔离": isolation,
+                         "一致": consistency, "守护": guardScore]
+        return (breakdown.values.reduce(0, +), breakdown)
+    }
+
+    /// 纯函数:输入检查结果,输出分数和一句话结论。
     ///
     /// 硬性项是「Claude 能不能启动」的开关,不是可以慢慢扣的分项 ——
     /// 代理内核没起来还挂着 85 分,等于告诉用户「小毛病,能用」,而实际是起不来。
-    /// 所以硬性项一失败就直接塌到 30 分以下,提示项才按项扣。
+    /// 所以硬性项一失败就直接塌到 30 分以下,其余项走四维加权。
     static func evaluate(_ rows: [CheckRow]) -> HealthSummary {
         let hard = rows.filter { !$0.canDisable }
         let soft = rows.filter { $0.canDisable }
@@ -89,7 +244,9 @@ struct HealthSummary {
                                  headline: "\(first.name)未通过\(tail) · Claude 不会启动")
         }
 
-        let noticeScore = max(0, min(100, 100 - hardWarn * 12 - softBad.count * 8 - softWarn * 6))
+        // 四维加权（见 Weight）。之前是「每条警告扣 6 分」，一条提示最多 6 分，
+        // 于是「出口是转租机房、纯净度 49」和「时区格式不对」等价 —— 88 分就是这么来的。
+        let noticeScore = max(0, 100 - deductions(rows).total)
 
         if let first = softBad.first {
             return HealthSummary(score: noticeScore, level: .notice, badge: "可以启动",
@@ -98,8 +255,26 @@ struct HealthSummary {
 
         let notices = hardWarn + softWarn
         if notices > 0 {
+            // 结论要点名最重的那一项,而不是笼统地报「3 项建议处理」。
+            // 实测:出口是转租机房、纯净度 49 分,而同一屏另外两个警告只是
+            // 「IP 变了 4 次」和「疑似机房」;只报项数会把这些压成同一句话,
+            // 用户读完「3 项建议处理,不影响使用」就不再往下看了。
+            // 硬性项的警告优先:它们本来就是拦启动的项,松动了等于接近失守。
+            let pool = hardWarn > 0
+                ? hard.filter { $0.state == .warn }
+                : soft.filter { $0.state == .warn }
+            if let worst = pool.min(by: { severity($0) < severity($1) }) {
+                var title = worst.name
+                if let score = shortScore(worst.detail) { title += " \(score) 分" }
+                let tail = notices > 1 ? " · 另有 \(notices - 1) 项提示" : ""
+                // 「不影响启动」而不是「不影响使用」:不拦启动是事实,
+                // 但「机房出口对账号没影响」不是我们能替他打的包票。
+                return HealthSummary(score: noticeScore, level: .notice, badge: "可以启动",
+                                     headline: "\(title)\(tail)，不影响启动")
+            }
+            // 到不了这里:notices > 0 保证 pool 非空。留着只为不崩。
             return HealthSummary(score: noticeScore, level: .notice, badge: "可以启动",
-                                 headline: "\(notices) 项建议处理，不影响使用")
+                                 headline: "\(notices) 项提示，不影响启动")
         }
 
         return HealthSummary(score: 100, level: .ok, badge: "正常",
@@ -115,6 +290,27 @@ struct CoreResult {
 struct AccountStamp: Equatable {
     let size: String
     let date: String
+}
+
+/// 一个槽位「还能不能直接用」。
+///
+/// 这个状态以前根本没有 —— 界面只有「已保存 / 未初始化」，而「已保存」说的是
+/// **档案在不在**，不是**会话还有没有效**。实测两个槽位，快照都在、大小都正常，
+/// 但其中一个的 Cookies 里压根没有 `sessionKey`（只剩设备类 cookie），
+/// 点进去是登录页。用户看见「已保存」，以为能用，切换过去才发现要重新登录。
+///
+/// 判据取 Claude 桌面版自己那份 Chromium Cookies 库里的会话 cookie：
+/// `sessionKey / sessionKeyLC / sessionKeyV3 / sessionKeyV3LC` 任意一条存在且
+/// 未过期即为已登录。不解密内容 —— 只看名字和过期时间，这也足够回答「还能用吗」。
+enum SlotLogin: Equatable {
+    /// 档案不存在 / 读不出来（库被锁、格式变了）。这一档要老老实实显示未知，
+    /// 不能猜成「已登录」，否则又把用户骗一次。
+    case unknown
+    case loggedIn
+    /// 会话 cookie 还在，但已经过期。和「没有」分开显示：前者是「太久没开过」，
+    /// 后者是「这个槽位从来没登过」。
+    case expired
+    case loggedOut
 }
 
 /// 一次「真的动过手」的拦截。来自 `~/.claude-switcher/incidents.log`,
@@ -160,26 +356,38 @@ private final class ProcessDeadline {
 }
 
 final class VM: ObservableObject {
+    // 图标怎么挑的：一列图标排在一条竖轴上，人眼对的是**着墨包围盒**和**着墨量**，
+    // 不是字号。SF Symbols 同名同号，实际着墨大小差得很远 —— 换之前量过：
+    //   eye.slash 19×12、textformat 15×9、hand.raised 11×15、antenna… 14×12(5.8%)，
+    //   而 cpu 只有 12×12。同一列里 19 宽和 11 宽并排，怎么调字号都"不齐"。
+    //
+    // 现在这一列的指标（13pt / medium，32×32 画布）：宽 12–14 / 高 12–14 / 着墨 6.1–10.1%。
+    // 换图标前请先量：`.font(.system(size: 13, weight: .medium))` 下着墨包围盒落在
+    // 12–14pt、着墨量 6–10%，且**不要再出现「圆环里包一个符号」**（圆环外径大、
+    // 内部空，光学重量和实心小图不是一回事）。
     @Published var rows: [CheckRow] = [
         CheckRow(name: "代理内核", icon: "cpu", canDisable: false),
-        CheckRow(name: "TUN 网卡", icon: "network", canDisable: false),
+        CheckRow(name: "TUN 网卡", icon: "externaldrive.connected.to.line.below", canDisable: false),
         CheckRow(name: "出口 IP", icon: "globe", canDisable: false),
-        CheckRow(name: "IP 与上次一致", icon: "checkmark.seal", canDisable: true),
+        CheckRow(name: "IP 与上次一致", icon: "equal.square", canDisable: true),
         CheckRow(name: "时区", icon: "clock", canDisable: false),
         CheckRow(name: "地区", icon: "flag", canDisable: false),
         CheckRow(name: "IPv6 关闭", icon: "6.circle", canDisable: false),
-        CheckRow(name: "DNS 走隧道", icon: "magnifyingglass", canDisable: true),
-        CheckRow(name: "WebRTC", icon: "eye.slash", canDisable: true),
-        CheckRow(name: "保镖在线", icon: "hand.raised", canDisable: false),
-        CheckRow(name: "规则置顶", icon: "list.number", canDisable: false),
-        CheckRow(name: "客户端语言", icon: "textformat", canDisable: true),
+        CheckRow(name: "DNS 走隧道", icon: "arrow.triangle.swap", canDisable: true),
+        CheckRow(name: "WebRTC", icon: "antenna.radiowaves.left.and.right.slash", canDisable: true),
+        CheckRow(name: "保镖在线", icon: "checkmark.circle", canDisable: false),
+        CheckRow(name: "规则置顶", icon: "checklist", canDisable: false),
+        CheckRow(name: "客户端语言", icon: "character.bubble", canDisable: true),
         CheckRow(name: "ASN 属性", icon: "building.columns", canDisable: true),
-        CheckRow(name: "生态可达性", icon: "antenna.radiowaves.left.and.right", canDisable: true),
+        CheckRow(name: "IP 纯净度", icon: "gauge.medium", canDisable: true),
+        CheckRow(name: "生态可达性", icon: "chart.line.uptrend.xyaxis", canDisable: true),
     ]
     @Published var phase: Phase = .checking
     @Published var current = "?"
     @Published var archived: Set<String> = []
     @Published var stamps: [String: AccountStamp] = [:]
+    /// 每个槽位「会话还有没有效」。由 Cookies 库直接读，和脚本的 status 并行取。
+    @Published var slotLogin: [String: SlotLogin] = [:]
     @Published var banner = ""
     @Published var note = ""
     @Published var fingerprint = ""
@@ -189,6 +397,12 @@ final class VM: ObservableObject {
     @Published var showUpdateSheet = false
     @Published private(set) var coreMissing = false
     @Published private(set) var currentClient = ""
+    /// Claude 桌面版此刻是否在运行。
+    ///
+    /// 槽位卡上原来写的是「当前账号 A」—— 那是**切换器的指针**，不是用户的
+    /// 登录状态。Claude 没打开、甚至没登录的时候，界面照样宣称「当前账号」，
+    /// 用户会以为自己在用某个账号。改成按运行态说事：没开就是「上次使用」。
+    @Published private(set) var claudeRunning = false
     @Published private(set) var isSwitchingClient = false
     @Published var disabledChecks: Set<String> = []
     @Published var allowOptionalFailures = false
@@ -199,6 +413,13 @@ final class VM: ObservableObject {
     /// 运行期看门狗已经动手停了 Claude。与「检查没过」不是一回事:
     /// 后者是拉起前的门禁,前者是已经放行之后又被抓回来,必须显眼到不可能忽略。
     @Published private(set) var intercepted = false
+    /// 最近一次熔断的真实结果，由脚本的 KILLSTATE 行给出。
+    /// nil = 还没熔断过，或者装的是不认这条的老脚本 —— 两种都要能降级。
+    /// was：熔断那一刻 Claude 在不在跑；still：处理完还在不在跑。
+    @Published private(set) var stopWasRunning: Bool?
+    @Published private(set) var stopStillRunning: Bool?
+    /// 最近一次熔断的原因原文，标题里只放结论，原因放在横幅里。
+    @Published private(set) var stopReason = ""
     /// 拦截历史,最新的在前。脚本写 incidents.log,这里只读。
     @Published private(set) var incidents: [Incident] = []
     /// 单项修复回执:检查项名 → 修复中/已修复/修不了。修复结束后保留一小会儿,
@@ -232,6 +453,7 @@ final class VM: ObservableObject {
         ("WebRTC", "WebRTC"),
         ("客户端语言", "客户端语言"),
         ("ASN属性", "ASN 属性"),
+        ("IP纯净度", "IP 纯净度"),
         ("生态可达性", "生态可达性"),
     ]
 
@@ -368,7 +590,8 @@ final class VM: ObservableObject {
         "IP一致": "IP 与上次一致", "时区": "时区", "地区": "地区",
         "IPv6": "IPv6 关闭", "DNS": "DNS 走隧道", "WebRTC": "WebRTC",
         "保镖": "保镖在线", "规则置顶": "规则置顶",
-        "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "生态可达性": "生态可达性",
+        "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "IP纯净度": "IP 纯净度",
+        "生态可达性": "生态可达性",
     ]
 
     /// 单行预览:只改观感,不参与判定。最终结果由 done 里的全量解析覆盖。
@@ -429,6 +652,11 @@ final class VM: ObservableObject {
         // 重新检查前先撤掉旧的守护:否则它会在检查过程中按旧结论把 Claude 关掉。
         stopWatch()
         intercepted = false
+        // 熔断的三条事实跟着一起清。不清的话，重新检查通过之后
+        // 标题还会挂着「已熔断并关闭 Claude」—— 说的是一件已经过去的事。
+        stopWasRunning = nil
+        stopStillRunning = nil
+        stopReason = ""
         loadIncidents()
         loadRTT()
         if !coreAvailable() { markCoreMissing(); return }
@@ -479,8 +707,19 @@ final class VM: ObservableObject {
             lastBeat = Date()
             return
         }
+        // 脚本在停 Claude 的那一步会报三条事实：熔断时在不在跑、处理完还在不在。
+        // 没有这条的老脚本不会发，stopWasRunning 保持 nil，文案自动退回旧说法。
+        if line.hasPrefix("KILLSTATE:") {
+            let parts = line.dropFirst("KILLSTATE:".count).split(separator: ":")
+            if parts.count == 2 {
+                stopWasRunning = parts[0] == "1"
+                stopStillRunning = parts[1] == "1"
+            }
+            return
+        }
         guard line.hasPrefix("STOP:") else { return }
         let reason = String(line.dropFirst(5))
+        stopReason = reason
         watchStopping = true
         watchActive = false
         // 不动 isBusy:看门狗停 Claude 与界面上的修复/切换是两条线,
@@ -488,13 +727,34 @@ final class VM: ObservableObject {
         phase = .failed
         intercepted = true
         lastCheckSummary = "已拦截"
-        banner = "已自动停止 Claude：\(reason)"
+        // 以前这里无条件写「已自动停止 Claude」。脚本其实在停之前就 pgrep 过，
+        // 只是没把结果传上来 —— 于是 Claude 没开、或者 pkill 之后还在跑，
+        // 界面说的都是同一句。现在按真实结果分三种说法。
+        banner = interceptionHeadline(reason: reason)
         // 脚本刚写完这条记录,立刻读回来 —— 界面上的「异常记录」要和日志同步,
         // 不能等下次重新检查才出现。
         loadIncidents()
         // 界面横幅只在窗口开着时有用,而这是「已经在用」的时候出的问题 ——
         // 用户多半没开窗口。必须推一条系统通知,否则等于没提醒。
-        notify(title: "已自动停止 Claude", body: reason)
+        notify(title: interceptionShortTitle, body: reason)
+    }
+
+    /// 熔断的三种真实结局，一句话说清「Claude 到底关掉没有」。
+    /// 旧脚本不发 KILLSTATE，这时退回原来那句中性说法，不假装知道。
+    var interceptionShortTitle: String {
+        guard let was = stopWasRunning else { return "已自动停止 Claude" }
+        if stopStillRunning == true { return "已拦截，但 Claude 没关掉" }
+        return was ? "已拦截并关闭 Claude" : "已拦截（Claude 当时没开）"
+    }
+
+    private func interceptionHeadline(reason: String) -> String {
+        guard let was = stopWasRunning else { return "已自动停止 Claude：\(reason)" }
+        if stopStillRunning == true {
+            return "已拦截，但 Claude 仍在运行，没能关掉：\(reason)"
+        }
+        return was
+            ? "已拦截并关闭 Claude：\(reason)"
+            : "已拦截（拦截时 Claude 没有在运行）：\(reason)"
     }
 
     /// 走 osascript 而不是 UNUserNotificationCenter:这个 App 是 ad-hoc 签名,
@@ -502,7 +762,7 @@ final class VM: ObservableObject {
     private func notify(title: String, body: String) {
         let clean = body.replacingOccurrences(of: "\\", with: " ")
             .replacingOccurrences(of: "\"", with: "'")
-        let script = "display notification \"\(clean)\" with title \"Claude 切换器\" subtitle \"\(title)\" sound name \"Basso\""
+        let script = "display notification \"\(clean)\" with title \"Claude 环境检查器\" subtitle \"\(title)\" sound name \"Basso\""
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
@@ -602,6 +862,33 @@ final class VM: ObservableObject {
             self.isBusy = false
         }
     }
+
+    /// 跟踪 Claude 桌面版的运行态。用 NSWorkspace 的启停通知，不轮询进程表 ——
+    /// 界面每次刷新都 pgrep 一遍，代价比收益大。
+    func trackClaudeProcess() {
+        claudeRunning = Self.isClaudeRunning()
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification,
+                     NSWorkspace.didTerminateApplicationNotification] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                let running = Self.isClaudeRunning()
+                guard running != self.claudeRunning else { return }
+                self.claudeRunning = running
+            }
+        }
+    }
+
+    static func isClaudeRunning() -> Bool {
+        NSWorkspace.shared.runningApplications.contains {
+            $0.bundleIdentifier == "com.anthropic.claudefordesktop"
+        }
+    }
+
+    #if CLAUDE_SWITCHER_TESTS
+    /// 测试用：直接设定运行态。测试进程里没有 Claude，靠监听永远拿不到 true。
+    func setClaudeRunningForTest(_ value: Bool) { claudeRunning = value }
+    #endif
 
     private func checkEnvironment(done: @escaping (Bool) -> Void) {
         if !coreAvailable() {
@@ -747,17 +1034,106 @@ final class VM: ObservableObject {
         current = account == "none" ? "未初始化" : account
         stamps = parsed
         archived = known
+        // 登录态要跟着切槽位/归档变化重算：切完之后实时档案换了一份，
+        // 「当前槽位」的会话有效性也就换了。
+        refreshSlotLogin()
         return true
     }
 
     static let accountLetters = ["A", "B", "C", "D"]
 
+    // MARK: - 槽位登录态
+    //
+    // 只读 Claude 桌面版那份 Chromium Cookies 库里的**会话 cookie 名字与过期时间**，
+    // 不解密内容、不碰 token。回答的是一个问题：「切过去还要不要重新登录」。
+    //
+    // 为什么不放进核心脚本：脚本的输出契约（current/accounts/accX）是给窗口、安装器、
+    // 更新链路共用的，加字段要同步改 SHA256SUMS、旧版兼容分支和一堆测试。
+    // 这件事纯粹是界面的显示需求，就在界面里做。
+
+    /// 「当前槽位」要看实时档案，其余槽位看各自的存档副本。
+    /// 切槽位的动作就是把存档整份拷到实时目录，所以两边结构一致。
+    static func cookiesPath(for letter: String, current: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        if letter == current {
+            return home.appendingPathComponent("Library/Application Support/Claude/Cookies").path
+        }
+        return home.appendingPathComponent(".claude-switcher/accounts/\(letter)/Cookies").path
+    }
+
+    /// Chromium 把过期时间存成「1601-01-01 起算的微秒数」。
+    private static let chromiumEpochOffset: Double = 11_644_473_600
+
+    static func probeSlotLogin(_ letter: String, current: String) -> SlotLogin {
+        let primary = cookiesPath(for: letter, current: current)
+        let fallback: String? = letter == current
+            ? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".claude-switcher/accounts/\(letter)/Cookies").path
+            : nil
+        if let state = readLogin(from: primary) { return state }
+        // 实时档案读不出来（Claude 正在写、库被锁）时退回存档副本 ——
+        // 比直接报「未知」有用，而且存档副本就是上次切换时的那份，
+        // 对「要不要重新登录」这个问题通常仍然成立。
+        if let fallback, let state = readLogin(from: fallback) { return state }
+        return .unknown
+    }
+
+    /// 读不出来返回 nil（调用方据此降级），读得出来返回确定的状态。
+    private static func readLogin(from path: String) -> SlotLogin? {
+        guard FileManager.default.isReadableFile(atPath: path) else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        p.arguments = [
+            "-readonly", path,
+            "select count(*), coalesce(max(expires_utc),0) from cookies where name like 'sessionKey%';",
+        ]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = text.split(separator: "|")
+        guard parts.count == 2, let count = Int(parts[0]), let raw = Double(parts[1]) else { return nil }
+        guard count > 0 else { return .loggedOut }
+        // 0 = 会话级 cookie（关掉 Claude 就没了，但此刻确实有效）。
+        guard raw > 0 else { return .loggedIn }
+        let expires = Date(timeIntervalSince1970: raw / 1_000_000 - chromiumEpochOffset)
+        return expires > Date() ? .loggedIn : .expired
+    }
+
+    func refreshSlotLogin() {
+        let current = self.current
+        guard current != "?" else { return }
+        DispatchQueue.global(qos: .utility).async {
+            var map: [String: SlotLogin] = [:]
+            for letter in Self.accountLetters {
+                map[letter] = Self.probeSlotLogin(letter, current: current)
+            }
+            DispatchQueue.main.async { self.slotLogin = map }
+        }
+    }
+
     /// 脚本真的能自动处理的检查项。不在这个集合里的(出口 IP、IP 一致性、
     /// ASN、生态可达性)只能靠人换节点/换线路,给按钮等于给假承诺。
+    ///
+    /// 「DNS 走隧道」曾经在这个集合里,但 fix() 那一段只刷了解析缓存、不改解析路径,
+    /// 它自己打印的就是「一键修复改不了这项」。界面给按钮、hero 还写「点修复即可」,
+    /// 用户点完只会拿到一句修不了 —— 承诺和能力对不上。现在移出可修清单,
+    /// 改由检查项自己的 detail 写明「去客户端把 DNS 设为隧道/DoH」。
     static let fixableNames: Set<String> = [
         "代理内核", "TUN 网卡", "时区", "地区", "IPv6 关闭",
-        "DNS 走隧道", "WebRTC", "保镖在线", "规则置顶", "客户端语言",
+        "WebRTC", "保镖在线", "规则置顶", "客户端语言",
     ]
+
+    /// 修不了、但换节点/换线路就能解决的项。剩下的那些(DNS 没走隧道)得去
+    /// 客户端改设置,笼统写成「换节点」会把用户支到错的方向。
+    static let nodeBoundNames: Set<String> = [
+        "ASN 属性", "IP 纯净度", "IP 与上次一致", "生态可达性",
+    ]
+
 
     private func updateClient(_ result: CoreResult) {
         guard result.succeeded else { return }
@@ -896,18 +1272,31 @@ final class VM: ObservableObject {
                 self.isBusy = false
                 return
             }
+            // 脚本跑完了,还有行挂着「修复中」的转圈 —— 那说明脚本**从头到尾没提过这一项**
+            // (它只对真动过手的组打勾)。转圈不会自己停:fixStates 要等下一次 fixAll
+            // 才清空,于是用户会盯着一行永远转下去的「修复中」,判定成「点了半天没修好」。
+            // 这里直接摘掉状态牌,让后面的复查给出真实结果 —— 不编「已修复」。
+            for (name, state) in self.fixStates where state == .running {
+                self.fixStates[name] = nil
+            }
             let done = self.fixStates.filter { $0.value.isDone }.count
+            let notes = self.fixStates.filter { $0.value.isNote }.count
             let failedRows = self.fixStates.filter { $0.value.isFailed }.map(\.key)
+            // 「未能验证」单独数一句:它既不是修好了,也不是要用户动手。
+            // 混进「已修复」是虚报,混进「需手动」是甩锅。
+            let noteTail = notes > 0 ? " · \(notes) 项未能验证" : ""
             if !failedRows.isEmpty {
                 // 点名比数数有用:用户下一步就是去改这几项,直接告诉他改哪几个。
                 let names = failedRows.count <= 3
                     ? failedRows.joined(separator: "、")
                     : "\(failedRows.prefix(3).joined(separator: "、")) 等 \(failedRows.count) 项"
                 self.fixNotice = done > 0
-                    ? "\(done) 项已修复 · \(names) 需要你手动处理"
-                    : "\(names) 需要你手动处理"
+                    ? "\(done) 项已修复 · \(names) 需要你手动处理\(noteTail)"
+                    : "\(names) 需要你手动处理\(noteTail)"
             } else if done > 0 {
-                self.fixNotice = "\(done) 项已修复"
+                self.fixNotice = "\(done) 项已修复" + noteTail
+            } else if notes > 0 {
+                self.fixNotice = "\(notes) 项未能验证"
             }
             // 留 1.6 秒让回执可见,再重新检查。立刻复查会把回执清掉,
             // 用户只看到「修复中」一闪而过,不知道到底修好了什么。
@@ -929,6 +1318,17 @@ final class VM: ObservableObject {
     private func applyFixLine(_ line: String) {
         guard line.hasPrefix("FIX:") else { return }
         let text = String(line.dropFirst(4))
+        // ⚠ 要**先判**,而且必须排在 failureWords 前面。
+        // 它是「脚本跑完了,但这一项没法验证」—— 文案里天然会带「无法比对」
+        // 这种字眼,先跑失败词表就会把它判成 ✗ 需手动,让用户去找一个
+        // 根本不存在的手动动作。三种符号各管一档:
+        //   ✓ 修好了 / ✗ 没修成、要你动手 / ⚠ 修没修不知道(非泄漏)
+        if text.contains("⚠") {
+            for name in Self.fixTargets(of: text) {
+                fixStates[name] = .note(Self.fixNote(from: text))
+            }
+            return
+        }
         let failed = text.contains("✗") || Self.failureWords.contains(where: { text.contains($0) })
         let ok = text.contains("✓") && !failed
         guard ok || failed else { return }
@@ -948,7 +1348,7 @@ final class VM: ObservableObject {
     /// 留内容);符号后面是空的就说明没什么可补充的,返回空;整行没有符号的
     /// (「FlClash 未能退出，请手动退出后重试」)就整句留着 —— 那句话本身就是原因。
     static func fixNote(from text: String) -> String {
-        if let i = text.firstIndex(where: { $0 == "✗" || $0 == "✓" }) {
+        if let i = text.firstIndex(where: { $0 == "✗" || $0 == "✓" || $0 == "⚠" }) {
             var rest = String(text[text.index(after: i)...]).trimmingCharacters(in: .whitespaces)
             if rest.hasPrefix("("), rest.hasSuffix(")") {
                 rest = String(rest.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
@@ -960,10 +1360,22 @@ final class VM: ObservableObject {
 
     static func fixTargets(of text: String) -> [String] {
         var names: [String] = []
-        if text.contains("代理内核") || text.contains("TUN") {
+        // 认「TUN 网卡」之前先把 **STUN** 这个词摘掉。
+        //
+        // 这是个子串事故:`STUN` 里含有 `TUN`,而 `text.contains("TUN")` 分不出来。
+        // 实测看到的是——WebRTC 那行报「节点无 IPv4 出口，STUN 只回 IPv4，
+        // 无法比对(非泄漏)」,于是**代理内核和 TUN 网卡两行同时被打上 ✗ 需手动**,
+        // 并且把 WebRTC 的原因原样挂在它们名下。用户看到的是「内核和 TUN 都坏了,
+        // 理由是 STUN 只回 IPv4」——三行说同一件事,而且其中两行是冤枉的。
+        let probe = text.replacingOccurrences(of: "STUN", with: "")
+        if probe.contains("代理内核") || probe.contains("TUN") {
             names += ["代理内核", "TUN 网卡"]
         }
         if text.contains("时区") { names.append("时区") }
+        // 「地区」以前漏在这里:脚本会打 `FIX:地区格式 → en_US ✓`,但没有任何分支
+        // 认领它,于是 fixStates 里那一行永远停在「修复中」,而 done 计数也把它漏掉 ——
+        // 地区是唯一问题时,用户点完修复连一句回执都看不到。
+        if text.contains("地区") { names.append("地区") }
         if text.contains("IPv6") { names.append("IPv6 关闭") }
         if text.contains("保镖") { names.append("保镖在线") }
         if text.contains("DNS") { names.append("DNS 走隧道") }
@@ -1002,7 +1414,7 @@ final class VM: ObservableObject {
             ? "本机交接文档：\(agents)"
             : "本机交接文档：\(agents)（~/.claude-switcher 不存在或其中没有 AGENTS.md，请从仓库根目录读取 AGENTS.md）"
         return """
-        这是「Claude 切换器」的 AI 交接提示词。请先完整阅读交接文档，再开始安装、配置或排障。
+        这是「Claude 环境检查器」的 AI 交接提示词。请先完整阅读交接文档，再开始安装、配置或排障。
 
         仓库地址：https://github.com/huanfine/claude-switcher
         \(agentsLine)
@@ -1083,59 +1495,222 @@ enum ClaudeTheme {
         })
     }
 
-    // 基底:浅色是暖纸,深色是暖炭 —— 不用纯黑,纯黑配陶土橙会发脏
-    static let bgTop = dual((0.984, 0.976, 0.961), (0.110, 0.106, 0.098))      // #FAF9F5 / #1C1B19
-    static let bgBottom = dual((0.957, 0.945, 0.925), (0.086, 0.082, 0.075))   // #F4F1EC / #161513
-    // 卡片面。深色下比底色提亮一档(#2A2723 vs #1C1B19) —— 没有描边之后,
-    // 卡片和背景全靠这点明度差分开,差太小整屏就糊成一片。
-    // 卡片面。深色下要和底色拉开到 1.25:1 才立得住 —— 去掉描边之后,
-    // 「这是一张卡」全靠这点明度差。之前 #2A2725 对 #1C1B19 只有 1.17:1,
-    // 亮屏能看出一点,夜里亮度调低就彻底糊成一片。
-    static let card = dual((1.000, 1.000, 1.000), (0.184, 0.176, 0.161))       // #FFFFFF / #2F2D29
-    static let cardBorder = dual((0.898, 0.882, 0.855), (0.208, 0.200, 0.184)) // #E5E1DA / #35332E
-    static let divider = dual((0.941, 0.929, 0.910), (0.173, 0.165, 0.149))    // #F0ECE8 / #2C2A26
-    static let iconWell = dual((0.965, 0.953, 0.937), (0.220, 0.212, 0.196))   // #F6F3EF / #38352F
-    /// 槽位面。比卡片再退一档:浅色下是浅暖灰,深色下是提亮两档的炭。
-    /// 没有描边之后,槽位和卡片全靠这一档明度差分开 —— 用 iconWell 不够,
-    /// 深色下它和 card 只差 0.01,四个槽位会完全消失。
-    static let slotWell = dual((0.953, 0.941, 0.925), (0.204, 0.196, 0.180))   // #F3F0EC / #34322E
+    // MARK: 表面
+    //
+    // 只有两种:平底色 + 白卡。没有渐变、没有光晕、没有第三种表面。
+    // 工具界面是平的 —— 一层 linear 渐变加一层 radial 光晕,是「展示页」的手法,
+    // 每天看一百遍的人只会觉得脏。
+    //
+    // 底色的亮度是按参照图实测定的,不是凭感觉:参照图整页背景的区域中位数是
+    // (249,248,246)。上一版 #F4F2EE 是 244,比它深 5 级 —— 一整屏铺开之后,
+    // 白卡像是浮在一块米色的板子上,而不是浮在「纸白」上,所以整体偏重。
+    // 抬到 249 之后白卡与底色的差从 11 级降到 6 级,卡片之间的分离改由阴影承担
+    // （这也是参照图的做法:它的底 249 / 卡 251 只差 2 级,全靠影子分层）。
+    static let bg = dual((0.976, 0.973, 0.965), (0.106, 0.102, 0.094))          // #F9F8F6 / #1B1A18
+    static let card = dual((1.000, 1.000, 1.000), (0.176, 0.169, 0.157))        // #FFFFFF / #2D2B28
+    /// 卡内凹槽:空槽位、图标块、输入框。比卡片低一档,不描边。
+    static let inset = dual((0.965, 0.957, 0.945), (0.137, 0.132, 0.122))       // #F6F4F1 / #23211F
+    /// 唯一的分隔线颜色。用得越少越好 —— 分组靠间距,不靠线。
+    static let hairline = dual((0.910, 0.898, 0.882), (0.216, 0.208, 0.196))    // #E8E5E1 / #373532
 
-    // 字体色阶
-    static let ink = dual((0.165, 0.153, 0.141), (0.949, 0.937, 0.914))        // #2A2724 / #F2EFE9
-    static let muted = dual((0.455, 0.435, 0.412), (0.604, 0.580, 0.549))      // #746F69 / #9A948C
+    // MARK: 三级灰(每一档都过 WCAG AA 4.5:1)
+    //
+    // 只有三档。之前是「一个 muted 加十几种 opacity」,同一屏里出现五六种灰度,
+    // 眼睛分不清哪一档代表什么,整屏就显脏。
+    //
+    // 三级之间要**等距**,不是「一级很深、后两级挤在一起」。原来 muted 是 6.8:1,
+    // 换成亮度看:ink L*11 / muted L*39 / faint L*49 —— 第一跳到 28 级、第二跳只有
+    // 10 级。屏幕上的结果就是「标题是黑,其余全是差不多的浅灰」,中间那一级立不住,
+    // 读起来像只有两级。这正是「文字颜色的层级不够明显」的来源。
+    //
+    // 现在把 muted 往背景反方向推(A 候选),让三档在对比度上近似**每档减半**:
+    //   浅色  16.8 : 8.8 : 4.6   亮度 L* 11 / 32 / 49  → 跳 21 / 17
+    //   深色  12.3 : 7.5 : 4.7   亮度 L* 95 / 77 / 61  → 跳 18 / 15
+    // 浅色往深推、深色往浅推 —— 同一句「次级色远离底色」,两种外观都是一条规则。
+    //
+    // faint 不能更浅:它是 12–13pt 的注脚,4.6:1 已经是 AA 小字的下限。
+    // 所以能动的只有中间那一档,这也是它必须动的原因。
+    static let ink = dual((0.122, 0.114, 0.102), (0.949, 0.937, 0.914))         // #1F1D1A / #F2EFE9 16.8:1
+    static let muted = dual((0.310, 0.290, 0.267), (0.769, 0.737, 0.702))       // #4F4A44 / #C4BCB3  8.8:1
+    static let faint = dual((0.478, 0.455, 0.424), (0.604, 0.576, 0.541))       // #7A746C / #9A938A  4.6:1
 
-    // Claude 标志性陶土橙。深色下提亮,否则在炭底上糊成一团
-    static let terracotta = dual((0.847, 0.447, 0.329), (0.878, 0.541, 0.424)) // #D87254 / #E08A6C
-    static let terracottaDeep = dual((0.761, 0.369, 0.259), (0.937, 0.612, 0.482)) // #C25E42 / #EF9C7B
-    static let terracottaTint = dual((0.847, 0.447, 0.329), (0.878, 0.541, 0.424)).opacity(0.12)
+    // MARK: 语义色
+    //
+    // 只落在小号文字和图标上,**不铺底、不做彩色 pill**。
+    // 铺底的彩色块是最典型的「AI 感」:颜色被当成装饰,一屏五六个色块,
+    // 真正异常的那条反而淹在里面。
+    static let brand = dual((0.847, 0.447, 0.329), (0.878, 0.541, 0.424))       // #D87254 / #E08A6C 图标/圆环
+    static let brandText = dual((0.706, 0.325, 0.184), (0.910, 0.631, 0.514))   // #B4532F / #E8A183 4.98:1
+    static let ok = dual((0.180, 0.490, 0.322), (0.435, 0.749, 0.557))          // #2E7D52 / #6FBF8E 5.2:1
+    static let warn = dual((0.651, 0.373, 0.055), (0.878, 0.643, 0.361))        // #A65F0E / #E0A45C 5.0:1
+    static let bad = dual((0.761, 0.282, 0.212), (0.878, 0.439, 0.361))         // #C24836 / #E0705C 4.9:1
 
-    // 状态色
-    static let success = dual((0.180, 0.490, 0.322), (0.435, 0.749, 0.557))    // #2E7D52 / #6FBF8E
-    static let warning = dual((0.722, 0.431, 0.094), (0.878, 0.643, 0.361))    // #B86E18 / #E0A45C
-    static let warningBorder = dual((0.961, 0.863, 0.718), (0.322, 0.259, 0.157))
-    static let error = dual((0.761, 0.282, 0.212), (0.878, 0.439, 0.361))      // #C24836 / #E0705C
+    // 旧名字保留,只为不惊动尚未迁到的角落;新代码不要再引用。
+    static let bgTop = bg
+    static let bgBottom = bg
+    static let iconWell = inset
+    static let slotWell = inset
+    static let divider = hairline
+    static let cardBorder = hairline
+    static let terracotta = brand
+    static let terracottaDeep = brandText
+    static let terracottaTint = brand.opacity(0.10)
+    static let success = ok
+    static let warning = warn
+    static let warningBorder = hairline
+    static let error = bad
+}
+
+// MARK: - 字阶
+//
+// 一套字号，五个档位；一套字重，三档；行距按中文给。
+// 下面是**唯一真源**，界面里不再出现裸的 size/weight 字面量。
+//
+// 【一】字体族
+//   SF Pro（拉丁与数字）+ PingFang SC（中文），两者都是系统字体、系统自动按字符
+//   切换，不打包任何字体文件 —— App 里嵌字库等于分发字体，中文字体动辄几 MB，
+//   授权和体积两道坑，这里一道都不碰。
+//   唯一的例外是**显示级数字**（圆环里的分数、槽位字母 A/B/C）用 SF Rounded：
+//   大字号下圆角数字的轮廓更饱满，和圆环的圆是同一套形状语言。它不是第二套
+//   字体，是同一家族的 rounded 变体，且只出现在这两处。
+//
+// 【二】字号：本机实测 NSFont.preferredFont(forTextStyle:) 的值
+//   largeTitle 26 / title1 22 / title2 17 / title3 15
+//   headline 13 bold / body 13 / callout 12 / subheadline 11 / caption 10
+//
+//   26  semibold  主数字（圆环分数，一屏只有一个）   = largeTitle
+//   22  semibold  次级数字（弹窗里的单指标）         = title1
+//   17  semibold  页面 / 卡片 / 分区标题             = title2
+//   13  →        正文、行名、读数                   = body
+//   12  →        元信息、时间戳、标签               = 系统 11 / 10，中文会糊，守 12
+//
+//   12 与 13 只差 1pt，它们**不算两个层级**：13 是「要读的内容」，12 是「注释」，
+//   分开靠的是颜色和位置，不是字号。真按字阶算，一屏只有 26 / 22 / 17 / 13 四级。
+//
+// 【三】字重只有三档：semibold(600) 标题 / medium(500) 强调 / regular(400) 正文。
+//   没有 bold、没有 light。小字上尤其不能用 semibold —— 12pt 的中文一加粗就糊成一团。
+//
+// 【四】行距按中文给：汉字是密实的方块，同样行高在中文里比英文挤。
+//   13pt 正文行距 4（≈1.5 倍行高），12pt 注释行距 3。英文界面常用的 1.2 倍
+//   放到中文这里会粘成一坨。
+//
+// 上一版是 32 / 24 / 17 / 14 / 12：正文比系统大 1pt、主数字大 6pt，
+// 整屏比原生窗口「胖」一圈 —— 这就是「文字大小和系统不一致」的来源。
+enum Type {
+    // 字号（需要参与布局计算的地方用它，别的地方直接用下面的 Font）
+    static let scoreSize: CGFloat = 26
+    static let metricSize: CGFloat = 22
+    static let titleSize: CGFloat = 17
+    static let bodySize: CGFloat = 13
+    static let microSize: CGFloat = 12
+
+    // 行距
+    static let lineGap: CGFloat = 4        // 13pt 正文
+    static let microLineGap: CGFloat = 3   // 12pt 注释
+
+    // 显示级（唯一用 SF Rounded 的两处）
+    static let scoreFont = Font.system(size: scoreSize, weight: .semibold, design: .rounded)
+    static let metricFont = Font.system(size: metricSize, weight: .semibold, design: .rounded)
+    static let slotLetterFont = Font.system(size: titleSize, weight: .semibold, design: .rounded)
+
+    // 标题 / 强调 / 正文 / 注释
+    static let titleFont = Font.system(size: titleSize, weight: .semibold)
+    static let bodyStrongFont = Font.system(size: bodySize, weight: .semibold)
+    static let labelFont = Font.system(size: bodySize, weight: .medium)
+    static let bodyFont = Font.system(size: bodySize)
+    static let microFont = Font.system(size: microSize)
+    static let microLabelFont = Font.system(size: microSize, weight: .medium)
+
+    // 等宽：只给「逐字符对齐本身就是信息」的东西 —— 时间戳、HTTP 状态码、
+    // 域名、日志块。**界面里的值、读数、计数一律用上面的比例字 + .monospacedDigit()**。
+    //
+    // 上一版是按内容判定的：字符串里有 . : / 就走等宽。结果同一列里
+    // 「Clash Verge 运行中」是比例字、「144.172.103.106/US」是等宽 —— 一列两种字形，
+    // 扫下来就是「不齐」。字形是**位置**的属性，不是内容的属性：
+    // 同一列只用一种字形，数字宽窄由 tabular 数字解决，不需要换字体。
+    static let bodyMono = Font.system(size: bodySize, design: .monospaced)
+    static let microMono = Font.system(size: microSize, design: .monospaced)
+    static let microMonoLabel = Font.system(size: microSize, weight: .medium, design: .monospaced)
+}
+
+
+// MARK: - 几何
+//
+// 三档圆角 + 一套间距节奏。之前是 13 档圆角和 23 种 padding ——
+// 「处处 20px」本身就是 AI 感:每样东西看起来同等重要。
+enum Geo {
+    static let cardRadius: CGFloat = 22    // 大卡
+    static let innerRadius: CGFloat = 14   // 卡内块 / 图标块 / 空槽位
+    static let controlRadius: CGFloat = 10 // 按钮 / 控件 / 行底
+    /// 组内
+    static let tight: CGFloat = 6
+    static let inline: CGFloat = 10
+    /// 组间
+    static let group: CGFloat = 32
+    static let gutter: CGFloat = 28        // 主区左右留白
+}
+
+// MARK: - 节奏
+//
+// 清单类界面「齐不齐」几乎全看两件事:所有图标在不在同一条竖轴上,
+// 所有二级文字有没有缩到同一个位置。所以这里不是一堆散落的 padding,
+// 而是一组能相乘的关系:
+//
+//   卡片左右内边距(cardH) + 图标列(icon) + 图标与文字之间(gap) = 文字轴
+//
+// 标题、行名、第二行说明全部落在这一条轴上,读者眼睛只需要跟着一列往下走。
+// 之前第二行说明缩进 26,标题缩进 16,行名缩进 27 —— 三条不同的轴,
+// 每行都在向左轻微地漂,整体就「乱」,但说不出哪里乱。
+enum Rhythm {
+    static let icon: CGFloat = 28          // 图标列宽：卡头是 28×28 块（规范 §3），行内符号居中于同一列
+    static let gap: CGFloat = 8            // 图标 ↔ 文字
+    static let cardH: CGFloat = 14         // 卡头左右
+    static let rowH: CGFloat = 8           // 行左右(悬停底色用)
+    static let listInset: CGFloat = 6      // 行容器相对卡片的内缩
+    static let rowV: CGFloat = 10          // 行上下 —— 呼吸感主要来源
+    static let cardTop: CGFloat = 18
+    static let cardBottom: CGFloat = 14
+    // 文字轴 = cardH + icon + gap = 50。上面那行关系式就是它,不再单列常量 ——
+    // 原来这里有个没人用的 `textAxis = 48`,和真值差 2:一个不参与布局的常量
+    // 写着「文字轴 = 48」,是账本和真源不一致,已删。
+    // 第二行说明的缩进。**必须是 icon + gap**,不能手写 34 ——
+    // 34 比行名左 2pt(量过:行名墨迹 50.0pt、说明 49.0,同号中文比下来就是 2),
+    // 一行说明整段向左错半步,十几行叠起来左边缘就发毛。
+    static let rowIndent: CGFloat = icon + gap
+    /// 行名列宽。值列从这一列之后起排 —— 名字长短不再影响第二列的位置。
+    static let nameColumn: CGFloat = 96
+    // 这里原来还有 actionColumn = 44（行尾固定槽宽）。删掉的原因是它把
+    // 「值」和「对勾」拆成了两条竖线：值 427、勾 478.5，差 51pt。
+    // 行尾现在按内容取宽，值和勾共用一条右导轨。
+}
+
+// MARK: - 动效
+//
+// 三种,不是十二种。工具界面的动效只用来「说明状态变了」,
+// 不是用来表演的:0.12 是颜色/hover,0.2 是状态切换,0.35 是强调(圆环、进度)。
+// 循环动画(扫描弧、心跳涟漪)单独放,它们表达「正在进行」,不属于过渡。
+enum Motion {
+    /// 规范 §4：过渡 ≤140ms，且只过渡颜色类属性。
+    /// 圆环、进度条这类「数值在变」的动画也收进这个区间 ——
+    /// 0.35s 会让分数看起来像在表演，而不是在更新。
+    static let micro: Double = 0.10
+    static let state: Double = 0.14
+    static let emphasis: Double = 0.14
 }
 
 // MARK: - Claude 优雅背景
 
 struct ClaudeBackground: View {
+    // 一个平色,仅此而已。
+    //
+    // 原来这里是「垂直渐变 + 顶部陶土色径向光晕」—— 那是落地页的打光手法。
+    // 工作台背景只需要一个值:它背后没有任何需要被照亮的东西,光晕只是
+    // 让每张卡的边缘脏一点,并且逼着人眼去解析一团没有信息量的明暗。
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [ClaudeTheme.bgTop, ClaudeTheme.bgBottom],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            RadialGradient(
-                colors: [ClaudeTheme.terracotta.opacity(0.04), Color.clear],
-                center: .top,
-                startRadius: 0,
-                endRadius: 400
-            )
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+        ClaudeTheme.bg
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 
@@ -1154,15 +1729,14 @@ struct ClaudeIconButton: View {
             // 无边框,只在 hover 时浮出一块底。四个带框的小方块并排会像
             // 一排工具栏按钮,而它们只是三个次要入口 + 一个重查。
             Image(systemName: systemName)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(disabled ? ClaudeTheme.muted.opacity(0.45)
-                                          : (isHovered ? ClaudeTheme.ink : ClaudeTheme.muted))
+                .font(.system(size: 14, weight: .regular))
+                .foregroundColor(disabled ? ClaudeTheme.faint : (isHovered ? ClaudeTheme.ink : ClaudeTheme.faint))
                 .frame(width: 28, height: 28)
                 .background(
-                    RoundedRectangle(cornerRadius: 7)
-                        .fill(isHovered && !disabled ? ClaudeTheme.iconWell : Color.clear)
+                    RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
+                        .fill(isHovered && !disabled ? ClaudeTheme.inset : Color.clear)
                 )
-                .contentShape(RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous))
         }
         .buttonStyle(.plain)
         .disabled(disabled)
@@ -1188,38 +1762,53 @@ private struct FixActionButton: View {
     var quiet = false
     let action: () -> Void
     @State private var hovered = false
-    @State private var pressed = false
 
+    // 主按钮是墨底白字，不是橙底白字。
+    // 规范只允许「主按钮」有实色填充，且明确是墨底 —— 橙色留给「需要你注意」
+    // 的小字和图标。一个橙色大按钮会把整屏的语义色预算一次花光。
     private var textColor: Color {
-        if prominent || hovered { return .white }
-        return ClaudeTheme.terracottaDeep
+        if prominent { return ClaudeTheme.bg }          // 墨底上的字用页面底色（反色）
+        return ClaudeTheme.brandText
     }
 
     private var fillColor: Color {
-        if prominent || hovered { return ClaudeTheme.terracotta }
-        return quiet ? Color.clear : ClaudeTheme.terracotta.opacity(0.12)
+        if prominent { return ClaudeTheme.ink }
+        // 行内的 quiet 按钮平时只有文字；hover 时给一层极浅底，而不是黑块。
+        if hovered { return ClaudeTheme.inset }
+        return quiet ? Color.clear : ClaudeTheme.inset
     }
 
     var body: some View {
         Button(action: action) {
             Text(label)
-                .font(.system(size: 11.5, weight: .medium))
+                .font(Type.labelFont)
                 .foregroundColor(textColor)
-                .padding(.horizontal, prominent ? 14 : 11)
-                .padding(.vertical, prominent ? 5.5 : 4)
-                .background(Capsule().fill(fillColor))
-                .scaleEffect(pressed ? 0.96 : 1)
-                .contentShape(Capsule())
+                .padding(.horizontal, prominent ? 12 : 9)
+                .padding(.vertical, prominent ? 6 : 4)
+                // 方角 10,不做胶囊。整屏唯一一块实色填充就是主按钮 ——
+                // 规范里只允许「主按钮」有底,其余一律文字。
+                .background(RoundedRectangle(cornerRadius: Geo.controlRadius,
+                                             style: .continuous).fill(fillColor))
+                .contentShape(RoundedRectangle(cornerRadius: Geo.controlRadius,
+                                               style: .continuous))
         }
         .buttonStyle(.plain)
+        // 行内按钮的「字」要和一列结论共用同一条右导轨。
+        //
+        // 量过：右卡所有行尾的右边缘落在 953–954.5pt，只有「修复」停在 945.5pt ——
+        // 差 8.5pt，正好是 label 的 9pt 横向内边距。也就是说标题都对齐了，
+        // 唯独「可以被点的那一行」往里缩了一格；一列扫下来它就是那条歪的。
+        //
+        // 不能把内边距直接删掉：那 9pt 是悬浮高亮的呼吸位，也是点击区。
+        // 负的尾部内边距 = 布局仍占原来的宽度，绘制往外顶 9pt ——
+        // 9 < 行的右侧留白（rowH 8 + listInset 6 = 14），所以既不会碰到卡片边缘，
+        // 也不会吃到隔壁内容。只在行内（quiet）生效，主按钮不动。
+        .padding(.trailing, quiet ? -9 : 0)
         .onHover { inside in
-            withAnimation(.easeOut(duration: 0.12)) { hovered = inside }
+            withAnimation(.easeOut(duration: Motion.micro)) { hovered = inside }
         }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in withAnimation(.easeOut(duration: 0.08)) { pressed = true } }
-                .onEnded { _ in withAnimation(.easeOut(duration: 0.12)) { pressed = false } }
-        )
+        // 按下不再缩放。位移动效是演示稿的语言;一个按钮按下去,
+        // 用户需要的是「它响应了」,而不是「它弹了一下」。
         .accessibilityLabel(label)
     }
 }
@@ -1233,13 +1822,13 @@ private struct GhostTextButton: View {
     var body: some View {
         Button(action: action) {
             Text(label)
-                .font(.system(size: 11.5))
-                .foregroundColor(hovered ? ClaudeTheme.ink : ClaudeTheme.muted)
+                .font(Type.microFont)
+                .foregroundColor(hovered ? ClaudeTheme.ink : ClaudeTheme.faint)
                 .padding(.vertical, 2)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { inside in withAnimation(.easeOut(duration: 0.12)) { hovered = inside } }
+        .onHover { inside in withAnimation(.easeOut(duration: Motion.micro)) { hovered = inside } }
         .accessibilityLabel(label)
     }
 }
@@ -1247,6 +1836,172 @@ private struct GhostTextButton: View {
 /// 统一的卡片壳:一个圆角面,靠「面」本身的明度差和一层极轻的投影浮起来。
 /// 不用描边 —— 一圈 1pt 的线在 1000pt 宽的窗口里会把每张卡切成方盒子,
 /// 整屏看着像表格;去掉之后卡片之间靠留白和层次说话,才是「面」而不是「框」。
+/// 全 App 唯一的卡片外观：22pt 圆角 + 一层「大半径、下沉」的柔影，无描边。
+///
+/// 影子的三个参数不是拍脑袋来的。用设计参照图逐像素量了卡片下沿的衰减曲线：
+/// 参照图阴影相对局部底色只有 Δ4–7，但**扩散到 38pt 才归零**；
+/// 上一版是 Δ7、只扩散 16pt —— 深度一样、长度只有一半，所以每一圈都像
+/// 一条贴边的深色线，这就是「生硬」的来源。
+///
+/// 解法是「加大半径 + 加大下移 + 压低透明度」：r20/y12/.05 实测下沿扩散 33pt
+/// （原来 16pt），峰值仍是 Δ8 没有变重，上沿只剩 Δ3 的一点余量 —— 影子从
+/// 「描了一圈边」变成「落在卡片下面的一团」。
+///
+/// 之前主界面和延迟面板各写各的 —— 主界面是「双层影 + 发丝线描边」，
+/// 面板是「单层 r9 影、不描边」，两张卡片挨着看就是两种材质。
+/// 收成一个 modifier 之后，改一次全局生效，也免得再各调各的又对不上。
+private struct CardSurface: ViewModifier {
+    var radius: CGFloat = Geo.cardRadius
+    var fill: Color = ClaudeTheme.card
+    var shadowRadius: CGFloat = 20
+    var shadowY: CGFloat = 12
+    var shadowAlpha: Double = 0.05
+
+    func body(content: Content) -> some View {
+        content
+            .background(RoundedRectangle(cornerRadius: radius, style: .continuous).fill(fill))
+            .shadow(color: .black.opacity(shadowAlpha), radius: shadowRadius, x: 0, y: shadowY)
+    }
+}
+
+extension View {
+    func cardSurface(radius: CGFloat = Geo.cardRadius,
+                     fill: Color = ClaudeTheme.card,
+                     shadowRadius: CGFloat = 20,
+                     shadowY: CGFloat = 12,
+                     shadowAlpha: Double = 0.05) -> some View {
+        modifier(CardSurface(radius: radius, fill: fill,
+                             shadowRadius: shadowRadius, shadowY: shadowY, shadowAlpha: shadowAlpha))
+    }
+}
+
+// MARK: - 品牌标记
+//
+// 盾牌 + 对号。和 App 图标（assets/icon-gen.swift）用的是同一组控制点，
+// 只是那边按 1024 设计稿、这边按 0–1 归一化。改一处必须同步另一处。
+
+private struct GuardShield: Shape {
+    func path(in rect: CGRect) -> Path {
+        func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: rect.minX + x * rect.width, y: rect.minY + y * rect.height)
+        }
+        var path = Path()
+        path.move(to: p(0.500, 0.000))
+        path.addCurve(to: p(1.000, 0.143), control1: p(0.708, 0.019), control2: p(0.943, 0.075))
+        path.addLine(to: p(1.000, 0.513))
+        path.addCurve(to: p(0.500, 1.000), control1: p(1.000, 0.702), control2: p(0.802, 0.887))
+        path.addCurve(to: p(0.000, 0.513), control1: p(0.198, 0.887), control2: p(0.000, 0.702))
+        path.addLine(to: p(0.000, 0.143))
+        path.addCurve(to: p(0.500, 0.000), control1: p(0.057, 0.075), control2: p(0.292, 0.019))
+        path.closeSubpath()
+        return path
+    }
+}
+
+// 原来这里还有一枚 GuardCheck（对号）。换成星标之后它没有任何引用点了 ——
+// 留着就是一段「看着像在用」的死代码，删掉。对号的路径还在 assets/icon-gen.swift
+// 的历史里（以及下面 GuardMark 的注释里），要回滚不用重画。
+
+/// Claude 的星标。
+///
+/// **几何是从官方图标上量下来的,不是凭印象画的。** 取 Claude.app 里那份
+/// electron.icns 的 1024 稿做极坐标扫描(每 0.25° 找白色最远半径 → 半径剖面,
+/// 峰即射线;再在固定半径横向扫过每根射线,把角宽换成线性宽度),得到:
+///   · **12 根**,角度不等分(8.5°…333°)。等分看着像太阳/齿轮,不均匀才是这枚标;
+///   · 每根**等宽**(不是花瓣形),线性宽度 0.09R…0.21R;
+///   · 端头是斜切的平口,最后约 1.5% 半径收口;
+///   · 中心一块实体毂,半径约 0.30R。
+/// 用像素重合度(IoU)把参数打到 0.86 —— 再往上就是在拟合抗锯齿噪点了。
+///
+/// 上一版是「6 根、圆头、靠描边」的近似,理由写在当时:6 根在 8pt 上比 9 根清楚。
+/// 但用户一眼就看出「中间那不是 Claude 的标」—— 这枚标记的品牌位价值高于那点
+/// 小尺寸清晰度,而且 12 根在 20pt 上并没有比官方更糊。
+private struct ClaudeBurst: Shape {
+    /// (角度°, 长度/最长, 线性宽度/最长, 端头斜切方向)
+    private static let rays: [(deg: CGFloat, len: CGFloat, w: CGFloat, slant: CGFloat)] = [
+        (8.50, 0.881, 0.141, 0.6), (40.25, 0.908, 0.205, -0.5),
+        (79.75, 0.881, 0.131, 0.5), (103.00, 0.899, 0.131, -0.7),
+        (133.25, 0.908, 0.099, 0.4), (149.25, 0.881, 0.146, -0.4),
+        (184.75, 0.908, 0.115, 0.7), (214.00, 0.905, 0.115, -0.6),
+        (237.25, 0.875, 0.131, 0.4), (271.75, 0.926, 0.099, -0.5),
+        (303.25, 0.938, 0.162, 0.6), (333.00, 1.000, 0.183, -0.4),
+    ]
+
+    func path(in rect: CGRect) -> Path {
+        let c = CGPoint(x: rect.midX, y: rect.midY)
+        let R = min(rect.width, rect.height) / 2
+        let widthScale: CGFloat = 1.03, hub: CGFloat = 0.30
+        let bevel: CGFloat = 0.015, capRatio: CGFloat = 0.45
+        var path = Path()
+        // **这里不放中心毂。** 毂由调用方另画一个圆,原因写在 GuardMark 里:
+        // SwiftUI 的 `addEllipse` 和下面这些手写多边形的绕向相反,非零绕数下
+        // 重叠区会被**抵消**,中心于是出现一个深色小洞(实测就是这样)。
+        for ray in Self.rays {
+            let a = CGFloat.pi / 2 - ray.deg * .pi / 180   // 0° = 正上,顺时针
+            let tip = ray.len * R
+            let w = ray.w * widthScale * R
+            func q(_ r: CGFloat, _ off: CGFloat) -> CGPoint {
+                CGPoint(x: c.x + cos(a) * r + cos(a + .pi / 2) * off,
+                        y: c.y + sin(a) * r + sin(a + .pi / 2) * off)
+            }
+            let shoulder = tip - bevel * R
+            let inner = hub * R * 0.6
+            path.move(to: q(inner, -w / 2))
+            path.addLine(to: q(shoulder, -w / 2))
+            path.addLine(to: q(shoulder + ray.slant * bevel * R * 0.5, -w / 2 * capRatio))
+            path.addLine(to: q(shoulder - ray.slant * bevel * R * 0.5,  w / 2 * capRatio))
+            path.addLine(to: q(shoulder, w / 2))
+            path.addLine(to: q(inner, w / 2))
+            path.closeSubpath()
+        }
+        return path
+    }
+}
+
+/// 界面里的品牌标记。对号用底色描一遍，看上去就等于「挖空」——
+/// 因为标记坐在底色上，用同一个色去描边和真打洞的效果一样，
+/// 比在 SwiftUI 里做布尔运算简单，也不会碰上自交假岛那种坑。
+///
+/// 上一版是「墨色圆角方块 + 白盾 + 墨色对号」，缩到 20pt 出问题：
+/// 盾牌只占方块 13.5pt，对号又吃掉盾牌内宽的 18%，中间那圈白只剩 2pt ——
+/// 描边一糊，看着就是**一圈白线**，也就是「线框感」。三件套在 20pt 这个尺寸上
+/// 根本装不下。
+///
+/// 现在只留两件：盾牌自己就是标记（撑满 20pt 高，墨色实心），**里面挖一枚 Claude 星标**。
+/// 实心块 + 洞，没有第三个元素，也就没有可以糊成线的那一圈。
+///
+/// 为什么把对号换成星标:这一屏是「给 Claude 守门的工具」,标题栏那枚标记是用户
+/// 唯一会正面看一眼的品牌位。对号只说明「检查过了」,换个工具也一样;星标是
+/// Claude 的标,一眼能认出这是给谁用的。守护的意思由**盾牌**承担,不靠对号。
+///
+/// 星标画在盾牌内腔偏上:盾牌是上宽下尖的梨形,几何中点在视觉上偏低。
+private struct GuardMark: View {
+    var box: CGFloat
+    /// 盾牌在图标里是 424×530（宽高比 0.8），拉成正方形会变胖，所以按比例给宽度。
+    var body: some View {
+        ZStack {
+            GuardShield().fill(ClaudeTheme.ink)
+            // 星芒改成实心形状之后不能再「描边挖空」——它本来就是一整块。
+            // 用底色去填,坐在墨色盾牌上就等于挖出了一个洞:和图标那边
+            // (拿渐变当裁切区重画一遍)是同一个做法,只是这里底色是纯色。
+            //
+            // 毂和射线分两次画。塞进同一个 Shape 试过:SwiftUI 的 addEllipse
+            // 与手写多边形绕向相反,非零绕数下重叠区相互抵消,中心会留一个
+            // 深色小洞(20pt 上就是一个黑点,像标中间被打了个洞)。
+            // 同一个底色填两次,视觉上就是并集,不吃绕数规则的亏。
+            Circle()
+                .fill(ClaudeTheme.bg)
+                .frame(width: box * 0.52 * 0.30, height: box * 0.52 * 0.30)
+                .offset(y: -box * 0.04)
+            ClaudeBurst()
+                .fill(ClaudeTheme.bg)
+                .frame(width: box * 0.52, height: box * 0.52)
+                .offset(y: -box * 0.04)
+        }
+        .frame(width: box * 0.8, height: box)
+    }
+}
+
 private struct Card<Content: View>: View {
     var padding: CGFloat = 0
     @ViewBuilder var content: Content
@@ -1254,11 +2009,7 @@ private struct Card<Content: View>: View {
     var body: some View {
         content
             .padding(padding)
-            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(ClaudeTheme.card))
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            // 投影加在裁切之后,否则会被自己裁掉一半。半径给得大、透明度给得很低:
-            // 目的是让卡片「浮起来一毫米」,不是画一个阴影。
-            .shadow(color: Color.black.opacity(0.055), radius: 12, x: 0, y: 3)
+            .cardSurface()
     }
 }
 
@@ -1324,7 +2075,7 @@ private struct GuardBand: View {
     }
 
     private var title: String {
-        if vm.intercepted { return "看门狗已拦截并停止" }
+        if vm.intercepted { return vm.interceptionShortTitle }
         if !vm.guarding { return "看门狗未驻守" }
         return fresh ? "运行期看门狗驻守中" : "看门狗失联"
     }
@@ -1340,41 +2091,39 @@ private struct GuardBand: View {
     }
 
     var body: some View {
-        HStack(spacing: 13) {
+        HStack(spacing: Geo.inline) {
             glyph
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(Type.bodyStrongFont)
                     .foregroundColor(fresh ? ClaudeTheme.ink : tone)
                 Text(subtitle)
-                    .font(.system(size: 10.5))
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.85))
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.faint)
                     .lineLimit(1)
             }
 
             Spacer(minLength: 10)
 
-            VStack(alignment: .trailing, spacing: 2) {
+            // 两个时间戳合成一行。本来就都是「多久以前」的同一个格式,竖着码两行
+            // 只是为了对齐,却让这条带子白白高了 14pt —— 而它是全屏最次要的信息。
+            HStack(spacing: 4) {
                 Text(dutyText)
-                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                    .foregroundColor(ClaudeTheme.muted)
-                    .lineLimit(1)
+                    .foregroundColor(ClaudeTheme.faint)
+                Text("·")
+                    .foregroundColor(ClaudeTheme.faint)
                 Text(beatText)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(fresh ? ClaudeTheme.success.opacity(0.9)
-                                           : ClaudeTheme.muted.opacity(0.7))
-                    .lineLimit(1)
+                    .foregroundColor(fresh ? ClaudeTheme.ok : ClaudeTheme.faint)
             }
+            .font(Type.microFont)
+            .monospacedDigit()
+            .lineLimit(1)
             .fixedSize()
         }
-        .padding(.horizontal, 15)
-        .padding(.vertical, 11)
+        // 它现在是一张独立的卡，内边距由调用点给（跟着「卡片左右 32」的规矩走，
+        // 否则这枚图标会比上面那枚圆环左边缺 18pt，两张卡的左边缘对不上）。
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .fill(tone.opacity(fresh ? 0.075 : 0.05))
-        )
         .onReceive(tick) { now = $0 }
         // 用 onReceive 订阅而不是 onChange:onChange 的单参数形式在 macOS 14
         // 已废弃,而两参数形式要 14+,这个 App 还要跑 13。
@@ -1392,35 +2141,30 @@ private struct GuardBand: View {
 
     private var glyph: some View {
         ZStack {
-            // 底圈:告诉眼睛这里有个「雷达」
+            // 一块实心底盘，心跳一到就往外扩一圈再收回来。
+            //
+            // 上一版这里是三层线条：1.6pt 的扫描弧 + 1.1pt 的涟漪描边 + 半填充盾牌。
+            // 30pt 的方块里塞三根 1pt 多的线，缩进菜单栏那种尺寸就只剩线框感 ——
+            // 而且「在动」这件事，实心块的呼吸比细弧线更明显，还不用三条动画。
             Circle()
-                .fill(tone.opacity(0.10))
-                .frame(width: 34, height: 34)
+                .fill(tone.opacity(ripple ? 0.05 : 0.14))
+                .frame(width: 30, height: 30)
+                .scaleEffect(ripple ? 1.45 : 1)
 
-            if fresh {
-                // 扫描弧。慢(2.6s 一圈),慢到不会让人分心,又能看出在动。
-                SpinRing(size: 34, lineWidth: 1.6, duration: 2.6, color: tone)
-
-                // 心跳涟漪:每收到一次 BEAT 扩一圈。这一圈才是「它刚刚真的
-                // 巡逻过」的证据,扫描弧只说明界面没卡死。
-                Circle()
-                    .stroke(tone.opacity(0.55), lineWidth: 1.1)
-                    .frame(width: 34, height: 34)
-                    .scaleEffect(ripple ? 1.55 : 1)
-                    .opacity(ripple ? 0 : 0.9)
-            }
-
-            Image(systemName: vm.intercepted ? "hand.raised.fill" : "shield.lefthalf.filled")
-                .font(.system(size: 12.5, weight: .medium))
+            Image(systemName: vm.intercepted ? "hand.raised.fill" : "shield.fill")
+                .font(Type.bodyStrongFont)
                 .foregroundColor(tone)
         }
-        .frame(width: 34, height: 34)
+        .frame(width: 30, height: 30)
     }
 
     /// 一圈涟漪。1.1s 扩到 1.55 倍并淡出,比扫描弧快一个量级 ——
     /// 快的那一下是「刚刚」,慢的那圈是「一直在」。
     private func pulse() {
         ripple = false
+        // ambient: 心跳涟漪是**循环动画**（每秒扩散一圈），不是状态过渡。
+        // 规范 ≤140ms 管的是 hover/切换这类状态变化；把一圈涟漪压到 140ms，
+        // 它就不再是「一直在守着」，而是「闪了一下」。
         withAnimation(.easeOut(duration: 1.1)) { ripple = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) { ripple = false }
     }    // MARK: 文案
@@ -1465,6 +2209,10 @@ struct ContentView: View {
     static let width: CGFloat = 1000
     static let height: CGFloat = 660
 
+    /// 脚本只会用这几个词表达「这一项没事」。它们不携带任何新信息,
+    /// 界面不该把同义词再抄一遍 —— 空串也算,那是脚本没给 detail。
+    private static let confirmationWords: Set<String> = ["", "通过", "已关闭", "走隧道"]
+
     var body: some View {
         ZStack {
             ClaudeBackground()
@@ -1489,9 +2237,9 @@ struct ContentView: View {
         .ignoresSafeArea()
         .frame(minWidth: measureOnly ? 0 : 860, minHeight: measureOnly ? 0 : 560)
         .frame(width: measureWidth)
-        .animation(.easeInOut(duration: 0.22), value: vm.phase)
-        .animation(.easeInOut(duration: 0.22), value: vm.intercepted)
-        .animation(.easeInOut(duration: 0.18), value: vm.fixNotice)
+        .animation(.easeInOut(duration: Motion.state), value: vm.phase)
+        .animation(.easeInOut(duration: Motion.state), value: vm.intercepted)
+        .animation(.easeInOut(duration: Motion.micro), value: vm.fixNotice)
         .sheet(isPresented: $showAIPrompt) { AIPromptSheet(text: vm.aiPrompt) }
         .sheet(isPresented: $vm.showSettingsSheet) { CheckSettingsView(vm: vm) }
         .sheet(isPresented: $showNotice) { NoticeView() }
@@ -1503,39 +2251,40 @@ struct ContentView: View {
     /// 主区内容。窗口高度就是按它量出来的,所以量高模式下必须和滚动模式
     /// 用同一份布局,否则量到的和看到的差一截。
     private var mainContent: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        // 组间 32、组内 10 —— 差 3.2 倍。之前是 22 和 11,所有间距都在 20 上下,
+        // 每样东西看起来同等重要,眼睛找不到分组。
+        VStack(alignment: .leading, spacing: Geo.group) {
             heroCard
             accountSection
-            // 两列而不是一列:14 行竖着堆,窗口要么高到离谱,要么矮到要滚动。
-            HStack(alignment: .top, spacing: 20) {
-                checkCard("核心安全基线", subtitle: "不可关闭 · 每次启动都校验",
-                          symbol: "shield.lefthalf.filled", rows: hardRows)
-                checkCard("加固与提示", subtitle: "可关闭 · 关闭后不参与拦截",
-                          symbol: "slider.horizontal.3", rows: softRows)
+            // 两列而不是一列:15 行竖着堆,窗口要么高到离谱,要么矮到要滚动。
+            // 等宽由 checkCard 末尾的 maxWidth: .infinity 保证（实测两卡均 464.5pt、间隙 10.5pt）,
+            // 这里不要再包一层 frame —— 同一件事说两遍,量高时反而会改到提案高度。
+            HStack(alignment: .top, spacing: Geo.inline) {
+                checkCard("核心安全基线", subtitle: "不可关闭 · 每次启动都校验", rows: hardRows)
+                checkCard("加固与提示", subtitle: "可关闭 · 关闭后不参与拦截", rows: softRows)
             }
         }
-        .padding(.horizontal, 26)
+        .padding(.horizontal, Geo.gutter + 2)
         .padding(.top, 10)
-        .padding(.bottom, 22)
+        .padding(.bottom, Geo.group)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: 工具栏
 
     private var toolbar: some View {
-        HStack(spacing: 9) {
-            Image(systemName: "shield.lefthalf.filled")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.white)
-                .frame(width: 22, height: 22)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep],
-                                             startPoint: .top, endPoint: .bottom))
-                )
+        HStack(spacing: 10) {
+            // 品牌标记。原来是 SF Symbol 的盾牌 —— 那是系统图标，不是我们的图形，
+            // 而且和 App 图标不是同一个东西（图标里是一枚带对号的盾，这里是一枚半填充盾），
+            // 两处对不上。现在两处画的是同一个路径。
+            //
+            // 20pt 上不再套「墨色方块 + 白盾」两层：那个组合在 20pt 会糊成一圈白线，
+            // 看着像线框图标。盾牌自己就是标记，实心墨色，对号是挖空的一笔。
+            GuardMark(box: 20)
+                .frame(width: 20, height: 20)
 
-            Text("Claude 切换器")
-                .font(.system(size: 12.5, weight: .semibold))
+            Text("Claude 环境检查器")
+                .font(Type.titleFont)
                 .foregroundColor(ClaudeTheme.ink)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
@@ -1567,44 +2316,56 @@ struct ContentView: View {
     private var heroCard: some View {
         Card {
             VStack(spacing: 0) {
-                HStack(alignment: .center, spacing: 18) {
+                HStack(alignment: .center, spacing: Geo.group) {
                 healthRing
 
                 VStack(alignment: .leading, spacing: 7) {
-                    HStack(spacing: 10) {
+                    // 17pt 的标题和 13pt 的徽章放一行时，默认的垂直居中会让徽章
+                    // 浮在标题的视觉中线上 —— 两行字各有各的基线，看着像没对齐。
+                    // 按首行基线对齐，两个不同字号才站在同一条线上。
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Text(heroTitle)
-                            .font(.system(size: 21, weight: .semibold))
+                            .font(Type.titleFont)
                             .foregroundColor(ClaudeTheme.ink)
                             .lineLimit(1)
                         heroBadge
                     }
-                    // 结论单独一行、给到 12.5pt 半粗:这一屏最该被读到的一句话。
-                    // 埋在 meta 行的小灰字里,等于没写。
+                    // 结论行原来是 17pt medium —— 和标题同号，两行一样大挤在一起，
+                    // 眼睛不知道先读哪行。现在降回正文 13pt：标题 17 回答「什么状态」，
+                    // 结论 13 + 状态色回答「为什么」，元信息 12。
+                    // 17 / 13 / 12 正好是系统的 title2 / body / caption 三档。
                     Text(heroVerdict.text)
-                        .font(.system(size: 12.5, weight: .medium))
+                        .font(Type.labelFont)
                         .foregroundColor(heroVerdict.color)
                         .lineLimit(2)
+                        // 结论会折成两行，中文必须给行距，否则第二行贴着第一行。
+                        .lineSpacing(Type.lineGap)
                         .fixedSize(horizontal: false, vertical: true)
                     heroMetaRow
                 }
 
-                Spacer(minLength: 14)
+                Spacer(minLength: 16)
 
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     // 检查是这个工具的主动作,给它一个正经按钮 —— 工具栏上那个
-                    // 12pt 的刷新图标,用户根本不会去找。
+                    // 11pt 的刷新图标,用户根本不会去找。
                     Button { vm.refresh() } label: {
-                        HStack(spacing: 5) {
+                        HStack(spacing: 4) {
                             Image(systemName: "arrow.clockwise")
                                 .font(.system(size: 10, weight: .semibold))
                             Text(vm.phase == .checking ? "检查中…" : "重新检查")
-                                .font(.system(size: 11.5, weight: .medium))
+                                .font(Type.labelFont)
                         }
                         .foregroundColor(ClaudeTheme.ink)
-                        .padding(.horizontal, 13)
+                        .padding(.horizontal, 12)
                         .padding(.vertical, 6)
-                        .background(Capsule().fill(ClaudeTheme.iconWell))
-                        .contentShape(Capsule())
+                        // 方角 10,不做胶囊。胶囊是消费级 App 的默认形状,
+                        // 工具里的按钮应该是方角 —— 它要看起来能按,不是能捏。
+                        .background(RoundedRectangle(cornerRadius: Geo.controlRadius,
+                                                     style: .continuous)
+                            .fill(ClaudeTheme.inset))
+                        .contentShape(RoundedRectangle(cornerRadius: Geo.controlRadius,
+                                                       style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .disabled(vm.isBusy)
@@ -1623,14 +2384,29 @@ struct ContentView: View {
                 }
                 .fixedSize()
             }
-            .padding(22)
+            // 上松下紧：上面是结论区，下面是同一张卡里的守护面。
+            // 32 / 20 的不对称不是随手给的 —— 守护面自己还有 12 的内边距，
+            // 加起来下沿才和上沿的 32 差不多，视觉上不会「底边更挤」。
+            .padding(EdgeInsets(top: Geo.group, leading: Geo.group,
+                                bottom: 20, trailing: Geo.group))
             .frame(maxWidth: .infinity, alignment: .leading)
 
-                // 「已守护」是结论,这一条是凭据 —— 结论和「凭什么」挨着放,
-                // 用户才不用猜这个绿字是哪儿来的。
-                GuardBand(vm: vm)
-                    .padding(.horizontal, 22)
-                    .padding(.bottom, 18)
+            // 「已守护」是结论,这一条是凭据 —— 结论和「凭什么」挨着放,
+            // 用户才不用猜这个绿字是哪儿来的。
+            //
+            // 用**一块内凹面**而不是一条发丝线来分隔：线是「线框」那套语言，
+            // 一屏里每多一条 1pt 的线，界面就多一分图纸感。内凹面本身就是一个
+            // 已经存在的表面色（inset），不新增颜色，只是把「换了一件事」写成
+            // 「换了一层」。
+            GuardBand(vm: vm)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: Geo.innerRadius, style: .continuous)
+                        .fill(ClaudeTheme.inset)
+                )
+                .padding(.horizontal, Geo.group)
+                .padding(.bottom, Geo.group - 10)
             }
         }
     }
@@ -1670,7 +2446,7 @@ struct ContentView: View {
     private var heroVerdict: Verdict {
         let s = healthSummary
         if vm.intercepted {
-            return Verdict(short: s.badge, text: "已自动停止 Claude · \(interceptedReason)", color: s.color)
+            return Verdict(short: s.badge, text: "\(vm.interceptionShortTitle) · \(interceptedReason)", color: s.color)
         }
         switch vm.phase {
         case .checking, .fixing, .switching:
@@ -1688,58 +2464,55 @@ struct ContentView: View {
     }
 
     private var healthRingColor: Color {
-        // 全绿时用品牌陶土橙,不用绿色 —— 一屏绿色比一个陶土环更像「报表」。
-        // 有问题时才切到状态色,红色环和红色结论一起出现,指向同一件事。
-        healthSummary.level == .ok ? ClaudeTheme.terracotta : healthSummary.color
+        // 只按分数分档（见 HealthSummary.scoreColor）。原来「全对 → 陶土橙」
+        // 那一档是罪魁：88 分带两条提示落到 notice 分支，整个环套的是警告色。
+        healthSummary.scoreColor
     }
 
     /// 圆环 + 分数。比一个大图标更能一眼看出「离满分还差多少」。
     private var healthRing: some View {
         ZStack {
             Circle()
-                .stroke(ClaudeTheme.cardBorder.opacity(0.7), lineWidth: 4.5)
+                .stroke(ClaudeTheme.hairline, lineWidth: 5)
             Circle()
                 .trim(from: 0, to: healthRingProgress)
-                .stroke(healthRingColor, style: StrokeStyle(lineWidth: 4.5, lineCap: .round))
+                .stroke(healthRingColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
                 .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: 0.55), value: healthRingProgress)
+                .animation(.easeInOut(duration: Motion.emphasis), value: healthRingProgress)
             if heroBusy {
                 ProgressView().scaleEffect(0.6)
             } else {
-                VStack(spacing: -1) {
+                VStack(spacing: -2) {
                     Text("\(healthScore)")
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                        .font(Type.scoreFont)
+                        .monospacedDigit()
                         .foregroundColor(ClaudeTheme.ink)
                         .contentTransition(.numericText())
                     Text("分")
-                        .font(.system(size: 8.5, weight: .medium))
-                        .foregroundColor(ClaudeTheme.muted)
+                        .font(Type.microLabelFont)
+                        .foregroundColor(ClaudeTheme.faint)
                 }
             }
         }
-        .frame(width: 62, height: 62)
+        .frame(width: 80, height: 80)
         .accessibilityLabel("健康分 \(healthScore) 分，\(heroVerdict.text)")
     }
 
-    /// 状态徽章:标题右边的 pill。文字直接取结论的短标签 ——
-    /// 之前这里写「3 项待确认」、下面再写一句「3 项提示」,同一个数字说两遍。
+    /// 状态徽章:标题右边的小标签。
+    ///
+    /// 原来是「彩色胶囊 + 彩色字」,属于规范点名要禁的彩色填充 ——
+    /// 一屏里出现五六个彩色胶囊之后,颜色就不再指示异常,只是装饰。
+    /// 现在是「一个小圆点 + 着色文字」,同样的信息量,没有色块。
     private var heroBadge: some View {
         let v = heroVerdict
-        return pill(v.short, color: v.color, dot: vm.phase != .checking)
-    }
-
-    private func pill(_ text: String, color: Color, dot: Bool) -> some View {
-        HStack(spacing: 4) {
-            if dot {
-                Circle().fill(color).frame(width: 4.5, height: 4.5)
+        return HStack(spacing: 4) {
+            if vm.phase != .checking {
+                Circle().fill(v.color).frame(width: 5, height: 5)
             }
-            Text(text)
-                .font(.system(size: 10.5, weight: .medium))
-                .foregroundColor(color)
+            Text(v.short)
+                .font(Type.labelFont)
+                .foregroundColor(v.color)
         }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 2.5)
-        .background(Capsule().fill(color.opacity(0.13)))
         .fixedSize()
     }
 
@@ -1770,34 +2543,39 @@ struct ContentView: View {
         let ok = vm.rows.filter { $0.state == .ok }.count
         let showCount = !heroBusy && !vm.intercepted
         let showRegion = !exitIP.isEmpty && !heroBusy && !exitRegion.isEmpty
-        return HStack(spacing: 6) {
+        return HStack(spacing: 10) {
             if !exitIP.isEmpty && !heroBusy {
+                // IP 不再套一个浅灰底块。它本来就是这行里最该被读到的值,
+                // 给它一块底色只是又多了一个色块;用主墨色 + tabular 数字已经够突出。
+                // 字形跟着这一行走（比例字）,不单独用等宽 —— 否则「144…」是等宽、
+                // 紧挨着的「US · 13/15」是比例,一行两种字形。
                 HStack(spacing: 4) {
                     Image(systemName: "network")
-                        .font(.system(size: 8.5))
-                        .foregroundColor(ClaudeTheme.muted)
+                        .font(.system(size: 9))
+                        .foregroundColor(ClaudeTheme.faint)
                     Text(exitIP)
-                        .font(.system(size: 10.5, design: .monospaced))
+                        .font(Type.microFont)
+                        .monospacedDigit()
                         .foregroundColor(ClaudeTheme.ink)
                         .lineLimit(1)
                 }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(ClaudeTheme.iconWell))
             }
             if showRegion {
+                // 原来这里是 medium + ink,和 IP 抢注意力:一行里出现两个「最重」,
+                // 就等于没有最重。地区是 IP 的附属(106.US 是一个整体),降成常规重。
                 Text(exitRegion)
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundColor(ClaudeTheme.ink)
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.muted)
             }
             if !heroDetail.isEmpty {
                 // 只有前面接了内容时才要点。detail 为空时(已守护态)这个点
                 // 会孤零零挂在行首,看着像渲染坏了。
                 if showRegion || (!exitIP.isEmpty && !heroBusy) { separatorDot }
                 Text(heroDetail)
-                    .font(.system(size: 11))
+                    .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.muted)
                     .lineLimit(2)
+                    .lineSpacing(Type.microLineGap)
                     .fixedSize(horizontal: false, vertical: true)
             }
             // 通过数跟着元信息走,不甩到卡片最右边 —— 隔着一整个屏宽,
@@ -1805,8 +2583,9 @@ struct ContentView: View {
             if showCount {
                 if !heroDetail.isEmpty || showRegion { separatorDot }
                 Text("\(ok)/\(vm.rows.count) 项通过")
-                    .font(.system(size: 10.5))
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.9))
+                    .font(Type.microFont)
+                    .monospacedDigit()
+                    .foregroundColor(ClaudeTheme.faint)
                     .fixedSize()
             }
             Spacer(minLength: 0)
@@ -1814,7 +2593,7 @@ struct ContentView: View {
     }
 
     private var separatorDot: some View {
-        Text("·").font(.system(size: 10)).foregroundColor(ClaudeTheme.muted.opacity(0.5))
+        Text("·").font(Type.microFont).foregroundColor(ClaudeTheme.faint)
     }
 
     private var problemCount: Int {
@@ -1885,8 +2664,15 @@ struct ContentView: View {
         let fixable = problems.filter { VM.fixableNames.contains($0.name) }.count
         let manual = problems.count - fixable
         if manual == 0 { return "\(head) · 点「修复」即可" }
-        if fixable == 0 { return "\(head) · 需要换节点或线路" }
-        return "\(head) · \(fixable) 项可修，\(manual) 项换节点"
+        // 「修不了的」不都是「换节点」。以前一律写成「换节点」,可 DNS 没走隧道
+        // 要去客户端改设置,把它说成换节点就是把用户支到错的方向。
+        let nodeBound = problems.filter { VM.nodeBoundNames.contains($0.name) }.count
+        let byHand = manual - nodeBound
+        if fixable == 0 {
+            return byHand == 0 ? "\(head) · 需要换节点或线路" : "\(head) · 需要手动处理"
+        }
+        if byHand == 0 { return "\(head) · \(fixable) 项可修，\(nodeBound) 项换节点" }
+        return "\(head) · \(fixable) 项可修，\(byHand) 项需手动"
     }
 
     // MARK: 提示条
@@ -1897,26 +2683,28 @@ struct ContentView: View {
         }
         if !vm.fixNotice.isEmpty {
             return AnyView(
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     Image(systemName: "wand.and.stars")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(ClaudeTheme.terracotta)
+                        .font(Type.microLabelFont)
+                        .foregroundColor(ClaudeTheme.brand)
                     Text(vm.fixNotice)
-                        .font(.system(size: 12))
+                        .font(Type.bodyFont)
                         .foregroundColor(ClaudeTheme.ink)
                     Spacer(minLength: 8)
                     if fixableProblemCount > 0 {
                         Button { vm.fixAll() } label: {
                             Text("再修一次")
-                                .font(.system(size: 11.5, weight: .medium))
-                                .foregroundColor(ClaudeTheme.terracottaDeep)
+                                .font(Type.labelFont)
+                                .foregroundColor(ClaudeTheme.brandText)
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 18)
+                .padding(.horizontal, 14)
                 .padding(.vertical, 9)
-                .background(ClaudeTheme.terracotta.opacity(0.10))
+                // 提示条也改成中性底 + 着色图标:彩色底条是又一种「第三种表面」,
+                // 而它承载的信息(修了几项)并不需要一整块颜色来强调。
+                .background(ClaudeTheme.inset)
             )
         }
         return nil
@@ -1931,38 +2719,38 @@ struct ContentView: View {
     // MARK: 账号
 
     private var accountSection: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Circle()
-                    .fill(ClaudeTheme.terracotta)
-                    .frame(width: 5, height: 5)
-                    .offset(y: -2)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
                 // 分区标题必须比内容更重。之前这里 11pt、行名 12.5pt ——
                 // 标题比正文还小,读者找不到「这一块在讲什么」。
+                // 前面那个橙色圆点去掉了:它不是信息,只是又一个色块,
+                // 而这一屏的色块已经够多了。
                 Text("隔离实例槽位")
-                    .font(.system(size: 12.5, weight: .semibold))
+                    .font(Type.titleFont)
                     .foregroundColor(ClaudeTheme.ink)
                 Text("环境与凭据独立沙盒")
-                    .font(.system(size: 10.5))
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.75))
+                    .font(Type.bodyFont)
+                    .foregroundColor(ClaudeTheme.faint)
                     .lineLimit(1)
                 Spacer(minLength: 6)
                 if !vm.incidents.isEmpty {
                     Button { showHistory = true } label: {
-                        HStack(spacing: 3) {
+                        HStack(spacing: 4) {
                             Text("全部记录")
                             Image(systemName: "chevron.right")
-                                .font(.system(size: 7.5, weight: .semibold))
+                                .font(.system(size: 8, weight: .semibold))
                         }
-                        .font(.system(size: 10.5))
-                        .foregroundColor(ClaudeTheme.terracotta)
+                        .font(Type.bodyFont)
+                        // 纯导航入口，不带状态含义 —— 让出强调色额度给
+                        // 「再修一次」和 24h 两个真正需要被看见的动作（§5 一屏 ≤3 处）
+                        .foregroundColor(ClaudeTheme.muted)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
                 ForEach(VM.accountLetters, id: \.self) { t in
                     accountCard(t)
                 }
@@ -1970,23 +2758,24 @@ struct ContentView: View {
 
             if let inc = vm.incidents.first {
                 Button { showHistory = true } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "clock.arrow.circlepath").font(.system(size: 9.5))
+                    HStack(spacing: 4) {
+                        Image(systemName: "clock.arrow.circlepath").font(.system(size: 10))
                         // 不写「最近拦截」的话,这行紧挨着「已守护」,很容易被当成
                         // 当前状态 —— 明明守护正常,却读出一句「检查未通过」。
-                        Text("最近拦截").font(.system(size: 10.5, weight: .medium))
+                        Text("最近拦截").font(Type.microLabelFont)
                         // 类型和原因往往重复(「检查未通过」+「运行中检查未通过:…」),
                         // 两句都留就是在同一行说两遍同一件事。原因更具体,留它。
                         Text(inc.reason.isEmpty ? inc.kind : shortReason(inc.reason))
-                            .font(.system(size: 10.5))
+                            .font(Type.microFont)
                             .lineLimit(1)
                             .truncationMode(.tail)
                         Spacer(minLength: 6)
                         Text(shortClock(inc.time))
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(Type.microMono)
+                            .monospacedDigit()
                             .fixedSize()
                     }
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.85))
+                    .foregroundColor(ClaudeTheme.faint)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -2001,65 +2790,90 @@ struct ContentView: View {
     private func accountCard(_ t: String) -> some View {
         let isCurrent = vm.current == t
         let archived = vm.archived.contains(t)
+        let subtitle = accountSubtitle(t)
         let hovered = hoveredAccount == t
 
         return Button { vm.switchTo(t) } label: {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
+                    // 四张卡的字母块现在是同一种材质（inset 凹槽）。
+                    // 之前当前槽位挂的是墨黑底白字 —— 一屏里最深的一块，
+                    // 比旁边真正的异常还抢眼，四张卡一眼看去先看到「A」，
+                    // 而不是先看到「有两项提示」。参照设计图也是淡底深字。
+                    //
+                    // 代价是少了一个「一眼定位」的锚点，所以锚点挪到了标签上：
+                    // 当前槽位的状态词用 ink + semibold，其余 muted + regular。
+                    // 这里刻意绑 isCurrent 而不是「Claude 是否在运行」——
+                    // 关掉 Claude 之后这个槽位仍然叫「上次使用」，它依然是
+                    // 指针指向的那一个，不该跟着掉回普通档。
                     Text(t)
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
-                        .foregroundColor(isCurrent ? .white : (archived ? ClaudeTheme.ink : ClaudeTheme.muted.opacity(0.55)))
-                        .frame(width: 32, height: 32)
+                        .font(Type.slotLetterFont)
+                        .foregroundColor(archived || isCurrent ? ClaudeTheme.ink : ClaudeTheme.faint)
+                        .frame(width: 30, height: 30)
                         .background(
-                            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                .fill(isCurrent ? ClaudeTheme.terracotta : ClaudeTheme.slotWell)
+                            RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
+                                .fill(ClaudeTheme.inset)
                         )
 
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(accountStateLabel(t))
-                            .font(.system(size: 12, weight: isCurrent ? .semibold : .medium))
+                            .font(isCurrent ? Type.bodyStrongFont : Type.bodyFont)
                             .foregroundColor(isCurrent ? ClaudeTheme.ink : ClaudeTheme.muted)
                             .lineLimit(1)
-                        Text(accountSubtitle(t))
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(ClaudeTheme.muted.opacity(archived ? 0.8 : 0.55))
-                            .lineLimit(1)
+                        // 空槽位不再写「空」:「未初始化」已经把话说完了,
+                        // 底注又写着「点击绑定」—— 同一件事说三遍,
+                        // 四张卡里两张显得比另外两张吵。
+                        if !subtitle.isEmpty {
+                            Text(subtitle)
+                                .font(Type.microMono)
+                                .monospacedDigit()
+                                .foregroundColor(ClaudeTheme.faint)
+                                .lineLimit(1)
+                        }
                     }
+                    // 角标放到第三行右端，不放这一行的行尾。
+                    // 放行尾会把「348M · 10-31」挤成「348M · 10-…」——
+                    // 卡片只有 226pt 宽，五样东西（字母块、状态词、角标）
+                    // 挤一行必然要牺牲一样，而体积+日期是这里唯一的量化信息。
                     Spacer(minLength: 0)
-                    if isCurrent {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 9.5, weight: .bold))
-                            .foregroundColor(ClaudeTheme.terracotta)
-                            .transition(.scale.combined(with: .opacity))
-                    }
                 }
 
                 HStack(spacing: 4) {
                     Image(systemName: archived ? "shield.lefthalf.filled" : "plus")
-                        .font(.system(size: 8.5))
+                        .font(.system(size: 9))
                     Text(archived ? "独立指纹" : "点击绑定")
-                        .font(.system(size: 10))
+                        .font(Type.microFont)
+                    Spacer(minLength: 6)
+                    // 「档案在不在」和「会话还有没有效」是两件事，以前只说了前一件。
+                    // 实测有个槽位快照完好、卡片写着「已保存」，但 Cookies 里根本
+                    // 没有 sessionKey —— 点进去是登录页。这个角标就是补这一句。
+                    if archived { loginChip(vm.slotLogin[t] ?? .unknown) }
                 }
-                .foregroundColor(ClaudeTheme.muted.opacity(archived ? 0.7 : 0.5))
+                .foregroundColor(ClaudeTheme.faint)
             }
-            .padding(.horizontal, 15)
-            .padding(.vertical, 14)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 15, style: .continuous)
-                    .fill(isCurrent ? ClaudeTheme.terracotta.opacity(0.10) : ClaudeTheme.card)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
-            // 没有描边,「这是一张卡」全靠投影说。当前账号给得更重一点,
-            // 一眼就能从四张里挑出来。
-            .shadow(color: Color.black.opacity(hovered ? 0.09 : (isCurrent ? 0.06 : 0.045)),
-                    radius: hovered ? 10 : 8, x: 0, y: hovered ? 4 : 2)
-            .animation(.easeOut(duration: 0.14), value: hovered)
+            // 当前槽位不再铺一层陶土色底。选中态靠「字母块是墨底白字」表达就够了 ——
+            // 橙色是「需要你注意」的信号，选中不是异常，不该占用它；
+            // 而四张卡里唯一的深色块，已经足够让人一眼找到「是它」。
+            //
+            // 圆角跟大卡、跟延迟面板里的小卡统一走 22：它们在页面上是同一个角色
+            // （浮在底色上的一张面），原来这里是 14，四张小卡挨着两张 22 的大卡，
+            // 一眼就能看出不是一套。
+            .cardSurface(radius: Geo.cardRadius,
+                         // hover 原来铺的是页面底色。页面底色抬到 249 之后，
+                         // 白卡(255) → 249 只差 6 级，是原来的一半，指针划过去
+                         // 几乎看不出来。改用 inset(246)：差 9 级，和改之前的
+                         // 手感基本一致，而且是已有色、不新增表面。
+                         fill: hovered ? ClaudeTheme.inset : ClaudeTheme.card)
+            .contentShape(RoundedRectangle(cornerRadius: Geo.cardRadius, style: .continuous))
+            .animation(.easeOut(duration: Motion.micro), value: hovered)
         }
         .buttonStyle(.plain)
         .disabled(vm.isBusy)
         .onHover { inside in
-            withAnimation(.easeOut(duration: 0.12)) {
+            withAnimation(.easeOut(duration: Motion.micro)) {
                 if inside { hoveredAccount = t }
                 else if hoveredAccount == t { hoveredAccount = nil }
             }
@@ -2067,13 +2881,57 @@ struct ContentView: View {
         .help(isCurrent ? "当前正在使用账号 \(t)" : "切换到账号 \(t)（会先重新检查一遍环境）")
     }
 
+    /// 登录角标。三种确定状态各给一个图标 + 一句人话；
+    /// 读不出来时**什么都不画** —— 猜一个「已登录」比不显示更糟。
+    @ViewBuilder
+    private func loginChip(_ state: SlotLogin) -> some View {
+        switch state {
+        case .loggedIn:
+            loginBadge("checkmark.circle.fill", "已登录", ClaudeTheme.ok,
+                       "会话有效，切过去可以直接用")
+        case .expired:
+            loginBadge("clock.badge.exclamationmark", "已过期", ClaudeTheme.warn,
+                       "会话已过期，切过去要重新登录")
+        case .loggedOut:
+            loginBadge("exclamationmark.circle.fill", "未登录", ClaudeTheme.warn,
+                       "这个槽位没有登录会话，切过去会停在登录页")
+        case .unknown:
+            EmptyView()
+        }
+    }
+
+    private func loginBadge(_ symbol: String, _ text: String,
+                            _ tint: Color, _ help: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+            // 13 号 + semibold。这一格回答的是「切过去能不能直接用」，
+            // 比旁边的「独立指纹」重要，不该和脚注同号同重。
+            // 13 在规范的刻度上（12/13/14/15/17），没有插值。
+            Text(text)
+                .font(Type.bodyStrongFont)
+        }
+        .foregroundColor(tint)
+        .lineLimit(1)
+        .fixedSize()
+        .help(help)
+    }
+
     func accountStateLabel(_ t: String) -> String {
-        if vm.current == t { return "当前账号" }
-        return vm.archived.contains(t) ? "已建档" : "未初始化"
+        if vm.current == t {
+            // 直接回答「Claude 这个程序现在开着没有」，不用「上次使用」这种绕的说法：
+            // 「上次使用」说的是历史，用户问的是现在 —— 关着就是关着。
+            // 「使用中 / 未运行」也是四张卡里唯一在描述进程状态的，其余三张
+            // 描述的是档案状态（已保存 / 未初始化），两类信息不会混。
+            return vm.claudeRunning ? "使用中" : "未运行"
+        }
+        return vm.archived.contains(t) ? "已保存" : "未初始化"
     }
 
     func accountSubtitle(_ t: String) -> String {
-        guard vm.archived.contains(t) else { return "空" }
+        // 空槽位返回空串,由调用方整行省略 —— 返回「空」的话,四张卡里
+        // 两张会多出一行「空」,而上面已经写着「未初始化」了。
+        guard vm.archived.contains(t) else { return "" }
         guard let stamp = vm.stamps[t] else { return "已建档" }
         return "\(stamp.size) · \(shortDate(stamp.date))"
     }
@@ -2089,32 +2947,31 @@ struct ContentView: View {
     private var hardRows: [CheckRow] { vm.rows.filter { !$0.canDisable } }
     private var softRows: [CheckRow] { vm.rows.filter { $0.canDisable } }
 
-    private func checkCard(_ title: String, subtitle: String, symbol: String,
+    private func checkCard(_ title: String, subtitle: String,
                            rows: [CheckRow]) -> some View {
         let checking = rows.contains(where: { vm.rechecking.contains($0.name) })
         return Card {
             VStack(alignment: .leading, spacing: 0) {
-                // 头:图标、标题、副标题、计数。四样东西挤在一行,靠「谁粗谁细」
-                // 分层,不靠色块 —— 之前图标有底、计数有胶囊,一行两个方块,
-                // 加上左右各一列边框感,卡头比内容还热闹。
-                HStack(alignment: .center, spacing: 11) {
-                    Image(systemName: symbol)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(cardAccent(rows))
-                        .frame(width: 26, height: 26)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(cardAccent(rows).opacity(0.10))
-                        )
-
-                    VStack(alignment: .leading, spacing: 1.5) {
+                // 头:标题、副标题、计数。**前面不放图标块**。
+                //
+                // 卡头原来挂着一枚 28×28 的浅灰图标块,理由是「章节标题要有指路牌」。
+                // 可这一屏上「块」已经三种了:hero 是大圆环、四张槽位卡是字母块、
+                // 行是裸符号 —— 再加上块,整屏第一列的形态太多,读者说不出哪里乱,
+                // 只看见一排方块大小不一。标题本身就是指路牌:17pt semibold 已经是
+                // 这一屏最大的字,不需要再加一个图形替它喊。
+                //
+                // 去掉块之后卡头从 cardH 起排,和行图标同一条起始边;
+                // 行名在 50(icon + gap),标题在 14 —— 这是「标题挂左、行缩进」的
+                // 常规做法,不是错位。
+                HStack(alignment: .center, spacing: Rhythm.gap) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(title)
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(Type.titleFont)
                             .foregroundColor(ClaudeTheme.ink)
                             .lineLimit(1)
                         Text(subtitle)
-                            .font(.system(size: 10.5))
-                            .foregroundColor(ClaudeTheme.muted.opacity(0.72))
+                            .font(Type.microFont)
+                            .foregroundColor(ClaudeTheme.faint)
                             .lineLimit(1)
                     }
 
@@ -2122,19 +2979,20 @@ struct ContentView: View {
 
                     // 计数用「点 + 文字」而不是胶囊。胶囊是给需要被点、被注意的
                     // 东西用的,这里只是个数字。
-                    HStack(spacing: 5) {
+                    HStack(spacing: 4) {
                         Circle()
                             .fill(countColor(rows))
                             .frame(width: 5, height: 5)
                         Text(countText(rows))
-                            .font(.system(size: 10.5, weight: .medium))
+                            .font(Type.labelFont)
+                            .monospacedDigit()
                             .foregroundColor(countColor(rows))
                     }
                     .fixedSize()
                 }
-                .padding(.horizontal, 18)
-                .padding(.top, 17)
-                .padding(.bottom, checking ? 9 : 11)
+                .padding(.horizontal, Rhythm.cardH)
+                .padding(.top, Rhythm.cardTop)
+                .padding(.bottom, checking ? 8 : Rhythm.cardBottom)
 
                 // 检查进度。整轮要两三秒,没有进度感的话用户只看到一堆行在闪。
                 // 只在核对时出现,平时不占位 —— 一条常驻的细线会被读成分隔线。
@@ -2148,21 +3006,26 @@ struct ContentView: View {
                 if vm.coreMissing {
                     setupPanel
                 } else {
-                    VStack(spacing: 1) {
+                    VStack(alignment: .leading, spacing: 4) {
                         ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
                             checkRow(row, index: idx)
                         }
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 10)
+                    .padding(.horizontal, Rhythm.listInset)
+                    .padding(.bottom, 12)
                 }
             }
-            // 两列行数不同,底边就会错开一截,看着像没对齐。撑到等高让下沿齐平。
-            // 量高探针里不能撑 —— 那里没有确定的父高度,撑成无穷大会量出天文数字。
-            .frame(maxHeight: measureOnly ? nil : .infinity, alignment: .top)
+            // 两卡等高。这里撑的是**内容区**而不是外层 frame —— 只有内容先长满，
+            // Card 的背景才会跟着长满；加在外面等于把卡片画小之后再套一个空框。
+            //
+            // 上一版为了躲「矮卡底部空 56pt 白」把等高撤了，改成各按内容收口。
+            // 结果两卡高度差 26pt（448.5 / 474.5），下沿一高一低，并排摆着像做歪了。
+            // 现在明确取舍：**下沿齐 > 底部可能留白**。清单卡片本来就不是等内容的容器，
+            // 留白是容器属性，错边是排版事故。
+            .frame(maxHeight: .infinity, alignment: .top)
         }
         .frame(maxWidth: .infinity, alignment: .top)
-        .animation(.easeOut(duration: 0.2), value: checking)
+        .animation(.easeOut(duration: Motion.state), value: checking)
     }
 
     /// 一条 3pt 的进度线。宽度跟着「已落定的行数」走,和逐行落定是同一个节拍 ——
@@ -2173,14 +3036,14 @@ struct ContentView: View {
         let ratio = Double(done) / Double(total)
         return GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(ClaudeTheme.iconWell)
-                Capsule()
+                RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.inset)
+                RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
                     .fill(cardAccent(rows).opacity(0.8))
                     .frame(width: max(4, geo.size.width * ratio))
             }
         }
         .frame(height: 3)
-        .animation(.easeOut(duration: 0.3), value: ratio)
+        .animation(.easeOut(duration: Motion.emphasis), value: ratio)
         .accessibilityLabel("检查进度 \(done)/\(total)")
     }
 
@@ -2218,14 +3081,17 @@ struct ContentView: View {
     }
 
     private func checkRow(_ row: CheckRow, index: Int = 0) -> some View {
-        let isProblem = row.state == .fail || row.state == .config
-        // 提示项(warn)也算「要你动手」:时区不对、DNS 没走隧道都能一键修。
-        let needsAttention = isProblem || row.state == .warn
+        // 提示项(warn)也算「要你动手」:时区不对、地区格式不对都能一键修。
+        // 判定只剩这一条 —— 原来还有个 isProblem(fail/config),只用来决定行名加不加粗,
+        // 结果是 warn 行和通过行字重一样;现在统一看 needsAttention。
+        let needsAttention = row.state == .fail || row.state == .config || row.state == .warn
         let fix = vm.fixStates[row.name]
         // 修复回执里的附注:失败时是「为什么改不了」,成功时是「改完还要做什么」。
         // 用户点了修复之后,这一句是他唯一想看的第二句话。
         let fixNote = fix?.note ?? ""
         let fixFailed = fix?.isFailed ?? false
+        // 元组标签在 `?? (…)` 这种默认值写法里会丢,所以下面按位置取(.0/.1/.2)。
+        let fixMark = fix?.noteMark ?? ("", ClaudeTheme.muted, "")
         // 「保镖在线」的 detail 只有「待命」两个字时,单看像「还没上岗」。
         // 实际含义是「launchd 守护在线、还没拦过任何东西」—— 补上「在线」,
         // 免得和上面那条「运行期看门狗驻守中」看起来互相矛盾。
@@ -2240,114 +3106,199 @@ struct ContentView: View {
         // 重查中的行不清空旧值,只在行尾挂个小转圈。用户能看到「这一项正在核对」,
         // 而不用面对一整屏突然变灰。
         let isRechecking = vm.rechecking.contains(row.name)
+        // 脚本对「没事」有几种说法:没有 detail、`通过`、`已关闭`、`走隧道`。
+        // 这些词和左边的行名说的是同一件事(「IPv6 关闭 — 已关闭」把行名复述了一遍),
+        // 一列里连着出现四五次,读下来全是同义反复,真正有内容的行反而被淹掉。
+        // 统一收成一个极淡的对勾:结论还在,视觉重量几乎归零。
+        let confirmOnly = row.state == .ok && ContentView.confirmationWords.contains(row.detail)
+        // 右列能不能放「读数」：短详情、且这一项不需要处理。
+        // 需要处理的行右端留给动作（修复）或状态词，读数已经写在第二行原因里了。
+        let showsReading = !confirmOnly && !needsAttention && !detailNeedsOwnLine
 
-        return VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 9) {
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: Rhythm.gap) {
                 Image(systemName: row.icon)
-                    .font(.system(size: 12, weight: .regular))
+                    // 13 / medium —— 和行名同号同重。
+                    // 12 / regular 的符号放在 13/medium 的中文旁边是「一根细线配一块实心字」，
+                    // 一列十几个图标扫下来整片发虚。图标字重跟着文字走，不单独定。
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundColor(tint)
-                    .frame(width: 17, alignment: .leading)
+                    // 定宽 26 且居中。之前是 18 宽靠左:时钟窄、盾牌宽,
+                    // 每个图标的视觉重心都在横向漂,十几行叠起来就是一条歪的虚线。
+                    // 定宽居中之后图标共用一条竖轴,行名起点自然成一条直线。
+                    .frame(width: Rhythm.icon)
 
+                // 行名定宽。名字长短不一是这一列「锯齿」的总根源:
+                // 「时区」后面空一大片、「IP 与上次一致」后面紧贴着值,
+                // 每行的值和对勾都停在不同位置,一列扫下去找不到规律。
+                // 定宽 + 左对齐之后,第二列从同一条竖线起排,读起来才是一张表。
+                //
+                // 字重 = 层级。原来只有 fail/config 才加粗,**warn 不加** ——
+                // 于是「IP 纯净度(提示)」和「时区(通过)」两个字重一模一样,
+                // 一列读下来没有任何一处是先看的。现在凡是「要你动手」的行
+                // (fail / config / warn)都加粗,通过的留在 medium:
+                // 一张卡里 5 行 normal + 2 行 semibold,眼睛自然先落在后两行。
                 Text(row.name)
-                    .font(.system(size: 12.5, weight: isProblem ? .medium : .regular))
+                    .font(needsAttention ? Type.bodyStrongFont : Type.labelFont)
                     .foregroundColor(ClaudeTheme.ink)
                     .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
+                    .truncationMode(.tail)
+                    .frame(width: Rhythm.nameColumn, alignment: .leading)
 
+                // 弹性空隙放在结论**之前**，结论一律贴右。
+                // 注意不能把弹性 frame 加在结论本身（`maxWidth:.infinity, alignment:.trailing`）：
+                // 没有结论的行里那个分支是 EmptyView，不参与布局 → 列塌成 0 宽，
+                // 对勾会被拽到行名后面（实测 x=238，而值在 x=518）。
                 Spacer(minLength: 8)
 
-                if !needsAttention && !detailNeedsOwnLine && row.state != .pending && !isRechecking {
-                    Text(value)
-                        .font(.system(size: 11.5, design: isMonospace(value) ? .monospaced : .default))
-                        // 通过项的值再压一档。「通过」重复八遍、颜色和真结果一样重,
-                        // 整列读起来全是噪声,反而看不出哪一行有信息。
-                        .foregroundColor(ClaudeTheme.muted.opacity(row.state == .ok ? 0.62 : 1))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .help(row.detail)
-                }
-
+                // 行尾「结论」——一张清单一列扫过去，右端必须每行都有东西，
+                // 而且只有三种形态：读数（14pt 灰）／对勾（符号）／动作（修复·24h）。
+                //
+                // 上一版的问题是「有的行右边是空气」：长说明的行（保卫在线、ASN 属性、
+                // IP 纯净度）把详情挪到第二行之后，右端就什么都不显示了。8 行里 4 行
+                // 右边空着，读者看到的是「有些对号、有些文字、有些什么都没有」——
+                // 这不是对齐问题，是每行的结论没有定义。
+                //
+                // 规则，自上而下命中一条即止：
+                //   1 正在核对 → 转圈
+                //   2 刚修过   → 回执（已修复／需手动）
+                //   3 能修     → 「修复」
+                //   4 24h 入口
+                //   5 有短读数且不需要处理 → 读数
+                //   6 通过     → 对勾
+                //   7 其余     → 状态词（提示／未通过／待配置／已跳过）
                 if row.state == .pending || isRechecking {
-                    // 自己画的弧,不用系统 ProgressView:那个小菊花在浅色卡上
-                    // 是一团灰糊,和整屏的圆角/细线语言也不搭。
+                    // 自己画的弧，不用系统 ProgressView：那个小菊花在浅色卡上
+                    // 是一团灰糊，和整屏的圆角/细线语言也不搭。
                     SpinRing(size: 12, lineWidth: 1.5, duration: 0.9)
                         .transition(.opacity)
                 } else if let fix {
                     fixChip(fix)
-                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        .transition(.opacity)
                 } else if needsAttention && VM.fixableNames.contains(row.name) && !vm.isBusy {
                     FixActionButton(label: "修复", quiet: true) { vm.fixAll(focus: row.name) }
                         .help("修复这一项（脚本会一并处理其他可自动修复的项）")
-                }
-
-                // 生态探测这一行是「24h 延迟洞察」的入口 —— 数据就是它测出来的,
-                // 放在这里比塞进工具栏更好找。
-                if row.name == "生态可达性" && !vm.isBusy && row.state != .pending {
+                } else if row.name == "生态可达性" && !vm.isBusy {
+                    // 这一行是「24h 延迟洞察」的入口 —— 数据就是它测出来的，
+                    // 放在行尾比塞进工具栏更好找。字号与「修复」同号（14），
+                    // 右列不出现第二种正文尺寸。
                     Button { showLatency = true } label: {
-                        HStack(spacing: 3) {
+                        HStack(spacing: 4) {
                             Image(systemName: "chart.xyaxis.line")
-                                .font(.system(size: 8.5, weight: .medium))
+                                .font(.system(size: 11, weight: .medium))
                             Text("24h")
-                                .font(.system(size: 9.5, weight: .medium))
+                                .font(Type.labelFont)
                         }
-                        .foregroundColor(ClaudeTheme.terracotta)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2.5)
-                        .background(Capsule().fill(ClaudeTheme.terracotta.opacity(0.09)))
-                        .contentShape(Capsule())
+                        .foregroundColor(ClaudeTheme.brandText)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("查看 24 小时延迟历史")
+                } else if showsReading {
+                    Text(value)
+                        .font(Type.bodyFont)
+                        // 读数与行名同号（14），只靠颜色降一级。
+                        // 层级不是「越浅越小越高级」——该读的留在第二级灰。
+                        .foregroundColor(ClaudeTheme.muted)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(row.detail)
+                } else if row.state == .ok {
+                    // 「通过」写成字，不用对勾。
+                    //
+                    // 对勾的问题是**它太像一个按钮/一个可点的东西**，一列排下来
+                    // 八个小绿勾，右端变成一列图标，反而比文字更吵；而且勾的颜色
+                    // （语义绿 5.2:1）和左边行名的墨色几乎一样重，一列扫过去
+                    // 分不清「哪边是结论」。
+                    //
+                    // 现在：字 + 最淡的一档灰。通过本来就不需要被读第二眼 ——
+                    // 它只需要「在场」，证明这一项确实被检查过。
+                    // 需要处理的行仍然是彩色（提示=橙 / 未通过=红 / 待配置=棕），
+                    // 于是这一列的颜色只有两种含义：淡灰 = 没事，彩色 = 有事。
+                    Text(stateWord(row.state))
+                        .font(Type.bodyFont)
+                        .foregroundColor(ClaudeTheme.faint)
+                        .lineLimit(1)
+                        .help(row.detail.isEmpty ? "通过" : row.detail)
+                } else {
+                    // 不通过又不给修复按钮的（出口 IP 一致、ASN、纯净度、生态），
+                    // 右端至少要说清「没过」。用状态词而不是再画一个红点。
+                    Text(stateWord(row.state))
+                        .font(Type.labelFont)
+                        .foregroundColor(tint)
+                        .lineLimit(1)
                 }
             }
 
             // 修复回执优先。修失败了,这一行的第二句必须是「为什么没修好」,
             // 而不是原来那句检查详情 —— 用户刚点完修复,关心的是结果。
             if !fixNote.isEmpty {
-                HStack(alignment: .top, spacing: 5) {
-                    Image(systemName: fixFailed ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
-                        .font(.system(size: 9.5))
-                        .foregroundColor(fixFailed ? ClaudeTheme.error : ClaudeTheme.success)
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: fixMark.0)
+                        .font(.system(size: 10))
+                        .foregroundColor(fixMark.1)
                         .padding(.top, 1.5)
+                    // 颜色也跟档走:只有「没修成」才用红。没法验证用灰 ——
+                    // 红色会把它读成失败,而这一条恰恰不是失败。
                     Text(fixNote)
-                        .font(.system(size: 11))
-                        .foregroundColor(fixFailed ? ClaudeTheme.error : ClaudeTheme.muted)
+                        .font(Type.bodyFont)
+                        .foregroundColor(fixFailed ? ClaudeTheme.bad : ClaudeTheme.muted)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
-                        .help(fixFailed ? "脚本没能自动修好这一项：\(fixNote)" : fixNote)
+                        .help(fixMark.2 + fixNote)
                 }
-                .padding(.leading, 26)
+                .padding(.leading, Rhythm.rowIndent)
                 .transition(.opacity)
             } else if detailNeedsOwnLine {
                 // 要动手的行把原因放到第二行整行铺开。一行放不下「当前 A,期望 B」,
                 // 中间截断切掉的正好是最要紧的那半句。
                 Text(row.detail)
-                    .font(.system(size: 11, design: isMonospace(row.detail) ? .monospaced : .default))
-                    .foregroundColor(ClaudeTheme.muted)
+                    // 第二行是「描述」，三级里最轻的一级：12pt + 最浅的灰。
+                    //
+                    // 三级各自只差一个维度，合起来一眼能分开：
+                    //   名称 14 medium ink     —— 它是这一行的主语
+                    //   状态 14 regular muted  —— 它是这一行的结论
+                    //   描述 12 regular faint  —— 它是结论的注脚
+                    // 上一版名称是 regular、描述和状态同色，只有字号差一档 ——
+                    // 「一眼看不出哪句是名、哪句是状态、哪句是补充」。
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.faint)
+                    .lineSpacing(Type.microLineGap)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
-                    .padding(.leading, 26)
+                    // 缩进 = 图标列 + 间距,正好落在行名的第一个字下面。
+                    // 原来是 26 和 28 两个值,两种缩进同一张卡里并存,左边缘看着发抖。
+                    .padding(.leading, Rhythm.rowIndent)
                     .transition(.opacity)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 9)
+        // 钉在容器宽度上。不钉的话,「代理离线(内核或 TUN 丢失),已自动关闭」
+        // 这种长备注会把行的理想宽度撑到卡片之外,然后被父级居中 —— 图标和行名
+        // 一起右移几十点,而同一张卡里别的行纹丝不动。谁也不会想到那是「换行没触发」。
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, Rhythm.rowH)
+        .padding(.vertical, Rhythm.rowV)
         // 只有悬浮才铺底色。之前给「要处理」的行铺一层淡色,结果同一张卡里
         // 两行有色、四行没色,看着像两个被选中的行,清单反而不像清单。
         // 「要处理」已经有三个信号了:图标着色、第二行原因、行尾修复按钮。
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(hoveredRow == row.name ? ClaudeTheme.iconWell.opacity(0.75) : Color.clear)
+            RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
+                // hover 用 inset 而不是页面底色：页面底色抬到 249 之后，
+                // 白卡上的 hover 只剩 6 级差，太淡；inset(246) 差 9 级，
+                // 和抬底色之前的手感一致，也不新增表面色。
+                .fill(hoveredRow == row.name ? ClaudeTheme.inset : Color.clear)
         )
         // 逐行落定,而不是整组一起跳。检查输出是一行行回来的,给每行按顺序
         // 错开十几毫秒,眼睛能跟上「现在核到哪一项」;错开量封顶 96ms,
         // 再多就变成拖沓。
-        .animation(.easeOut(duration: 0.2).delay(Double(min(index, 8)) * 0.012), value: row.state)
-        .animation(.easeOut(duration: 0.16), value: isRechecking)
-        .animation(.easeOut(duration: 0.16), value: row.detail)
+        .animation(.easeOut(duration: Motion.state).delay(Double(min(index, 8)) * 0.012),
+                   value: row.state)
+        .animation(.easeOut(duration: Motion.micro), value: isRechecking)
+        .animation(.easeOut(duration: Motion.micro), value: row.detail)
         .onHover { inside in
             // 鼠标划过去要有一点反应,否则整张清单像一张不可点的表。
-            withAnimation(.easeOut(duration: 0.12)) {
+            withAnimation(.easeOut(duration: Motion.micro)) {
                 if inside { hoveredRow = row.name }
                 else if hoveredRow == row.name { hoveredRow = nil }
             }
@@ -2357,13 +3308,20 @@ struct ContentView: View {
     }
 
     /// 通过项用中性灰,只有要处理的行才着色 —— 14 行全彩等于没有重点。
+    ///
+    /// 这是全文件**唯一**允许用 opacity 调灰度的地方:它调的是图标不是文字,
+    /// 而且「已跳过」本来就该比「通过」再退后一点。文字一律只走 ink/muted/faint
+    /// 三档 —— 文字上用 opacity 会凭空造出第四第五档灰,层级立刻糊掉。
     private func iconTint(_ s: RowState) -> Color {
         switch s {
-        case .ok: return ClaudeTheme.muted.opacity(0.7)
-        case .warn: return ClaudeTheme.warning
-        case .fail: return ClaudeTheme.error
-        case .config: return ClaudeTheme.terracotta
-        case .pending, .skip: return ClaudeTheme.muted.opacity(0.5)
+        // 通过的行：图标用 muted 而不是 faint。13pt 的符号在 faint(4.6:1) 下
+        // 只剩一层虚影，和旁边的实心中文并排就像没对齐；muted(8.8:1) 让它和
+        // 右边那一列读数同色 —— 同一行里「附属信息」用同一个灰，比用两个灰干净。
+        case .ok: return ClaudeTheme.muted
+        case .warn: return ClaudeTheme.warn
+        case .fail: return ClaudeTheme.bad
+        case .config: return ClaudeTheme.brandText
+        case .pending, .skip: return ClaudeTheme.faint.opacity(0.6)
         }
     }
 
@@ -2387,17 +3345,23 @@ struct ContentView: View {
             case .running: return ("修复中", ClaudeTheme.muted, "")
             case .done: return ("已修复", ClaudeTheme.success, "checkmark")
             case .failed: return ("需手动", ClaudeTheme.error, "exclamationmark")
+            // 「未验证」而不是「失败」:这一项的判定依赖一个当前不存在的比对对象,
+            // 用红色会让用户去找一个不存在的手动动作。
+            case .note: return ("未验证", ClaudeTheme.muted, "questionmark")
             }
         }()
-        return HStack(spacing: 3) {
+        return HStack(spacing: 4) {
             if case .running = state {
                 SpinRing(size: 10, lineWidth: 1.4, duration: 0.9)
             } else {
                 Image(systemName: symbol)
-                    .font(.system(size: 8, weight: .bold))
+                    // 11pt 图标配 14pt 字：8pt 的勾在 14pt 汉字旁边像掉了一颗芝麻，
+                    // 而这一枚回执是要被读到结论的，不是装饰。
+                    .font(.system(size: 11, weight: .semibold))
             }
             Text(text)
-                .font(.system(size: 11, weight: .medium))
+                // 与「读数」「修复」「24h」同号，右列不出现第二种正文尺寸。
+                .font(Type.labelFont)
         }
         .foregroundColor(color)
         .fixedSize()
@@ -2406,10 +3370,10 @@ struct ContentView: View {
     private var setupPanel: some View {
         VStack(spacing: 10) {
             Text("还没有安装核心脚本")
-                .font(.system(size: 13, weight: .medium))
+                .font(Type.titleFont)
                 .foregroundColor(ClaudeTheme.ink)
             Text(vm.banner)
-                .font(.system(size: 11.5))
+                .font(Type.microFont)
                 .foregroundColor(ClaudeTheme.muted)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2418,22 +3382,22 @@ struct ContentView: View {
                     openInBrowser("https://github.com/huanfine/claude-switcher")
                 } label: {
                     Text("打开项目主页")
-                        .font(.system(size: 11.5, weight: .medium))
+                        .font(Type.microLabelFont)
                         .foregroundColor(.white)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 5)
-                        .background(Capsule().fill(ClaudeTheme.terracotta))
+                        .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.ink))
                 }
                 .buttonStyle(.plain)
                 Button {
                     openInBrowser("https://github.com/huanfine/claude-switcher#安装")
                 } label: {
                     Text("安装说明")
-                        .font(.system(size: 11.5, weight: .medium))
+                        .font(Type.microLabelFont)
                         .foregroundColor(ClaudeTheme.ink)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 5)
-                        .background(Capsule().fill(ClaudeTheme.iconWell))
+                        .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.inset))
                 }
                 .buttonStyle(.plain)
             }
@@ -2441,10 +3405,6 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 32)
         .padding(.horizontal, 24)
-    }
-
-    private func isMonospace(_ str: String) -> Bool {
-        str.contains(".") || str.contains(":") || str.contains("/")
     }
 
     // MARK: 底栏
@@ -2459,22 +3419,24 @@ struct ContentView: View {
                     Button(choice.label) { vm.setClient(choice.key) }
                 }
             } label: {
-                HStack(spacing: 5) {
+                HStack(spacing: 6) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")
-                        .font(.system(size: 9.5))
-                        .foregroundColor(ClaudeTheme.terracotta)
+                        .font(.system(size: 10))
+                        .foregroundColor(ClaudeTheme.faint)
                     Text(clientLabel)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(Type.microLabelFont)
                         .foregroundColor(ClaudeTheme.ink)
                         .lineLimit(1)
                     Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 6.5, weight: .semibold))
-                        .foregroundColor(ClaudeTheme.muted.opacity(0.7))
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(ClaudeTheme.faint)
                 }
                 .padding(.horizontal, 9)
-                .padding(.vertical, 4.5)
-                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(ClaudeTheme.slotWell))
-                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: Geo.controlRadius,
+                                             style: .continuous).fill(ClaudeTheme.inset))
+                .contentShape(RoundedRectangle(cornerRadius: Geo.controlRadius,
+                                               style: .continuous))
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
@@ -2486,11 +3448,11 @@ struct ContentView: View {
                 ProgressView().scaleEffect(0.45).frame(width: 12, height: 12)
             }
 
-            HStack(spacing: 4) {
-                Circle().fill(footerStatusColor).frame(width: 4.5, height: 4.5)
+            HStack(spacing: 6) {
+                Circle().fill(footerStatusColor).frame(width: 5, height: 5)
                 Text(footerStatusText)
-                    .font(.system(size: 10.5))
-                    .foregroundColor(ClaudeTheme.muted)
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.faint)
                     .lineLimit(1)
             }
 
@@ -2498,8 +3460,8 @@ struct ContentView: View {
             // 一行里说两遍同一件事。内容一样就不画。
             if vm.lastCheckSummary != "尚未检查" && vm.lastCheckSummary != footerStatusText {
                 Text("· \(vm.lastCheckSummary)")
-                    .font(.system(size: 10.5))
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.7))
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.faint)
                     .lineLimit(1)
             }
 
@@ -2511,9 +3473,9 @@ struct ContentView: View {
             GhostTextButton(label: "AI 配置") { showAIPrompt = true }
             GhostTextButton(label: "诊断") { vm.showSettingsSheet = true }
         }
-        .padding(.horizontal, 22)
-        .padding(.top, 9)
-        .padding(.bottom, 16)
+        .padding(.horizontal, Geo.gutter)
+        .padding(.top, 8)
+        .padding(.bottom, 14)
         .sheet(isPresented: $vm.showUpdateSheet) { UpdateSheet(vm: vm) }
     }
 
@@ -2551,8 +3513,17 @@ struct ContentView: View {
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "  ", with: " ")
             .trimmingCharacters(in: .whitespaces)
-        guard flat.count > 30 else { return flat }
-        return String(flat.prefix(30)) + "…"
+        // 括号里基本是变量的具体值:「出口 IPv4 变了(123.90.7.74 → 144.1…）」。
+        // 按固定字数硬切,切出来正好是「144.1…」这种半个 IP —— 读者看到的是一段
+        // 乱码,而不是一句「出口变了」。括号前那半句已经把发生了什么说完,
+        // 具体数值留给悬浮提示和拦截记录页。所以长句优先在括号处断开。
+        let limit = 34
+        if flat.count > limit, let paren = flat.firstIndex(of: "(") {
+            let head = flat[..<paren].trimmingCharacters(in: .whitespaces)
+            if !head.isEmpty { return head }
+        }
+        guard flat.count > limit else { return flat }
+        return String(flat.prefix(limit)) + "…"
     }
 }
 
@@ -2564,14 +3535,14 @@ struct IncidentHistorySheet: View {
     var body: some View {
         ZStack {
             ClaudeBackground()
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: Geo.inline) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("拦截记录")
-                            .font(.system(size: 15, weight: .bold))
+                            .font(Type.titleFont)
                             .foregroundColor(ClaudeTheme.ink)
                         Text("看门狗真的动手停过 Claude 的事件，最多保留 50 条")
-                            .font(.system(size: 10.5))
+                            .font(Type.microFont)
                             .foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
@@ -2590,7 +3561,7 @@ struct IncidentHistorySheet: View {
                             .font(.system(size: 22))
                             .foregroundColor(ClaudeTheme.success.opacity(0.6))
                         Text("还没有拦截记录")
-                            .font(.system(size: 12))
+                            .font(Type.bodyFont)
                             .foregroundColor(ClaudeTheme.muted)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2600,20 +3571,17 @@ struct IncidentHistorySheet: View {
                             ForEach(vm.incidents) { item in
                                 HStack(alignment: .top, spacing: 8) {
                                     Text(item.kind)
-                                        .font(.system(size: 9.5, weight: .semibold))
-                                        .foregroundColor(ClaudeTheme.error)
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1.5)
-                                        .background(Capsule().fill(ClaudeTheme.error.opacity(0.10)))
+                                        .font(Type.microLabelFont)
+                                        .foregroundColor(ClaudeTheme.bad)
                                         .fixedSize()
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(item.reason)
-                                            .font(.system(size: 11.5))
+                                            .font(Type.microFont)
                                             .foregroundColor(ClaudeTheme.ink)
                                             .fixedSize(horizontal: false, vertical: true)
                                             .textSelection(.enabled)
                                         Text(item.time)
-                                            .font(.system(size: 9.5))
+                                            .font(Type.microFont)
                                             .foregroundColor(ClaudeTheme.muted)
                                     }
                                     Spacer(minLength: 0)
@@ -2646,13 +3614,13 @@ struct CheckSettingsView: View {
             ClaudeBackground()
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("检查设置").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("安全项始终强制执行；跳过不等于通过").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("检查设置").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
+                        Text("安全项始终强制执行；跳过不等于通过").font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(ClaudeTheme.muted)
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 15, weight: .medium)).foregroundColor(ClaudeTheme.muted)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("关闭")
@@ -2673,13 +3641,13 @@ struct CheckSettingsView: View {
                                         ))
                                         if vm.disabledChecks.contains(item.key) {
                                             Text("已关闭 · 不再拦截启动")
-                                                .font(.caption2)
+                                                .font(Type.microFont)
                                                 .foregroundColor(ClaudeTheme.warning)
                                         }
                                     }
                                 }
                                 Text("默认 14 项全部拦截启动。这里关掉的项会真正跳过探测，并以灰色「已跳过」显示 —— 那不叫通过，叫放弃验证。只在本机环境确实造成误报时才关。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。")
-                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                                    .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                             }
                             .padding(.vertical, 6)
                         }
@@ -2688,20 +3656,20 @@ struct CheckSettingsView: View {
                             VStack(alignment: .leading, spacing: 10) {
                                 Toggle("把上述 6 项的失败降为警告", isOn: $vm.allowOptionalFailures)
                                 Text("降级后这些项仍然会跑、仍然会报，只是不再拦住启动。只影响这 6 项；不会放宽任何硬性安全项，也不会自动关闭检测。")
-                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                                    .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                                 Toggle("记录脱敏客户端日志", isOn: $vm.loggingEnabled)
                                 Text("仅记录版本、命令、退出码、耗时和检查状态，不记录 IP、凭据或账号内容。")
-                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                                    .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                             }
                             .padding(.vertical, 6)
                         }
 
                         GroupBox("问题排查") {
-                            VStack(alignment: .leading, spacing: 9) {
+                            VStack(alignment: .leading, spacing: 10) {
                                 Button("导出脱敏诊断日志…") { vm.exportDiagnostics() }
                                     .disabled(vm.settingsBusy)
                                 Text("日志：~/Library/Logs/claude-switcher/client.log")
-                                    .font(.caption2).foregroundColor(ClaudeTheme.muted).textSelection(.enabled)
+                                    .font(Type.microFont).foregroundColor(ClaudeTheme.muted).textSelection(.enabled)
                             }
                             .padding(.vertical, 6)
                         }
@@ -2709,7 +3677,7 @@ struct CheckSettingsView: View {
                 }
 
                 if !vm.settingsMessage.isEmpty {
-                    Text(vm.settingsMessage).font(.caption).foregroundColor(ClaudeTheme.muted)
+                    Text(vm.settingsMessage).font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
@@ -2735,17 +3703,17 @@ struct FingerprintView: View {
     let text: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Geo.inline) {
             HStack {
-                Text("设备指纹体检").font(.headline).foregroundColor(ClaudeTheme.ink)
+                Text("设备指纹体检").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
                 Spacer()
                 Button("关闭") { dismiss() }.buttonStyle(.borderedProminent).tint(ClaudeTheme.terracottaDeep)
             }
             Text("字体地区特征 + GPU/虚拟机特征；Canvas/WebGL 请用 Web 检测页")
-                .font(.caption).foregroundColor(ClaudeTheme.muted)
+                .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
             ScrollView {
                 Text(text.isEmpty ? "正在体检…" : text)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(Type.microMono)
                     .foregroundColor(ClaudeTheme.ink)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -2770,12 +3738,12 @@ struct UpdateSheet: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("版本更新").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("只检查，不写入任何文件").font(.caption).foregroundColor(ClaudeTheme.muted)
+                        Text("版本更新").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
+                        Text("只检查，不写入任何文件").font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(ClaudeTheme.muted)
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 15, weight: .medium)).foregroundColor(ClaudeTheme.muted)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("关闭")
@@ -2783,39 +3751,37 @@ struct UpdateSheet: View {
 
                 ScrollView {
                     Text(vm.updateText.isEmpty ? "尚未检查" : vm.updateText)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(Type.microMono)
                         .foregroundColor(ClaudeTheme.ink)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(14)
                 .frame(height: 110)
-                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(ClaudeTheme.iconWell))
+                .background(RoundedRectangle(cornerRadius: Geo.cardRadius, style: .continuous).fill(ClaudeTheme.iconWell))
 
                 HStack(spacing: 10) {
                     Button { vm.checkUpdate() } label: {
                         Label("重新检查", systemImage: "arrow.clockwise")
-                            .font(.callout.bold())
+                            .font(Type.bodyStrongFont)
                             .padding(.horizontal, 16).padding(.vertical, 7)
-                            .background(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .leading, endPoint: .trailing))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
+                            .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.ink))
+                            .foregroundColor(ClaudeTheme.bg)
                     }
                     .buttonStyle(.plain)
                     Button { copyUpdateCommand() } label: {
                         Label(copied ? "已复制" : "复制更新命令", systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .font(.callout.bold())
+                            .font(Type.bodyStrongFont)
                             .padding(.horizontal, 16).padding(.vertical, 7)
                             .background(ClaudeTheme.iconWell)
                             .foregroundColor(ClaudeTheme.ink)
-                            .clipShape(Capsule())
                     }
                     .buttonStyle(.plain)
                     Spacer()
                 }
 
                 Text("复制后到终端执行即可更新；更新前会做 SHA256 校验，自检不通过会自动回滚。")
-                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                    .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
             }
             .padding(20)
         }
@@ -2840,15 +3806,15 @@ struct AIPromptSheet: View {
     var body: some View {
         ZStack {
             ClaudeBackground()
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: Geo.inline) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("AI 交接提示词").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("复制后粘贴给本地 AI，让它先读 AGENTS.md 再动手").font(.caption).foregroundColor(ClaudeTheme.muted)
+                        Text("AI 交接提示词").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
+                        Text("复制后粘贴给本地 AI，让它先读 AGENTS.md 再动手").font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(ClaudeTheme.muted)
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 15, weight: .medium)).foregroundColor(ClaudeTheme.muted)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("关闭")
@@ -2856,23 +3822,22 @@ struct AIPromptSheet: View {
 
                 ScrollView {
                     Text(text)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(Type.microMono)
                         .foregroundColor(ClaudeTheme.ink)
                         .textSelection(.enabled)
-                        .lineSpacing(2)
+                        .lineSpacing(Type.microLineGap)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(14)
-                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(ClaudeTheme.iconWell))
+                .background(RoundedRectangle(cornerRadius: Geo.cardRadius, style: .continuous).fill(ClaudeTheme.iconWell))
 
                 HStack {
                     Button { copyPrompt() } label: {
                         Label(copied ? "已复制" : "复制", systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .font(.callout.bold())
+                            .font(Type.bodyStrongFont)
                             .padding(.horizontal, 18).padding(.vertical, 7)
-                            .background(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .leading, endPoint: .trailing))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
+                            .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.ink))
+                            .foregroundColor(ClaudeTheme.bg)
                     }
                     .buttonStyle(.plain)
                     Spacer()
@@ -2912,12 +3877,12 @@ struct NoticeView: View {
             VStack(spacing: 0) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("安全防护体系公告").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("Security Architecture Bulletin").font(.caption).foregroundColor(ClaudeTheme.muted)
+                        Text("安全防护体系公告").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
+                        Text("Security Architecture Bulletin").font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(ClaudeTheme.muted)
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 15, weight: .medium)).foregroundColor(ClaudeTheme.muted)
                     }
                     .buttonStyle(.plain)
                 }
@@ -2926,15 +3891,15 @@ struct NoticeView: View {
                 ScrollView {
                     VStack(spacing: 10) {
                         Text("本产品面向对账号环境一致性有严格要求的专业用户，基于 Fail-Closed（故障即断）原则构建，针对目标平台的 Risk Control 体系提供全链路防护，确保本地真实出口在任何场景下零暴露。")
-                            .font(.callout)
+                            .font(Type.bodyFont)
                             .foregroundColor(ClaudeTheme.muted)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.bottom, 6)
 
                         ForEach(Array(sections.enumerated()), id: \.offset) { idx, s in
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text("\(idx + 1). \(s.0)").font(.callout.bold()).foregroundColor(ClaudeTheme.terracottaDeep)
-                                Text(s.1).font(.caption).foregroundColor(ClaudeTheme.muted).lineSpacing(3)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("\(idx + 1). \(s.0)").font(Type.bodyStrongFont).foregroundColor(ClaudeTheme.terracottaDeep)
+                                Text(s.1).font(Type.microFont).foregroundColor(ClaudeTheme.muted).lineSpacing(Type.microLineGap)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(12)
@@ -2943,7 +3908,7 @@ struct NoticeView: View {
                         }
 
                         Text("本防护体系基于对目标平台风控机制的持续逆向分析与实战经验迭代。")
-                            .font(.caption2)
+                            .font(Type.microFont)
                             .foregroundColor(ClaudeTheme.muted)
                             .padding(.top, 8)
                     }
@@ -3013,32 +3978,29 @@ struct LatencyInsightSheet: View {
     // MARK: 头部
 
     private var header: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .top, spacing: Geo.inline) {
             Image(systemName: "chart.xyaxis.line")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(ClaudeTheme.terracotta)
                 .frame(width: 30, height: 30)
-                .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
                     .fill(ClaudeTheme.terracotta.opacity(0.10)))
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
                     Text("Anthropic 生态探测 · 延迟历史")
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(Type.titleFont)
                         .foregroundColor(ClaudeTheme.ink)
                     HStack(spacing: 4) {
                         Circle().fill(samples.isEmpty ? ClaudeTheme.muted : ClaudeTheme.success)
                             .frame(width: 4.5, height: 4.5)
                         Text(samples.isEmpty ? "等待采样" : "监测中")
-                            .font(.system(size: 9.5, weight: .medium))
+                            .font(Type.microLabelFont)
                             .foregroundColor(samples.isEmpty ? ClaudeTheme.muted : ClaudeTheme.success)
                     }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill((samples.isEmpty ? ClaudeTheme.muted : ClaudeTheme.success).opacity(0.10)))
                 }
                 Text("每次环境检查都会记一条 api 首包耗时，按时间回放")
-                    .font(.system(size: 10.5))
+                    .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.muted)
             }
 
@@ -3048,12 +4010,12 @@ struct LatencyInsightSheet: View {
                 ForEach(ranges, id: \.1) { label, h in
                     Button { hours = h } label: {
                         Text(label)
-                            .font(.system(size: 10.5, weight: hours == h ? .semibold : .regular))
+                            .font(hours == h ? Type.microLabelFont : Type.microFont)
                             .foregroundColor(hours == h ? ClaudeTheme.ink : ClaudeTheme.muted)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
                             .background(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
                                     .fill(hours == h ? ClaudeTheme.card : Color.clear)
                             )
                             .contentShape(Rectangle())
@@ -3062,7 +4024,7 @@ struct LatencyInsightSheet: View {
                 }
             }
             .padding(2)
-            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(ClaudeTheme.iconWell))
+            .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.iconWell))
 
             Button { dismiss() } label: {
                 Image(systemName: "xmark")
@@ -3103,31 +4065,30 @@ struct LatencyInsightSheet: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 4) {
                 Text(title)
-                    .font(.system(size: 10))
+                    .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.muted)
                 Spacer(minLength: 0)
                 Image(systemName: symbol)
-                    .font(.system(size: 8.5))
+                    .font(.system(size: 9))
                     .foregroundColor(tint.opacity(0.85))
             }
             HStack(alignment: .firstTextBaseline, spacing: 2) {
                 Text(value)
-                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                    .font(Type.metricFont)
                     .foregroundColor(ClaudeTheme.ink)
                 Text(unit)
-                    .font(.system(size: 10))
+                    .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.muted)
             }
             Text(note)
-                .font(.system(size: 9.5))
-                .foregroundColor(ClaudeTheme.muted.opacity(0.8))
+                .font(Type.microFont)
+                .foregroundColor(ClaudeTheme.faint)
                 .lineLimit(1)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 13)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 15, style: .continuous).fill(ClaudeTheme.card))
-        .shadow(color: Color.black.opacity(0.05), radius: 9, x: 0, y: 2)
+        .cardSurface()
     }
 
     // MARK: 曲线
@@ -3137,19 +4098,20 @@ struct LatencyInsightSheet: View {
             HStack(spacing: 6) {
                 Circle().fill(ClaudeTheme.terracotta).frame(width: 5, height: 5)
                 Text("端到端首包耗时")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(Type.microLabelFont)
                     .foregroundColor(ClaudeTheme.ink)
                 Text("· 采样 \(samples.count) 个")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.8))
+                    .font(Type.microFont)
+                    .monospacedDigit()
+                    .foregroundColor(ClaudeTheme.faint)
                 Spacer(minLength: 8)
                 HStack(spacing: 4) {
-                    RoundedRectangle(cornerRadius: 1).fill(ClaudeTheme.terracotta).frame(width: 12, height: 2)
-                    Text("api 首包").font(.system(size: 9.5)).foregroundColor(ClaudeTheme.muted)
+                    Rectangle().fill(ClaudeTheme.brand).frame(width: 12, height: 2)
+                    Text("api 首包").font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                 }
                 HStack(spacing: 4) {
-                    RoundedRectangle(cornerRadius: 1).fill(ClaudeTheme.warning.opacity(0.5)).frame(width: 12, height: 1.5)
-                    Text("500ms 警戒").font(.system(size: 9.5)).foregroundColor(ClaudeTheme.muted)
+                    Rectangle().fill(ClaudeTheme.warn.opacity(0.5)).frame(width: 12, height: 1.5)
+                    Text("500ms 警戒").font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                 }
             }
 
@@ -3157,8 +4119,7 @@ struct LatencyInsightSheet: View {
                 .frame(height: 150)
         }
         .padding(16)
-        .background(RoundedRectangle(cornerRadius: 15, style: .continuous).fill(ClaudeTheme.card))
-        .shadow(color: Color.black.opacity(0.05), radius: 9, x: 0, y: 2)
+        .cardSurface()
     }
 
     // MARK: 端点
@@ -3167,13 +4128,13 @@ struct LatencyInsightSheet: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Text("端点可用性")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(Type.microLabelFont)
                     .foregroundColor(ClaudeTheme.ink)
                 Spacer(minLength: 8)
                 // 只有脚本真的探过这两个域,不凑数。cdn / statsig 没探就不显示。
                 Text("仅统计脚本实际探测的端点")
-                    .font(.system(size: 9.5))
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.75))
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.faint)
             }
             HStack(spacing: 10) {
                 endpointTile("claude.ai", code: samples.last?.claudeCode ?? "—",
@@ -3192,25 +4153,22 @@ struct LatencyInsightSheet: View {
                 .font(.system(size: 9))
                 .foregroundColor(ClaudeTheme.muted)
             Text(host)
-                .font(.system(size: 10.5, design: .monospaced))
+                .font(Type.microMono)
                 .foregroundColor(ClaudeTheme.ink)
             Spacer(minLength: 6)
             if let latency {
                 Text("\(latency)ms")
-                    .font(.system(size: 9.5, design: .monospaced))
+                    .font(Type.microMono)
                     .foregroundColor(ClaudeTheme.muted)
             }
             Text(code)
-                .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                .font(Type.microMonoLabel)
                 .foregroundColor(tint)
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1.5)
-                .background(Capsule().fill(tint.opacity(0.10)))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(ClaudeTheme.iconWell))
+        .background(RoundedRectangle(cornerRadius: Geo.innerRadius, style: .continuous).fill(ClaudeTheme.iconWell))
     }
 
     // MARK: 事件
@@ -3219,48 +4177,50 @@ struct LatencyInsightSheet: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: "clock.arrow.circlepath")
-                    .font(.system(size: 9.5))
+                    .font(.system(size: 9))
                     .foregroundColor(ClaudeTheme.muted)
                 Text("关键事件")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(Type.microLabelFont)
                     .foregroundColor(ClaudeTheme.ink)
                 Spacer(minLength: 8)
                 Text("共 \(vm.incidents.count) 条")
-                    .font(.system(size: 9.5, design: .monospaced))
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.8))
+                    .font(Type.microFont)
+                    .monospacedDigit()
+                    .foregroundColor(ClaudeTheme.faint)
             }
             if vm.incidents.isEmpty {
                 Text("还没有拦截记录。看门狗没有动过手，就是最好的状态。")
-                    .font(.system(size: 10.5))
+                    .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.muted)
                     .padding(.vertical, 6)
             } else {
                 VStack(spacing: 6) {
                     ForEach(vm.incidents.prefix(4)) { item in
                         HStack(alignment: .top, spacing: 8) {
-                            Circle().fill(ClaudeTheme.error.opacity(0.8))
-                                .frame(width: 5, height: 5)
-                                .padding(.top, 4)
-                            VStack(alignment: .leading, spacing: 1) {
+                            // 中性小方块做列表标记：形状表「这是一条」，颜色不表态（§5 禁彩色糖豆）
+                            Rectangle().fill(ClaudeTheme.faint)
+                                .frame(width: 4, height: 4)
+                                .padding(.top, 6)
+                            VStack(alignment: .leading, spacing: 2) {
                                 Text(item.kind)
-                                    .font(.system(size: 10.5, weight: .medium))
+                                    .font(Type.microLabelFont)
                                     .foregroundColor(ClaudeTheme.ink)
                                 Text(item.reason)
-                                    .font(.system(size: 10))
+                                    .font(Type.microFont)
                                     .foregroundColor(ClaudeTheme.muted)
                                     .lineLimit(2)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                             Spacer(minLength: 8)
                             Text(clockText(item.time))
-                                .font(.system(size: 9.5, design: .monospaced))
-                                .foregroundColor(ClaudeTheme.muted.opacity(0.75))
+                                .font(Type.microMono)
+                                .foregroundColor(ClaudeTheme.faint)
                                 .fixedSize()
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 8)
                         .background(ClaudeTheme.iconWell.opacity(0.6))
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous))
                     }
                 }
             }
@@ -3272,36 +4232,36 @@ struct LatencyInsightSheet: View {
     private var footer: some View {
         HStack(spacing: 10) {
             Button { exportJSON() } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "square.and.arrow.down").font(.system(size: 9.5))
-                    Text("导出 JSON").font(.system(size: 10.5, weight: .medium))
+                HStack(spacing: 6) {
+                    Image(systemName: "square.and.arrow.down").font(.system(size: 9))
+                    Text("导出 JSON").font(Type.microLabelFont)
                 }
                 .foregroundColor(ClaudeTheme.ink)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
-                .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(ClaudeTheme.iconWell))
+                .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.iconWell))
             }
             .buttonStyle(.plain)
             .disabled(samples.isEmpty)
 
             if !exportNote.isEmpty {
                 Text(exportNote)
-                    .font(.system(size: 9.5))
+                    .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.success)
                     .lineLimit(1)
             }
 
             Spacer(minLength: 8)
             Text("采样由 claude-switch.sh check 落盘，界面只读")
-                .font(.system(size: 9.5))
-                .foregroundColor(ClaudeTheme.muted.opacity(0.7))
+                .font(Type.microFont)
+                .foregroundColor(ClaudeTheme.faint)
             Button { dismiss() } label: {
                 Text("完成")
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(Type.microLabelFont)
                     .foregroundColor(.white)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 6)
-                    .background(Capsule().fill(ClaudeTheme.terracotta))
+                    .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.ink))
             }
             .buttonStyle(.plain)
         }
@@ -3360,16 +4320,16 @@ private struct RTTChart: View {
                 VStack(spacing: 6) {
                     Image(systemName: "waveform.path")
                         .font(.system(size: 18))
-                        .foregroundColor(ClaudeTheme.muted.opacity(0.5))
+                        .foregroundColor(ClaudeTheme.faint)
                     Text("还没有采样数据")
-                        .font(.system(size: 10.5))
+                        .font(Type.microFont)
                         .foregroundColor(ClaudeTheme.muted)
                     Text("每次「重新检查」会记一条，多跑几次就有曲线了")
-                        .font(.system(size: 9.5))
-                        .foregroundColor(ClaudeTheme.muted.opacity(0.7))
+                        .font(Type.microFont)
+                        .foregroundColor(ClaudeTheme.faint)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .background(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
                     .fill(ClaudeTheme.iconWell.opacity(0.45)))
             } else {
                 chart(in: geo.size)
@@ -3426,9 +4386,7 @@ private struct RTTChart: View {
                 .stroke(ClaudeTheme.warning.opacity(0.45), style: StrokeStyle(lineWidth: 0.8, dash: [4, 3]))
             }
 
-            area.fill(LinearGradient(colors: [ClaudeTheme.terracotta.opacity(0.20),
-                                              ClaudeTheme.terracotta.opacity(0.0)],
-                                     startPoint: .top, endPoint: .bottom))
+            area.fill(ClaudeTheme.brand.opacity(0.10))
             line.stroke(ClaudeTheme.terracotta, style: StrokeStyle(lineWidth: 1.8, lineJoin: .round))
 
             if let last = pts.last {
@@ -3441,14 +4399,19 @@ private struct RTTChart: View {
             // 右侧刻度。用 verbatim:Text 的字符串插值会走本地化数字格式,
             // 四位数会被加上千分位,显示成「1,680ms」。
             VStack {
-                Text(verbatim: "\(topMS)ms").font(.system(size: 8.5, design: .monospaced))                    .foregroundColor(ClaudeTheme.muted.opacity(0.6))
+                Text(verbatim: "\(topMS)ms")
+                    .font(Type.microMono)
+                    .monospacedDigit()
+                    .foregroundColor(ClaudeTheme.faint)
                 Spacer()
-                Text("0").font(.system(size: 8.5, design: .monospaced))
-                    .foregroundColor(ClaudeTheme.muted.opacity(0.6))
+                Text("0")
+                    .font(Type.microMono)
+                    .monospacedDigit()
+                    .foregroundColor(ClaudeTheme.faint)
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
-        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+        .background(RoundedRectangle(cornerRadius: Geo.innerRadius, style: .continuous)
             .fill(ClaudeTheme.iconWell.opacity(0.5)))
     }
 }
@@ -3480,6 +4443,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vm.onSwitchCompleted = { [weak self] in self?.mainWindow?.orderOut(nil) }
         showMainWindow()
         vm.start()
+        vm.trackClaudeProcess()
         // 检查结果一变,内容高度就变,窗口跟着收放。debounce 是因为一次检查
         // 会连发十几个 objectWillChange,每次都重量等于白烧 CPU。
         heightObserver = vm.objectWillChange
@@ -3505,7 +4469,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 styleMask: style,
                 backing: .buffered, defer: false
             )
-            window.title = "Claude切换器"
+            window.title = "Claude 环境检查器"
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             window.isMovableByWindowBackground = true
@@ -3596,8 +4560,8 @@ struct MenuBarContent: View {
     let showWindow: () -> Void
 
     var body: some View {
-        Text("Claude 切换器")
-        Text("当前账号：\(vm.current)")
+        Text("Claude 环境检查器")
+        Text("当前槽位：\(vm.current)")
         if vm.intercepted {
             // 拦截后「最近检查：通过」是事实,但完全不是用户现在该看的东西。
             Text(vm.banner).foregroundStyle(.red)
@@ -3630,7 +4594,7 @@ struct MenuBarContent: View {
         Button("导出诊断日志") { vm.exportDiagnostics() }
             .disabled(vm.settingsBusy)
         Divider()
-        Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }
+        Button("退出 Claude 环境检查器") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
             .disabled(!vm.canQuit)
             .onAppear { vm.refreshAccountStatus() }
@@ -3643,7 +4607,10 @@ struct SwitcherMenu: Scene {
     let controller: AppDelegate
 
     private static let normalImage: NSImage = {
-        let image = NSImage(systemSymbolName: "shield.lefthalf.filled", accessibilityDescription: "Claude 切换器")!
+        // 用 .fill 不用线框版：菜单栏图标是唯一一直可见的品牌符号，
+        // 细线版在浅色菜单栏上几乎只剩一圈边。而且「被拦截」那枚本来就是填充的
+        // （exclamationmark.shield.fill），两态字重不一致会显得像两个应用。
+        let image = NSImage(systemSymbolName: "checkmark.shield.fill", accessibilityDescription: "Claude 环境检查器")!
         image.isTemplate = true
         return image
     }()
@@ -3661,12 +4628,12 @@ struct SwitcherMenu: Scene {
             MenuBarContent(vm: vm, showWindow: controller.showMainWindow)
         } label: {
             Image(nsImage: vm.intercepted ? Self.blockedImage : Self.normalImage)
-                .accessibilityLabel(vm.intercepted ? "Claude 切换器：已拦截" : "Claude 切换器")
+                .accessibilityLabel(vm.intercepted ? "Claude 环境检查器：已拦截" : "Claude 环境检查器")
         }
         .menuBarExtraStyle(.menu)
         .commands {
             CommandGroup(replacing: .appTermination) {
-                Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }
+                Button("退出 Claude 环境检查器") { NSApplication.shared.terminate(nil) }
                     .keyboardShortcut("q")
                     .disabled(!vm.canQuit)
             }

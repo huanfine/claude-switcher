@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "core/claude-switch.sh"
-OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性")
+OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性")
 
 
 class OptionalLoggingTests(unittest.TestCase):
@@ -95,12 +95,12 @@ esac''')
 
     def test_disabled_checks_skip_probes_and_never_report_ok(self):
         self.prepare_checkdetail()
-        self.write_settings({"disabled": ["DNS", "WebRTC", "ASN属性", "生态可达性"],
+        self.write_settings({"disabled": ["DNS", "WebRTC", "ASN属性", "IP纯净度", "生态可达性"],
                              "allowOptionalFailures": False, "logging": True})
         run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],
                              text=True, capture_output=True, env=self.env, timeout=10)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        for name in ("DNS", "WebRTC", "ASN属性", "生态可达性"):
+        for name in ("DNS", "WebRTC", "ASN属性", "IP纯净度", "生态可达性"):
             self.assertIn(name + "=skip:用户已禁用", run.stdout)
         calls = self.calls.read_text(encoding="utf-8") if self.calls.exists() else ""
         self.assertNotIn("python3", calls)

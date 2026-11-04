@@ -18,9 +18,9 @@ import tempfile
 import zipfile
 
 
-OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性")
+OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性")
 ALL_CHECKS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
-              "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性")
+              "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性")
 DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True}
 LOG_LIMIT = 512 * 1024
 
@@ -1085,6 +1085,11 @@ def migrate_merge(path):
 def write_changes(changes):
     changes = {path: data.encode("utf-8") for path, data in changes.items()
                if not path.exists() or path.read_bytes() != data.encode("utf-8")}
+    # 返回「真正动过哪几个文件」。调用方要靠它决定**要不要重启客户端** ——
+    # 内容一模一样时重启是纯损失:客户端要重新起内核、TUN 要重建,
+    # 这几秒里所有走 TUN 的请求都会失败,而用户只是又点了一次「修复」。
+    if not changes:
+        return []
     originals, staged, replaced = {}, {}, []
     try:
         for path, data in changes.items():
@@ -1111,6 +1116,7 @@ def write_changes(changes):
         for temp in staged.values():
             if temp.exists():
                 temp.unlink()
+    return replaced
 
 
 def assess_probe(policy, expected_ip, output, exit_code):
@@ -1181,16 +1187,22 @@ def main():
     changes = {script_path: new_script, policy_path: policy + "\n"}
     if new_merge is not None:
         changes[merge_path] = new_merge
-    write_changes(changes)
-    print("OK:全局脚本已写入(" + policy + ")")
+    replaced = write_changes(changes)
+    # 「无变化」要明确报出来:fix 靠这一句决定要不要重启客户端。
+    # 只写「已写入」时,调用方无从知道该不该重启,只能每次都重启 ——
+    # 于是「再点一次修复」也要付一次内核重启 + TUN 重建的代价。
+    print("OK:全局脚本已写入(" + policy + ("，无变化)" if not replaced else "，变更 %d 处)" % len(replaced)))
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, TypeError, AttributeError):
-        fail("规则配置处理失败，未确认修复；请检查配置格式与权限")
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        # 带上是哪一类异常、说了什么。原来只有一句「规则配置处理失败,请检查格式与权限」——
+        # 用户照着这句话什么也检查不了,我们自己也拿不到线索(实测就卡在这里:
+        # 内核正在重启,请求打空 → OSError,那条提示却读起来像配置坏了)。
+        fail("规则配置处理失败(%s: %s)；请检查配置格式与权限" % (type(exc).__name__, exc))
 PY_CLASH_RULES
 fi
 
@@ -1770,23 +1782,324 @@ ip_class() {
     esac
 }
 
+# ---- IP 纯净度评级 ----
+# 口径对齐 ip.net.coffee 的 Trust Score。实测它给:住宅 100、VPN 61~69、机房 51~58、
+# Tor 43~50,结构是「按出口类型给基线分,再按滥用记录惩罚」,不是从 100 逐项减。
+# 照这个结构走,我们的数字才有对照价值 —— 用户能拿它和别的检测站点比。
+#
+# 但「分数」和「判定」必须分开。它的 trust_score 衡量的是 IP 信誉(口径宽,连 Tor 都
+# 能拿 50 分「良好」),对 Claude 的适用性由另外两层表达:ai_verdict 与受限地区强制 0。
+# 我们只有一个分数决定拦不拦启动,所以分数向它对齐、判定按 Claude 风控收紧 ——
+# Tor 拿 41 分照样红叉。
+#
+# 数据源全部免注册:
+#   ipquery.io     类型标志 + risk_score + 地理
+#   ip-api.com     免费版只走 http,但判别口径不同(实测 Cloudflare WARP 它报
+#                  proxy:true,ipquery 只报 datacenter),所以两个都要问
+#   ipinfo.io      第三个地理源,用于交叉验证
+#   dig -x         PTR。实测 fake-ip 不劫持反向解析,而出口常常自曝身份:
+#                  tor-exit-read-me.dfri.se / …static.cloudzy.com / …hsd1.ca.comcast.net
+#   stopforumspam  滥用记录。DNSBL 这条走不通:Clash fake-ip 会把任何 A 查询接管成
+#                  198.18.x,黑名单命中率全是假的,所以只能用 HTTP 接口。
+PURITY_CACHE_TTL=86400
+
+# 从扁平 JSON 取标量字段。不引入 jq:检查链路得能在只装了 Xcode 命令行工具的机器上跑,
+# 多一个依赖就多一个装不上的理由。
+_ipfield() {
+    printf '%s' "${1:-}" | grep -o "\"$2\":[^,}]*" | head -1 | cut -d: -f2- | tr -d '" '
+}
+
+# 输出一行: <score>|<verdict>|<flags>|<detail>
+# verdict 取 ok|warn|fail|unknown;unknown = 没拿到数据,由调用方决定怎么报。
+ip_purity() {
+    local ip="${1:-}" now cip cep cver cscore ctype cdet
+    # 字段分隔用 | 而不是 tab:tab 属于 IFS 空白,read 会把前导空字段整个吞掉,
+    # 于是「无分数」这条路径会被解析成 score=unknown、detail 为空 —— 静默错位。
+    [ -z "$ip" ] && { printf '|unknown||未取到出口IP'; return 0; }
+    now=$(date +%s)
+
+    # 同一出口 24h 内复用结果:一次检查要打 4 个网络请求,而出口一天里不会变几十次。
+    # 查不到不写缓存,否则一次网络抖动会把「未知」钉住一整天。
+    # 文件名带 v2:第 5 个字段从「扣分标签」换成了「出口类型」,字段数虽然一样,
+    # 混用旧文件会让类型串进错位,宁可让旧缓存作废。
+    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v2" ]; then
+        while IFS='|' read -r cip cep cver cscore ctype cdet || [ -n "$cip" ]; do
+            [ "$cip" = "$ip" ] || continue
+            case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
+            case "${cscore:-}" in ''|*[!0-9]*) continue ;; esac
+            [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
+            printf '%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet"
+            return 0
+        done < "$BASE/purity-cache.v2"
+    fi
+
+    local q1 q2 q3 q4 b1 b2 b3 b4 rdns=""
+    q1=$(mktemp "${TMPDIR:-/tmp}/purity1.XXXXXX") || return 0
+    q2=$(mktemp "${TMPDIR:-/tmp}/purity2.XXXXXX") || { rm -f "$q1"; return 0; }
+    q3=$(mktemp "${TMPDIR:-/tmp}/purity3.XXXXXX") || { rm -f "$q1" "$q2"; return 0; }
+    q4=$(mktemp "${TMPDIR:-/tmp}/purity4.XXXXXX") || { rm -f "$q1" "$q2" "$q3"; return 0; }
+    # 四个源并行:串行最坏 20 秒,会顶掉 App 的 45 秒检查预算。
+    curl -sL --max-time 6 "https://api.ipquery.io/$ip" >"$q1" 2>/dev/null &
+    curl -s --max-time 4 "http://ip-api.com/json/$ip?fields=status,proxy,hosting,mobile,city,regionName,timezone" >"$q2" 2>/dev/null &
+    curl -sL --max-time 4 "https://ipinfo.io/$ip/json" >"$q3" 2>/dev/null &
+    curl -s --max-time 4 "https://api.stopforumspam.org/api?ip=$ip&json" >"$q4" 2>/dev/null &
+    wait
+    b1=$(cat "$q1" 2>/dev/null); b2=$(cat "$q2" 2>/dev/null)
+    b3=$(cat "$q3" 2>/dev/null); b4=$(cat "$q4" 2>/dev/null)
+    rm -f "$q1" "$q2" "$q3" "$q4"
+    # PTR 走本地解析器,不占网络预算。去掉结尾的点,便于按关键词匹配。
+    rdns=$(dig +short -x "$ip" +time=2 +tries=1 2>/dev/null | head -1 | sed 's/\.$//')
+
+    local dc="" mob="" px="" tor="" risk="" tzip="" abfreq=""
+    case "$(_ipfield "$b1" is_datacenter)" in true) dc=1 ;; esac
+    case "$(_ipfield "$b1" is_mobile)" in true) mob=1 ;; esac
+    case "$(_ipfield "$b1" is_vpn)" in true) px=1 ;; esac
+    case "$(_ipfield "$b1" is_proxy)" in true) px=1 ;; esac
+    case "$(_ipfield "$b1" is_tor)" in true) tor=1 ;; esac
+    risk=$(_ipfield "$b1" risk_score)
+    tzip=$(_ipfield "$b1" timezone)
+    case "$(_ipfield "$b2" proxy)" in true) px=1 ;; esac
+    case "$(_ipfield "$b2" hosting)" in true) dc=1 ;; esac
+    case "$(_ipfield "$b2" mobile)" in true) mob=1 ;; esac
+    abfreq=$(_ipfield "$b4" frequency)
+
+    # PTR 自曝的特征。这一条比任何第三方评分都硬:出口自己把身份写进了反向解析。
+    case "$rdns" in
+        *tor-exit*|*tor-relay*|*torexit*|*.exit.*) tor=1 ;;
+    esac
+    case "$rdns" in
+        *vpn*|*openvpn*|*wireguard*|*proxy*) px=1 ;;
+    esac
+
+    # 两件事必须分开判,混成一件就会在两侧各错一次:
+    #   ① 数据源「认识」这个地址吗 —— 有的源对不存在的网段不报错,而是回一份结构完整、
+    #      标志全 false、risk_score 为 0 的空壳(实测 ipquery 对 192.0.2.55 就是这样,
+    #      ip-api 则老实回 status:fail「reserved range」)。空壳读起来和「住宅且毫无风险」
+    #      一模一样,分不开,一个查错的地址就会拿到 100 分 —— 那是最糟的假绿。
+    #   ② 我们手上有几个风险信号 —— 认识地址 ≠ 拿到了代理/滥用证据。
+    #      两个风险源全挂时(实测 ipquery 与 ip-api 会同时连不上),仍可以靠 ipinfo 的
+    #      运营商名把类型判出来,但分数不能报满分:那是拿「没查」冒充「查干净了」。
+    #      也不能就此拦启动 —— 拿我们自己的网络抖动去堵用户,是拿误报换安全感。
+    local known="" src_n=0 org3=""
+    if printf '%s' "$b1" | grep -q '"org"[[:space:]]*:[[:space:]]*"[^"]' \
+       || printf '%s' "$b1" | grep -q '"isp"[[:space:]]*:[[:space:]]*"[^"]'; then
+        known=1; src_n=$((src_n+1))
+    fi
+    [ "$(_ipfield "$b2" status)" = "success" ] && { known=1; src_n=$((src_n+1)); }
+    # ipinfo 只说「这个地址有主」,它一个风险标志都不给,所以只参与 ①、不参与 ②。
+    org3=$(printf '%s' "$b3" | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ -n "$org3" ] && known=1
+    # PTR 能解出来,本身就证明这个地址存在且有人给它起过名字 —— 而且反向解析常常
+    # 直接写着出口类型(hsd1 / static / tor-exit)。三家 HTTP 源全挂时,它是最后一根
+    # 可用的线索,不能因为「不在那四份响应里」就当作没有。
+    [ -n "$rdns" ] && known=1
+    if [ -z "$known" ]; then
+        printf '|unknown||未取到该出口的信誉数据,本次未评级'
+        return 0
+    fi
+    # 一家风险源都没答上来:进入降级判型,结论只能给到类型这一层。
+    local degraded=""
+    [ "$src_n" = "0" ] && degraded=1
+
+    # 类型判定。顺序即优先级:Tor > 代理/VPN > 机房 > 移动 > 住宅。
+    # 低优先级不许覆盖高优先级 —— Tor 出口常常同时被打上 residential 标记
+    # (实测 DFRI 那个就是),按顺序判才不会把 Tor 洗成「住宅宽带」。
+    # ASN 运营商名优先用已经拿到的 ipinfo 响应(q3),不要再去调 ip_org ——
+    # 那会为同一个字段多发一次 ipinfo 请求。
+    # ipinfo 免费额度被打满时会回 429(实测连续查询就会,共享出口更容易),此时
+    # ip_org 也会跟着空 —— 于是类型退化成「不明」、70 分、warn,给一个真实的
+    # Comcast 用户报「建议换住宅或原生 IP」,是彻底的误导。所以中间插一层:
+    # ipquery 的响应里本来就带着运营商名,零成本,先拿它顶上。
+    local asn_org asn_kind type="unknown" resid_hint="" host_hint=""
+    asn_org="$org3"
+    [ -z "$asn_org" ] && asn_org=$(printf '%s' "$b1" | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ -z "$asn_org" ] && asn_org=$(ip_org "$ip")
+    asn_kind=$(ip_class "$asn_org")
+    case "$rdns" in
+        *hsd*|*dynamic*|*dhcp*|*broadband*|*adsl*|*ppp*|*dial*|*dsl*|*fiber*|*cable*) resid_hint=1 ;;
+    esac
+    case "$rdns" in
+        *static*|*cloud*|*vps*|*dedicated*|*server*|*hosting*|*datacenter*|*colo*) host_hint=1 ;;
+    esac
+    if [ -n "$tor" ]; then
+        type=tor
+    elif [ -n "$px" ]; then
+        type=vpn
+    elif [ -n "$dc" ] || [ -n "$host_hint" ] || [ "$asn_kind" = "hosting" ]; then
+        type=hosting
+    elif [ -n "$mob" ]; then
+        type=mobile
+    elif [ -n "$resid_hint" ] || [ "$asn_kind" = "residential" ]; then
+        type=residential
+    fi
+
+    # 基线分:直接对齐 ip.net.coffee 的实测落点,让两边的数字可比。
+    local base
+    case "$type" in
+        tor)         base=50 ;;
+        vpn)         base=75 ;;
+        hosting)     base=60 ;;
+        mobile)      base=85 ;;
+        residential) base=100 ;;
+        # 类型不明不给满分,也不当机房:70 分落在「良好」档,提示但不拦。
+        *)           base=70 ;;
+    esac
+
+    local pen=0 riskpen=0 abpen=0 flags=""
+    # 1) 第三方风险分:分段而非线性 —— 对齐 net.coffee 对 abuser_score 的处理方式
+    #    (Low/Elevated/High 各一档),连续值直接相乘会让一家源的刻度决定全局。
+    case "${risk:-}" in
+        ''|*[!0-9]*) ;;
+        *) if   [ "$risk" -ge 51 ]; then riskpen=12
+           elif [ "$risk" -ge 26 ]; then riskpen=9
+           elif [ "$risk" -ge 11 ]; then riskpen=7
+           elif [ "$risk" -ge 1 ];  then riskpen=3
+           fi ;;
+    esac
+    # 2) 滥用记录(stopforumspam)。实测住宅与正常机房都是 0,只有 Tor/VPN 段会命中,
+    #    所以这一条几乎不会误伤 —— 命中就是真的被拿去刷过。
+    case "${abfreq:-}" in
+        ''|*[!0-9]*|0) ;;
+        *) if   [ "$abfreq" -ge 51 ]; then abpen=14
+           elif [ "$abfreq" -ge 11 ]; then abpen=9
+           else abpen=5
+           fi
+           flags="$flags ·滥用记录" ;;
+    esac
+    # 两个都是「历史信誉」信号,而且高度相关:Tor 出口的 risk_score 天然高、
+    # 也天然被拿去刷过。相加等于同一个事实罚两次,取较大者即可。
+    pen=$riskpen
+    [ "$abpen" -gt "$pen" ] && pen=$abpen
+
+    # 3) 地理一致性:三个源说了几个不同的城市?≥2 个就说明这个 IP 的地理归属本身是模糊的。
+    #    实测 RouterHosting 那段 ipquery/ipinfo 报犹他、ip-api 报内华达,跨了州 ——
+    #    这种情况下拿任何一个源的时区去要求用户对齐都是在冤枉人。所以只标「地理模糊」
+    #    小幅扣分,不再按「时区不符」处理。只有三源一致时才比较时区。
+    #    这一维只对「机房/移动/类型不明」成立:它们的出口城市是固定的基础设施位置。
+    #    住宅跳过 —— 家宽的注册地与实际接入地本来就会不同(跨州搬迁、运营商池化),
+    #    那既不是风险,也不该拿它去要求用户对齐;而且实测 net.coffee 对住宅一律给 100。
+    #    Tor 与代理也跳过 —— 它们的「城市」本来就是数据中心位置,三个源按各自的出口点
+    #    库去标必然互相不一致(实测两个随机 Tor 出口全部命中「地理模糊」),给它们挂这个
+    #    标记是纯噪声:类型罚分已经说明问题了。同理「系统时区与出口不一致」另有「时区」
+    #    那一项在管,这里再罚一次是重复计费。
+    local c1 c2 c3 ncities
+    c1=$(_ipfield "$b1" city); c2=$(_ipfield "$b2" city); c3=$(_ipfield "$b3" city)
+    ncities=$(printf '%s\n%s\n%s\n' "$c1" "$c2" "$c3" | grep -v '^$' | sort -u | wc -l | tr -d ' ')
+    case "$type" in
+        residential|tor|vpn) ;;   # 这三类的城市不反映用户位置,整段跳过
+        *)
+            if [ "${ncities:-0}" -ge 2 ]; then
+                pen=$((pen+4)); flags="$flags ·地理模糊"
+            elif [ "${ncities:-0}" -lt 2 ] && [ -n "$tzip" ] && [ -n "${TZ_TARGET:-}" ] && [ "$tzip" != "$TZ_TARGET" ]; then
+                pen=$((pen+6)); flags="$flags ·时区不符"
+            fi ;;
+    esac
+
+    # 降级判型时分数封顶 70。70 是本模型里「类型不明」的基线,含义正是「看着还行
+    # 但没拿到证据」;带着一个没验证过的出口报 100 分,等于用「没查」冒充「查干净了」。
+    # 这里不再叠任何扣分:风险分、滥用频次都取不到,地理也只剩一个源,没有可罚的依据。
+    if [ -n "$degraded" ] && [ "$base" -gt 70 ]; then
+        base=70
+    fi
+
+    local score=$((base - pen))
+    [ "$score" -lt 0 ] && score=0
+
+    # 判定比分数严:分数是 IP 信誉(宽口径),判定回答的是「能不能拿它开 Claude」。
+    # 但机房要单独定档:它的分数天然比住宅低一档,按分数卡在 50 分线上,会让一个
+    # 51 分和 49 分的机房段得到相反结论 —— 实测 RouterHosting 正好卡在 49,
+    # 而大量用户就是在用机房节点,一票否决等于把门焊死。所以机房固定 warn,
+    # 只有「机房 + 有滥用记录」这种转租段(分数掉到 30 以下)才拦。
+    local verdict
+    if [ -n "$tor" ] || [ -n "$px" ]; then
+        verdict=fail
+    elif [ -n "$degraded" ]; then
+        # 降级判型:类型之外的东西一概没验证,判定封顶在 warn。
+        # 拿我们自己的网络抖动去拦用户启动,是拿误报换安全感。
+        verdict=warn
+    elif [ "$type" = "hosting" ]; then
+        if [ "$score" -ge 30 ]; then verdict=warn; else verdict=fail; fi
+    elif [ "$score" -ge 75 ]; then
+        verdict=ok
+    elif [ "$score" -ge 50 ]; then
+        verdict=warn
+    else
+        verdict=fail
+    fi
+
+    local isp="" who tlabel next
+    # 冒号两侧可能有空格(不同源的 JSON 排版不一样),所以不能写死 "isp":"。
+    # 外层还有一个同名 key(isp 对象本身),它后面跟的是 {,这里的引号要求正好把它排除。
+    isp=$(printf '%s' "$b1" | grep -o '"isp"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    # 降级判型时 ipquery 是空的,isp 自然取不到;退到 ASN 运营商名。
+    # 否则用户会看到一行「评分 70/100 · 住宅宽带 · 未知运营商」——分数、类型、运营商
+    # 三处里有两处是空的,而我们其实知道它叫什么。
+    [ -z "$isp" ] && isp="$asn_org"
+    [ -z "$isp" ] && isp="$rdns"
+    who=$(printf '%s' "${isp:-未知运营商}" | cut -c1-24)
+    case "$type" in
+        tor)         tlabel="Tor 出口" ;;
+        vpn)         tlabel="代理/VPN" ;;
+        hosting)     tlabel="机房" ;;
+        mobile)      tlabel="移动网络" ;;
+        residential) tlabel="住宅宽带" ;;
+        *)           tlabel="类型不明" ;;
+    esac
+    case "$type" in
+        tor)     next="Tor 会被 Claude 直接标记,换普通住宅节点" ;;
+        vpn)     next="代理特征明显,换住宅或原生 IP 节点" ;;
+        hosting) next="机房出口风险偏高,建议换住宅 IP" ;;
+        *)       case "$verdict" in
+                     ok)   next="" ;;
+                     warn) next="建议换住宅或原生 IP" ;;
+                     *)    next="换住宅节点后再试" ;;
+                 esac ;;
+    esac
+    if [ -n "$degraded" ]; then
+        # 分数只反映「按运营商名判出来的类型」,风险维度一个都没验证过,所以不给
+        # 「换节点」这类需要证据的建议 —— 否则一个真实的住宅用户会被劝去换住宅 IP。
+        # 只说清发生了什么、下一步做什么。
+        flags="$flags ·风险源不可达"
+        next="仅按运营商名或反向解析判型,稍后重查"
+    elif [ "$src_n" = "1" ]; then
+        # 双源交叉退化成单源:代理特征可能被漏判(实测 WARP 只有 ip-api 报 proxy:true,
+        # ipquery 只报 datacenter)。分数照算,但必须让用户知道这次的证据是不全的。
+        flags="$flags ·仅一家风险源可达"
+    fi
+    local detail="评分 ${score}/100 · ${tlabel} · ${who}${flags}${next:+ · $next}"
+
+    if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
+        { grep -vF "$ip|" "$BASE/purity-cache.v2" 2>/dev/null
+          printf '%s|%s|%s|%s|%s|%s\n' "$ip" "$now" "$verdict" "$score" "$type" "$detail"
+        } | tail -20 > "$BASE/purity-cache.v2.tmp" 2>/dev/null \
+            && mv "$BASE/purity-cache.v2.tmp" "$BASE/purity-cache.v2" 2>/dev/null
+    fi
+    printf '%s|%s|%s|%s' "$score" "$verdict" "$type" "$detail"
+}
+
 
 # IP 审查:记录出口IP并统计最近48h内不同出口个数(账号画像风险指标)
 iphist_count() {
     [ -z "$1" ] && { echo 0; return; }
     local HIST="$BASE/iphistory.log"
-    local now=$(date +%s) n
+    local now=$(date +%s) n k
     echo "$1 $now" >>"$HIST"
     # 裁掉48小时(172800秒)以前的记录
     awk -v cutoff=$((now-172800)) '$2>=cutoff' "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
     # 按协议族分别去重后取最大值。双栈节点 v4 与 v6 是同一出口的两条腿,
     # 直接混在一起数会把一个节点算成两个;而只取某一族又会漏掉另一族的变化。
     # 取最大值:任一族换了地址就算一次变化,两条腿都没动就是 0 次新增。
+    # 历史文件里两种形态并存:新版本写的是已归一的 v4:/v6: 键,旧版本写的是裸地址。
+    # 必须走 ip_key_migrate —— 直接再套一层 ip_key 会把 v4:1.2.3.4 当成 v6 地址
+    # (ip_key 靠「有没有冒号」判族),归一成 v6:v4:1.2.3.4,所有 v4 记录塌进 v6 一族,
+    # 「按族取最大」就失效了:实测一个没换过的节点被数成 4 次变动并报 warn,
+    # 而这一项既不在可修复清单里,用户也无从修起。用迁移函数,两种形态都归到同一身份。
     # ip_key 不带换行(给命令替换用),这里得自己补,否则多行会被 sort 当成一行。
     # read 在「最后一行没有换行」时返回非零,不补 || 判断的话整段会被跳过。
     n=$(while read -r addr _ || [ -n "$addr" ]; do
             [ -n "$addr" ] || continue
-            ip_key "$addr"; echo
+            k=$(ip_key_migrate "$addr") || continue
+            [ -n "$k" ] && printf '%s\n' "$k"
         done < "$HIST" | sort -u | cut -d: -f1 | uniq -c | sort -rn | head -1 | awk '{print $1}')
     echo "${n:-0}"
 }
@@ -2011,6 +2324,16 @@ check() {
         }
     fi
 
+    # 纯净度只在真的判不过时才影响结论:机房出口(warn 级)不拦启动 —— 很多人就用
+    # 机房节点,把它当硬失败等于把所有人挡在门外;代理特征和 Tor 才拦。
+    # 取不到数据同样是 warn 级:网络抖动不该拦住启动,但也不能悄悄算通过。
+    if ! check_disabled "IP纯净度"; then
+        IFS='|' read -r pscore pver ptype pdet <<<"$(ip_purity "$ip")"
+        case "${pver:-unknown}" in
+            fail) optional_failure "出口纯净度低(${pdet:-评分 $pscore/100})" ;;
+        esac
+    fi
+
     if ! check_disabled "生态可达性"; then
         r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://claude.ai/ 2>/dev/null)
         r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models 2>/dev/null)
@@ -2213,7 +2536,12 @@ webrtc_status() {
                 ''|*:*)
                     # 真的没有 v4 出口:IPv4 的 STUN 结果本来就无从比对。
                     # 这不是泄漏,但也不能当作已验证 —— 明确说成 warn,不拦启动。
-                    echo "warn:出口只有 IPv6,STUN 结果无法比对"
+                    #
+                    # 文案里要带「STUN 只回 IPv4」。原来写「出口只有 IPv6，STUN 结果无法比对」,
+                    # 主语是「出口」,读者得到的信息是「我的出口有问题」;而且它和
+                    # 「IPv6 关闭 通过」并排时像是在说检查自相矛盾。真正的因果是:
+                    # 节点没有 v4 出口 → 我们的 STUN 探针(只能走 v4)没有可比对象。
+                    echo "warn:节点无 IPv4 出口，STUN 只回 IPv4，无法比对(非泄漏)"
                     return ;;
             esac ;;
     esac
@@ -2317,11 +2645,11 @@ checkdetail() {
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     if [ "$loc" = "$COUNTRY_TARGET" ]; then
-        # v6 出口单独标一下:用户看到一串冒号地址会以为哪里不对,实际只是走了 IPv6。
-        case "$ip" in
-            *:*) echo "出口IP=ok:$ip/$loc (IPv6 出口)" ;;
-            *)   echo "出口IP=ok:$ip/$loc" ;;
-        esac
+        # 只报「地址/地区」。原来 v6 出口会加一句「(IPv6 出口)」——
+        # 地址本身就有冒号,再补一句等于同一件事说两遍;而且那句话读起来
+        # 像是「你开了 IPv6」,和「IPv6 关闭」那一项当场打架。
+        # 「节点侧还是本机」的区分写在 IPv6 那一行,一处交代就够。
+        echo "出口IP=ok:$ip/$loc"
     elif [ -z "$COUNTRY_TARGET" ]; then
         config_result "出口IP" "环境层未就绪(未取到目标国家) · 点「一键修复」"
     else
@@ -2397,7 +2725,14 @@ checkdetail() {
     fi
     v6=$(ipv6_on_services | paste -sd '、' -)
     if [ -z "$v6" ]; then
-        echo 'IPv6=ok:已关闭'
+        # 出口是 v6 时才补一句「本机 / 节点」的分层。这一行和「出口 IP」隔着两行
+        # 并排显示,出口写 2602:… 时用户直接读出「说关了 IPv6,出口却是 IPv6」——
+        # 两句话说的根本不是一层:这一项管的是**本机网卡**,出口是**节点侧的**。
+        # 出口是 v4 时不多话:那时本来就没有可误会的地方,多写一句只是噪音。
+        case "$ip" in
+            *:*) echo 'IPv6=ok:本机已关闭 · 节点出口为 IPv6' ;;
+            *)   echo 'IPv6=ok:已关闭' ;;
+        esac
     else
         echo "IPv6=fail:未关闭($v6) · 点「一键修复」"
     fi
@@ -2407,7 +2742,10 @@ checkdetail() {
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
         case "$dnsip" in
             "$FAKE_PREFIX"*) optional_result "DNS" ok "走隧道" ;;
-            *) optional_result "DNS" fail "未走隧道(${dnsip:-空})" ;;
+            # 这一项脚本修不了(见 fix() 里的说明),界面因此不再给它「修复」按钮。
+            # 既然不给按钮,「怎么办」就必须写在这一行里 —— 否则用户既没有按钮,
+            # 也不知道下一步做什么,只能对着一个红叉发呆。
+            *) optional_result "DNS" fail "未走隧道(${dnsip:-空}) · 请在客户端把 DNS 设为隧道/DoH" ;;
         esac
     fi
     if check_disabled "WebRTC"; then
@@ -2472,7 +2810,20 @@ checkdetail() {
             *)           optional_result "ASN属性" warn "未获取" ;;
         esac
     fi
-    # 14. Anthropic 生态可达性
+    # 14. IP 纯净度(出口类型 × 代理特征 × Tor × 地域一致,给一个能解释的 0-100)
+    if check_disabled "IP纯净度"; then
+        optional_result "IP纯净度" ok
+    else
+        # 缓存命中时这一项不产生网络请求;换出口或首次才两个源并行问一次。
+        IFS='|' read -r pscore pver ptype pdet <<<"$(ip_purity "$ip")"
+        case "${pver:-unknown}" in
+            # 取不到就明说没评级。这里绝不能借 ok 混过去 —— 用户看到绿勾会
+            # 以为「出口干净已经验过了」,而实际上什么都没验。
+            unknown) optional_result "IP纯净度" warn "${pdet:-未取到信誉数据}" ;;
+            *)       optional_result "IP纯净度" "$pver" "$pdet" ;;
+        esac
+    fi
+    # 15. Anthropic 生态可达性
     if check_disabled "生态可达性"; then
         optional_result "生态可达性" ok
     else
@@ -2650,7 +3001,13 @@ fix() {
     if [ -f /Library/LaunchDaemons/local.tz-watchdog.plist ] && ! launchctl print system/local.tz-watchdog >/dev/null 2>&1; then
         adminCmds="${adminCmds}launchctl bootstrap system /Library/LaunchDaemons/local.tz-watchdog.plist; "
     fi
-    echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
+    # 这里原来还有一行 `echo "$v6" | grep -qi 'off' || adminCmds="…networksetup -setv6off Wi-Fi"`。
+    # 删掉，因为它是**恒真**的：$v6 是「IPv6 还开着的服务列表」，列表里永远不会出现
+    # 字面量 "off"（关掉的服务根本不会进这个列表），所以 grep 恒不匹配，`||` 恒执行。
+    # 后果不是「多关一次 Wi-Fi」，而是 adminCmds 永远非空 → **每次点修复都弹一次
+    # 管理员密码框**，哪怕一项都不用改（本机实测：v6 列表为空，照样弹）。
+    # 用户看到的就是「点了修复半天没反应」—— 卡在授权框上，没输入就等到超时。
+    # 逐条服务关 IPv6 上面那段 while 已经做了，包括 Wi-Fi，这一行本来就多余。
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         adminCmds="${adminCmds}cp $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ && chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist && launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist; "
     fi
@@ -2702,36 +3059,82 @@ ASEOF
             echo "FIX:置顶规则 ✗ $rules_result"
             return 1
         fi
-        quit_clash_verge
-        open -a "Clash Verge"
-        for i in $(seq 1 40); do tun_up && break; sleep 1; done
-        local loaded=0
-        for i in $(seq 1 5); do
-            if rules_result=$(clash_rules verify 2>&1); then loaded=1; break; fi
-            sleep 1
-        done
-        if [ "$loaded" -ne 1 ]; then
-            echo "FIX:置顶规则 ✗ 未验证内核加载:$rules_result"
-            echo "FIX:请检查全局扩展脚本是否启用、代理组是否存在，以及节点 UDP 支持"
-            return 1
-        fi
-        echo "FIX:置顶规则 ✓ 已验证内核实际加载"
+        case "$rules_result" in
+            *无变化*)
+                # 规则本来就是最新的 —— **不重启客户端**。
+                #
+                # 重启不是免费的:内核要重起、TUN 要重建,那十几秒里所有走 TUN 的
+                # 请求全部失败。而 fix 后面紧跟着就用 curl 验 WebRTC 和出口,
+                # 于是刚重启完必然连着两条 ✗。用户点一次「修复」,看到的是
+                # 「WebRTC 未修复 + 出口无/未知」—— 比修之前还糟,自然会再来点一次。
+                echo "FIX:置顶规则 ✓ 规则已是最新,未重启客户端"
+                ;;
+            *)
+                quit_clash_verge
+                open -a "Clash Verge"
+                for i in $(seq 1 40); do tun_up && break; sleep 1; done
+                local loaded=0
+                # 15 次 × 1 秒:内核起来 + 加载全局脚本 + 建 TUN,实测最慢要 8~10 秒。
+                # 原来只等 5 次,冷启动时必红 —— 而那正是用户最想让它成功的时候。
+                for i in $(seq 1 15); do
+                    if rules_result=$(clash_rules verify 2>&1); then loaded=1; break; fi
+                    sleep 1
+                done
+                if [ "$loaded" -ne 1 ]; then
+                    echo "FIX:置顶规则 ✗ 未验证内核加载:$rules_result"
+                    echo "FIX:请检查全局扩展脚本是否启用、代理组是否存在，以及节点 UDP 支持"
+                    return 1
+                fi
+                echo "FIX:置顶规则 ✓ 已验证内核实际加载"
+                ;;
+        esac
     elif [ "$PROXY_MODE" != "flclash" ] && ! route_ok; then
         echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
     fi
 
     # C. 复测与日常审计共用判断，空结果、非零退出及无响应不会冒充代理成功。
     local fix_failed=0
-    wrip=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2)
+    # 打三枪,但每枪 5 秒,并且**看懂空枪的原因再决定要不要接着打**。
+    #
+    # 原来的写法是无条件三枪、每枪 --max-time 8、枪间 sleep 3:节点没有 IPv4 出口时
+    # (实测:出口是 v6,STUN 只回 v4),每一枪都要把 8 秒超时**走满**,
+    # 三枪加两次 sleep = 30 秒。这段时间界面上只有一行「修复中」不动,
+    # 用户读成「点了半天没修好」—— 而那正是它本来想解决的那个病。
+    #
+    # 现在三种空枪分开处理:
+    #   rc 28(超时)  → 链路是黑洞,再打还是同一个 5 秒,直接认;
+    #   TUN 起来了    → 这条线路根本没有 v4 出口,等也没用,直接认;
+    #   TUN 没起来    → 内核在启动,这是唯一值得等的情况,隔 2 秒再打。
+    #
+    # 注意这里必须是 `tun_up && break`。写成 `tun_up || break` 会把两件事**做反**:
+    # TUN 起来的连打三枪、没起来的立刻放弃 —— 实测就是这个形状
+    # (起着的 6.5 秒,没起的 0.17 秒),正好是我们要的反面。
+    local wrip="" trace="" rc=0
+    for i in 1 2 3; do
+        trace=$(curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        rc=$?
+        wrip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
+        [ -n "$wrip" ] && break
+        [ "$rc" -eq 28 ] && break
+        tun_up && break
+        sleep 2
+    done
     wr=$(webrtc_status "$wrip")
     case "$wr" in
-        ok:*) echo "FIX:WebRTC ✓ ${wr#ok:}" ;;
-        *) echo "FIX:WebRTC ✗ ${wr#fail:}"; fix_failed=1 ;;
+        ok:*)   echo "FIX:WebRTC ✓ ${wr#ok:}" ;;
+        # ⚠ 是第三档,不是 ✗:脚本跑完了,但这一项**没有可比对的对象**
+        # (STUN 探针只回 IPv4,而这条线路是 v6 出口)。用 ✗ 会让界面把它
+        # 打成红色「需手动」,而用户根本没有任何手动动作可做。
+        warn:*) echo "FIX:WebRTC ⚠ ${wr#warn:}" ;;
+        *)      echo "FIX:WebRTC ✗ ${wr#fail:}"; fix_failed=1 ;;
     esac
 
-    # D. 出口IP最终验证
-    sleep 2
-    trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    # D. 出口IP最终验证 —— 优先用刚刚那一枪的 trace,不再重打一次。
+    # 这一段原来是 `sleep 2` + 再 curl 一遍(--max-time 8):同样的请求两秒内发两次,
+    # 打空时白花 8 秒。中间只隔了 webrtc_status 的探针,它不改路由。
+    if [ -z "$(echo "$trace" | grep '^ip=')" ]; then
+        trace=$(curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    fi
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     if [ "$loc" = "$COUNTRY_TARGET" ]; then
@@ -3238,9 +3641,16 @@ watch_incident() {
 
 # 立刻停 Claude:先礼后兵。osascript 对这类 App 常常没反应,所以必须落到 pkill,
 # 否则「已经拦住了」只是提示语上的一句好话。
+#
+# 顺带把「到底关没关掉」报出来。这个函数本来就会 pgrep 判断在不在跑,
+# 但判断完就把结果丢了 —— 界面只能无条件写「已自动停止 Claude」,
+# 而它可能压根没开、也可能 pkill 之后还在。现在这行 KILLSTATE 是给界面用的:
+#   was=1 熔断时 Claude 在运行;was=0 本来就没开
+#   still=1 处理完仍在运行(关不掉,保护失败);still=0 已确认退出
 stop_claude_now() {
-    local reason="$1" kind="${2:-拦截}"
+    local reason="$1" kind="${2:-拦截}" was=0 still=0
     if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1; then
+        was=1
         osascript -e 'tell application "Claude" to quit' >/dev/null 2>&1
         local i
         for i in 1 2 3; do
@@ -3252,7 +3662,9 @@ stop_claude_now() {
     # CLI 一并停掉:后台的 claude 进程比 App 更容易悄悄重试
     pkill -f "claude-code/cli.js" 2>/dev/null
     pkill -f "@anthropic-ai/claude-code" 2>/dev/null
-    watch_log "已停止 Claude:$reason"
+    pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 && still=1
+    echo "KILLSTATE:$was:$still"
+    watch_log "已停止 Claude:$reason(熔断时在运行=$was, 处理后仍在运行=$still)"
     watch_incident "$reason" "$kind"
 }
 
