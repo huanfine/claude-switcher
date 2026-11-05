@@ -342,6 +342,40 @@ esac''')
         self.assertIn("读不到运行中的内核节点", blob,
                       "门禁应放行;后面的失败来自假环境没有内核,不是门禁")
 
+    def test_gate_recognises_native_claude_binary(self):
+        """brew / ~/.local/bin 装的原生 claude,argv[0] 就是 `claude`。
+
+        原来只认 `claude-code/cli.js`、`@anthropic-ai/claude-code` 和桌面 App
+        三条 -f 模式,实测 `claude --version` 的进程命令行是 `claude --version`,
+        一条都匹配不上 —— 终端里开着 Claude Code,门禁却判「没在跑」,
+        看门狗熔断时也不会去停它。
+        """
+        # 只让 `-x claude` 命中,其余模式一律不命中,确保测的是新加的那条。
+        self.stub("pgrep", 'case "$1 $2" in "-x claude") exit 0 ;; *) exit 1 ;; esac')
+        src = SOURCE.read_text(encoding="utf-8")
+        start = src.index("claude_app_running() {")
+        end = src.index("\n}\n", src.index("node_gate() {")) + len("\n}\n")
+        script = 'BASE="%s"\n%s\nnode_gate\n' % (self.home / ".claude-switcher",
+                                                 src[start:end])
+        run = subprocess.run(["/bin/bash", "-c", script], text=True,
+                             capture_output=True, env=self.env, timeout=10)
+        self.assertIn("report-only", run.stdout, run.stdout + run.stderr)
+        self.assertIn("Claude 正在运行", run.stdout, run.stdout + run.stderr)
+
+    def test_kill_switch_stops_the_cli_too(self):
+        """熔断只停桌面 App 是不够的:终端里的 claude 会继续重试。
+
+        大小写敏感这件事也要钉住 —— `-x claude` 不能误伤桌面 App 的 `Claude`。
+        """
+        src = SOURCE.read_text(encoding="utf-8")
+        start = src.index("stop_claude_now() {")
+        end = src.index("\n}\n", start) + len("\n}\n")
+        block = src[start:end]
+        self.assertIn("pkill -x claude", block, "熔断没有停原生二进制")
+        self.assertIn("claude_cli_running", block, "停止后要复查 CLI 是否真的退了")
+        self.assertIn("claude_running && was=1", block,
+                      "was 只看桌面 App 时,CLI 被熔断会显示成「本来就没开」")
+
     def test_scan_gate_ignores_existing_slots(self):
         """报告门禁同理:有槽位但没东西在跑,应当给 auto-ok。
 

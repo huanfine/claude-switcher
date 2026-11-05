@@ -3208,6 +3208,30 @@ preferred_node_leaf() {
     awk -F'\t' 'NF >= 2 && $2 != "" {print $2; exit}' "$PREFERRED_NODE_FILE" 2>/dev/null
 }
 
+# ---------- 「Claude 在不在跑」的统一判据 ----------
+# 三个入口都要认,少一个就会出现「明明开着却报未运行」:
+#   1. 桌面 App      /Applications/Claude.app/Contents/MacOS/Claude
+#   2. 老 npm 包     .../claude-code/cli.js 与 @anthropic-ai/claude-code
+#   3. 原生二进制    brew / ~/.local/bin 装的,argv[0] 就是 `claude`
+#
+# 第 3 种是现在的主流装法,原来完全没认 —— 实测 `claude --version` 的进程
+# 命令行就是 `claude --version`,上面两条 -f 模式一条都匹配不上。后果是:
+# 节点门禁判成「没在跑」,看门狗熔断时也不会去停它。
+claude_app_running() {
+    pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1
+}
+
+claude_cli_running() {
+    pgrep -x claude >/dev/null 2>&1 && return 0
+    pgrep -f "claude-code/cli.js" >/dev/null 2>&1 && return 0
+    pgrep -f "@anthropic-ai/claude-code" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+claude_running() {
+    claude_app_running || claude_cli_running
+}
+
 # 能不能自动应用,只看「此刻有没有东西在用这条出口」。
 #
 # 这里原来还有第四条:status 里 hasA..hasD=1 —— 只要**存过**任何账号快照就判
@@ -3218,9 +3242,7 @@ preferred_node_leaf() {
 # 不占用出口,换线路不会动到它。
 node_gate() {
     local reasons="" pid=""
-    if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 \
-       || pgrep -f "claude-code/cli.js" >/dev/null 2>&1 \
-       || pgrep -f "@anthropic-ai/claude-code" >/dev/null 2>&1; then
+    if claude_running; then
         reasons="Claude 正在运行"
     fi
     pid=$(awk -F'\t' '{print $1; exit}' "$BASE/watch.pid" 2>/dev/null)
@@ -3443,9 +3465,7 @@ scan_nodes() {
 # 而槽位快照只是磁盘上的目录,不占用出口。
 node_apply_gate() {
     local reasons="" pid="" i
-    if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 \
-       || pgrep -f "claude-code/cli.js" >/dev/null 2>&1 \
-       || pgrep -f "@anthropic-ai/claude-code" >/dev/null 2>&1; then
+    if claude_running; then
         reasons="Claude 正在运行"
     fi
     [ -n "$reasons" ] && { printf 'denied|%s\n' "$reasons"; return 0; }
@@ -4341,21 +4361,30 @@ watch_incident() {
 #   was=1 熔断时 Claude 在运行;was=0 本来就没开
 #   still=1 处理完仍在运行(关不掉,保护失败);still=0 已确认退出
 stop_claude_now() {
-    local reason="$1" kind="${2:-拦截}" was=0 still=0
-    if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1; then
-        was=1
+    local reason="$1" kind="${2:-拦截}" was=0 still=0 i
+    # was 原来只认桌面 App,于是「终端里开着 Claude Code 被熔断」时界面会写
+    # 「本来就没开」。现在三种形态都算在跑。
+    claude_running && was=1
+    if claude_app_running; then
         osascript -e 'tell application "Claude" to quit' >/dev/null 2>&1
-        local i
         for i in 1 2 3; do
-            pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || break
+            claude_app_running || break
             sleep 1
         done
         pkill -f "/Applications/Claude.app/Contents/MacOS/Claude" 2>/dev/null
     fi
-    # CLI 一并停掉:后台的 claude 进程比 App 更容易悄悄重试
+    # CLI 一并停掉:后台的 claude 进程比 App 更容易悄悄重试。
+    # `-x claude` 认的是原生二进制的进程名(argv[0] 就叫 claude),大小写敏感,
+    # 不会误伤桌面 App 的 `Claude`。另外两条留给老 npm 装法。
+    pkill -x claude 2>/dev/null
     pkill -f "claude-code/cli.js" 2>/dev/null
     pkill -f "@anthropic-ai/claude-code" 2>/dev/null
-    pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 && still=1
+    # 给 CLI 一点退出时间,别在它还没死透时就断言「已停止」。
+    for i in 1 2 3; do
+        claude_cli_running || break
+        sleep 1
+    done
+    claude_running && still=1
     echo "KILLSTATE:$was:$still"
     watch_log "已停止 Claude:$reason(熔断时在运行=$was, 处理后仍在运行=$still)"
     watch_incident "$reason" "$kind"

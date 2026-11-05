@@ -413,6 +413,8 @@ final class VM: ObservableObject {
     /// 登录状态。Claude 没打开、甚至没登录的时候，界面照样宣称「当前账号」，
     /// 用户会以为自己在用某个账号。改成按运行态说事：没开就是「上次使用」。
     @Published private(set) var claudeRunning = false
+    /// CLI 的启停没有系统通知可订阅，只能低频轮询（见 trackClaudeProcess）。
+    private var cliPollTimer: Timer?
     @Published private(set) var isSwitchingClient = false
     @Published var disabledChecks: Set<String> = []
     @Published var allowOptionalFailures = false
@@ -889,8 +891,12 @@ final class VM: ObservableObject {
         }
     }
 
-    /// 跟踪 Claude 桌面版的运行态。用 NSWorkspace 的启停通知，不轮询进程表 ——
+    /// 跟踪 Claude 的运行态。桌面版靠 NSWorkspace 的启停通知，不轮询进程表 ——
     /// 界面每次刷新都 pgrep 一遍，代价比收益大。
+    ///
+    /// 终端里的 Claude Code 没有启停通知可订阅，只能低频轮询：5 秒一次，
+    /// 命中缓存后只跑一条 sh（约 2ms）。代价换来的是「终端里开着 claude 时
+    /// 槽位卡不再写未运行」—— 原来只查桌面版 bundle id，CLI 完全隐形。
     func trackClaudeProcess() {
         claudeRunning = Self.isClaudeRunning()
         let center = NSWorkspace.shared.notificationCenter
@@ -903,12 +909,52 @@ final class VM: ObservableObject {
                 self.claudeRunning = running
             }
         }
+        #if !CLAUDE_SWITCHER_TESTS
+        cliPollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let running = Self.isClaudeRunning()
+            guard running != self.claudeRunning else { return }
+            self.claudeRunning = running
+        }
+        #endif
     }
 
     static func isClaudeRunning() -> Bool {
-        NSWorkspace.shared.runningApplications.contains {
+        if NSWorkspace.shared.runningApplications.contains(where: {
             $0.bundleIdentifier == "com.anthropic.claudefordesktop"
+        }) { return true }
+        #if CLAUDE_SWITCHER_TESTS
+        // 测试进程里不该去问真实进程表：开发机上开着 claude 就会让用例飘。
+        return false
+        #else
+        return claudeCLIRunning()
+        #endif
+    }
+
+    /// 三种装法都要认：原生二进制（brew / ~/.local/bin，argv[0] 就叫 claude）、
+    /// 老 npm 包的 cli.js、以及 @anthropic-ai/claude-code。
+    /// 结果缓存 2 秒 —— 这个函数会被视图求值调用，不能每次都 fork。
+    private static var cliProbeAt = Date.distantPast
+    private static var cliProbeValue = false
+
+    static func claudeCLIRunning() -> Bool {
+        let now = Date()
+        if now.timeIntervalSince(cliProbeAt) < 2 { return cliProbeValue }
+        cliProbeAt = now
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/bin/sh")
+        probe.arguments = ["-c", "pgrep -x claude >/dev/null 2>&1"
+            + " || pgrep -f claude-code/cli.js >/dev/null 2>&1"
+            + " || pgrep -f @anthropic-ai/claude-code >/dev/null 2>&1"]
+        probe.standardOutput = FileHandle.nullDevice
+        probe.standardError = FileHandle.nullDevice
+        do { try probe.run() } catch {
+            cliProbeValue = false
+            return false
         }
+        probe.waitUntilExit()
+        cliProbeValue = probe.terminationStatus == 0
+        return cliProbeValue
     }
 
     #if CLAUDE_SWITCHER_TESTS
