@@ -86,6 +86,30 @@ repository, command-line script, and build artifact name.
 
 ## Install
 
+### Another machine: download from this repo's Releases (recommended)
+
+Grab `*-installer-kit.zip` (fresh install), `*-app-only.dmg` / `.zip` (UI only), and
+`SHA256SUMS-release.txt` from [huanfine/claude-switcher Releases](https://github.com/huanfine/claude-switcher/releases).
+**Do not use the old upstream `YOURSJEYO/claude-switcher` release**: its core script
+predates `node-scan` / `slot-node` and fails with `exit code 2` on node scan.
+
+```bash
+# Fresh Mac: unzip the kit and double-click installer/安装.command
+xcode-select --install   # the installer compiles the UI app locally
+
+# Already installed, only the core script is stale
+bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
+
+# Verify downloads
+shasum -a 256 -c SHA256SUMS-release.txt
+```
+
+The `app-only` packages contain no core script and are arm64-only; on Intel Macs
+build from the installer kit. Pushing a `v*` tag triggers the release workflow to
+build and publish all platform packages.
+
+### From source
+
 Requirements: macOS 13 or later, a proxy client with TUN support (Clash Verge,
 FlClash, Shadowrocket, sing-box, ClashX, or Surge), the Claude desktop app, and
 Python 3. The exit country must not be `CN` — the installer derives the target

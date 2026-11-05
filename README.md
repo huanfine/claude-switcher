@@ -75,6 +75,32 @@
 
 ## 安装
 
+### 装到另一台机器：从本仓库 Release 下载（推荐）
+
+最新版在 [huanfine/claude-switcher Releases](https://github.com/huanfine/claude-switcher/releases)，`*-installer-kit.zip` 用于全新安装，`*-app-only.dmg` / `.zip` 只换界面，`SHA256SUMS-release.txt` 用于校验。**不要从旧上游 `YOURSJEYO/claude-switcher` 的 Release 下载**：那里的核心脚本不认识 `node-scan` / `slot-node`，装完点节点扫描会报「脚本执行失败（退出码 2）」。
+
+```bash
+# 全新 Mac：下载 *-installer-kit.zip → 解压 → 双击 installer/安装.command
+xcode-select --install   # 安装器现场编译界面 App，需要 Xcode 命令行工具
+
+# 已经装过、只是核心脚本旧：界面里的「复制升级命令」就是这一条
+bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
+
+# 校验下载包
+shasum -a 256 -c SHA256SUMS-release.txt
+```
+
+装完在终端确认核心不是旧版（两条都能看到才算装对）：
+
+```bash
+~/.local/bin/claude-switch.sh help | grep -E 'node-scan|slot-node'
+~/.local/bin/claude-switch.sh status
+```
+
+`app-only` 包不含核心脚本，且仅适用于 Apple Silicon；Intel Mac 请用 `installer-kit` 在本机编译。Windows / Linux Beta 包也在同一个 Release 页。
+
+### 从源码安装
+
 **系统要求**：macOS 13+ · Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3 · 出口国家不能是 CN。
 
 ```bash
@@ -83,7 +109,7 @@ cd claude-switcher
 # 双击 installer/安装.command，自动识别代理客户端、代理组名与地区目标
 ```
 
-安装器在本机编译界面 App、装入核心脚本与保镖 / 时区看门狗。产物为 ad-hoc 签名、未公证，首次被 Gatekeeper 拦截时右键打开，或到「系统设置 → 隐私与安全性」放行；手动打包见 `scripts/package-macos.sh`。
+安装器在本机编译界面 App、装入核心脚本与保镖 / 时区看门狗。产物为 ad-hoc 签名、未公证，首次被 Gatekeeper 拦截时右键打开，或到「系统设置 → 隐私与安全性」放行；手动打包见 `scripts/package-macos.sh`。打 `v*` 标签推送即触发 `.github/workflows/release.yml` 自动构建并发布全平台安装包。
 
 Windows / Linux Beta 见 [windows/README.md](windows/README.md) · [linux/README.md](linux/README.md)。浏览器侧检测页在 `docs/`，线上地址 [huanfine.github.io/claude-switcher](https://huanfine.github.io/claude-switcher/)（需在仓库 Settings → Pages 选 `main` / `/docs` 启用），本地预览见 [docs/WEB-README.md](docs/WEB-README.md)。
 
