@@ -225,6 +225,40 @@ esac''')
         for secret in (b"203.0.113.10", b"Bearer", b"token", b"session", b"cookie", b"secret"):
             self.assertNotIn(secret, payload)
 
+    def test_diagnostic_export_includes_redacted_last_fix_log(self):
+        """「点修复没反应」必须看得到 FIX: 逐步输出,但不能带出出口 IP/路径/凭据。"""
+        log_dir = self.home / "Library/Logs/claude-switcher"
+        log_dir.mkdir(parents=True)
+        (log_dir / "last-fix.log").write_text(
+            "脚本执行失败（退出码 1）\n"
+            "FIX:开始一键修复\n"
+            "FIX:时区/IPv6/保镖 ✗(取消或失败)\n"
+            "FIX:出口IP ✗ (203.0.113.10/US,期望US)\n"
+            "FIX:WebRTC ✗ 2001:db8::1 不支持 UDP\n"
+            "FIX:置顶规则 ✗ 写不进 " + str(self.home) + "/.claude-switcher/rules.yaml "
+            "https://example.com/x?token=supersecret\n"
+            "FIX:修复流程结束\n", encoding="utf-8")
+        destination = Path(self.tmp.name) / "diagnostics.zip"
+        run = self.support("export-diagnostics", str(destination))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        with zipfile.ZipFile(destination) as archive:
+            self.assertIn("last-fix.log", archive.namelist())
+            payload = archive.read("last-fix.log").decode("utf-8")
+        self.assertIn("FIX:开始一键修复", payload)
+        self.assertIn("FIX:修复流程结束", payload)
+        self.assertIn("时区/IPv6/保镖", payload)
+        for secret in ("203.0.113.10", "2001:db8::1", "supersecret",
+                       "https://example.com", str(self.home)):
+            self.assertNotIn(secret, payload)
+
+    def test_diagnostic_export_without_fix_log_still_works(self):
+        """旧版 App 没写过 last-fix.log 时不能让导出失败。"""
+        destination = Path(self.tmp.name) / "diagnostics.zip"
+        run = self.support("export-diagnostics", str(destination))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        with zipfile.ZipFile(destination) as archive:
+            self.assertNotIn("last-fix.log", archive.namelist())
+
 
 if __name__ == "__main__":
     unittest.main()

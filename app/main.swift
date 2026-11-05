@@ -576,6 +576,21 @@ final class VM: ObservableObject {
         if phase == .done { phase = .ready }
     }
 
+    /// 给核心脚本的进程环境。保留 App 继承到的全部变量,只把系统/brew 的
+    /// 标准工具目录补进 PATH —— 不覆盖用户已有的顺序,避免把系统 curl 换成
+    /// 某个同名工具。python3 由核心脚本自己按绝对路径解析,不依赖这里。
+    private static func coreProcessEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        var parts = (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+            .split(separator: ":", omittingEmptySubsequences: true).map(String.init)
+        for dir in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/local/sbin",
+                    "/opt/homebrew/sbin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            if !parts.contains(dir) { parts.append(dir) }
+        }
+        env["PATH"] = parts.joined(separator: ":")
+        return env
+    }
+
     /// onLine:每产出一行就回调一次,用于「边查边显示」。它只影响观感,
     /// 判定仍然由 done 里的完整输出决定 —— 流式预览不参与任何通过/失败计算,
     /// 否则半行、重复行都会变成判定输入。
@@ -600,6 +615,11 @@ final class VM: ObservableObject {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/bash")
             p.arguments = [self.core] + args
+            // 从 Finder / LaunchAgent 启动的 App 继承的是 launchd 的极简 PATH
+            // (/usr/bin:/bin:/usr/sbin:/sbin)。终端里能用的 brew、python.org
+            // 解释器和代理 CLI 在 App 里全都不在 PATH 上,fix 会在前置校验里
+            // 0 秒失败,而终端手动跑却是好的。在继承环境的基础上补齐常见目录。
+            p.environment = Self.coreProcessEnvironment()
             p.standardOutput = fh
             p.standardError = fh
             do { try p.run() } catch {
@@ -1611,48 +1631,94 @@ final class VM: ObservableObject {
         }
         if let focus { fixStates[focus] = .running }
         run(["fix"], timeout: operationTimeout, onLine: { [weak self] line in
-            self?.applyFixLine(line)
+            // run() 的流式回调在后台队列,直接改 @Published 会让 SwiftUI 在
+            // 非主线程刷新;统一丢回主线程,顺序由主队列串行保证。
+            DispatchQueue.main.async { self?.applyFixLine(line) }
         }) { result in
-            guard result.succeeded else {
-                self.banner = result.output
-                self.phase = .failed
+            // 原始输出落盘,「导出诊断日志」会带上一份脱敏副本。以前诊断包里
+            // 只有 client.log 的命令元数据,根本看不出 fix 卡在哪一行。
+            Self.persistFixOutput(result.output)
+
+            // 以完整输出为准重放一次:流式预览可能漏行/半行,而且它跑在
+            // 另一条队列上。重放是幂等的(applyFixLine 只是覆盖同名状态牌)。
+            for line in result.output.split(whereSeparator: \.isNewline) {
+                self.applyFixLine(String(line))
+            }
+
+            // 关键区分:fix() 收尾那句 `FIX:修复流程结束` 只有真正走完整条
+            // 流程才会打印。前置校验(WebRTC 策略/python3/旧核心)失败时它在
+            // 0 秒就 return 1,永远到不了这一句。
+            //   · 有它 + 退出码非 0 = 前面多半修好了,只是收尾复测(WebRTC/
+            //     出口IP)判失败 —— 旧代码在这里把 fixStates 全清空、phase
+            //     打成 .failed、banner 换成「脚本执行失败(退出码 1)」,用户
+            //     看到的就是「点了一下修复,什么都没修」。
+            //   · 没它 = 脚本根本没跑起来,这才该显示原始错误 + 可操作提示。
+            let sawFinish = result.output.contains("FIX:修复流程结束")
+            guard result.succeeded || sawFinish else {
                 self.fixStates = [:]
+                self.phase = .failed
+                self.banner = Self.fixLaunchFailureHint(result.output)
                 self.isBusy = false
                 return
             }
-            // 脚本跑完了,还有行挂着「修复中」的转圈 —— 那说明脚本**从头到尾没提过这一项**
-            // (它只对真动过手的组打勾)。转圈不会自己停:fixStates 要等下一次 fixAll
-            // 才清空,于是用户会盯着一行永远转下去的「修复中」,判定成「点了半天没修好」。
-            // 这里直接摘掉状态牌,让后面的复查给出真实结果 —— 不编「已修复」。
-            for (name, state) in self.fixStates where state == .running {
-                self.fixStates[name] = nil
-            }
-            let done = self.fixStates.filter { $0.value.isDone }.count
-            let notes = self.fixStates.filter { $0.value.isNote }.count
-            let failedRows = self.fixStates.filter { $0.value.isFailed }.map(\.key)
-            // 「未能验证」单独数一句:它既不是修好了,也不是要用户动手。
-            // 混进「已修复」是虚报,混进「需手动」是甩锅。
-            let noteTail = notes > 0 ? " · \(notes) 项未能验证" : ""
-            if !failedRows.isEmpty {
-                // 点名比数数有用:用户下一步就是去改这几项,直接告诉他改哪几个。
-                let names = failedRows.count <= 3
-                    ? failedRows.joined(separator: "、")
-                    : "\(failedRows.prefix(3).joined(separator: "、")) 等 \(failedRows.count) 项"
-                self.fixNotice = done > 0
-                    ? "\(done) 项已修复 · \(names) 需要你手动处理\(noteTail)"
-                    : "\(names) 需要你手动处理\(noteTail)"
-            } else if done > 0 {
-                self.fixNotice = "\(done) 项已修复" + noteTail
-            } else if notes > 0 {
-                self.fixNotice = "\(notes) 项未能验证"
-            }
-            // 留 1.6 秒让回执可见,再重新检查。立刻复查会把回执清掉,
-            // 用户只看到「修复中」一闪而过,不知道到底修好了什么。
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-                self.checkEnvironment { _ in self.isBusy = false }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-                    if !self.isBusy { self.fixNotice = "" }
-                }
+            self.completeFix(succeeded: result.succeeded)
+        }
+    }
+
+    /// 把 fix 的原始输出存到日志目录(0600)。导出诊断时会脱敏后才进 zip。
+    private static func persistFixOutput(_ output: String) {
+        guard let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Logs/claude-switcher", isDirectory: true) else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("last-fix.log")
+        try? output.write(to: file, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+
+    /// 修复「没跑起来」时,别只丢一句「脚本执行失败」让人自己猜。
+    private static func fixLaunchFailureHint(_ raw: String) -> String {
+        if raw.contains("退出码 2") {
+            return raw + "\n提示：核心脚本版本过旧，请重新双击 INSTALL.command，或在终端运行升级命令。"
+        }
+        if raw.contains("python3") || raw.contains("command not found") {
+            return raw + "\n提示：缺少可用的 python3。请安装 Xcode 命令行工具（xcode-select --install）后重试。"
+        }
+        return raw + "\n提示：修复在启动阶段就退出了。可点「导出诊断日志」，或用 diagnose-fix.sh 查看逐步输出。"
+    }
+
+    /// 收尾:脚本跑完了(退出码 0,或完整流程但收尾判失败)就按真实回执结算,
+    /// 不把已修好的项一笔勾销,再复查一次让行状态回到现实。
+    private func completeFix(succeeded: Bool) {
+        phase = .ready
+        // 还有行挂着「修复中」的转圈 —— 那说明脚本**从头到尾没提过这一项**
+        // (它只对真动过手的组打勾)。转圈不会自己停,直接摘掉状态牌,
+        // 让后面的复查给出真实结果 —— 不编「已修复」。
+        for (name, state) in fixStates where state == .running { fixStates[name] = nil }
+        let done = fixStates.filter { $0.value.isDone }.count
+        let notes = fixStates.filter { $0.value.isNote }.count
+        let failedRows = fixStates.filter { $0.value.isFailed }.map(\.key)
+        // 「未能验证」单独数一句:它既不是修好了,也不是要用户动手。
+        let noteTail = notes > 0 ? " · \(notes) 项未能验证" : ""
+        if !failedRows.isEmpty {
+            let names = failedRows.count <= 3
+                ? failedRows.joined(separator: "、")
+                : "\(failedRows.prefix(3).joined(separator: "、")) 等 \(failedRows.count) 项"
+            fixNotice = done > 0
+                ? "\(done) 项已修复 · \(names) 需要你手动处理\(noteTail)"
+                : "\(names) 需要你手动处理\(noteTail)"
+        } else if done > 0 {
+            fixNotice = "\(done) 项已修复" + noteTail
+        } else if notes > 0 {
+            fixNotice = "\(notes) 项未能验证"
+        } else if !succeeded {
+            fixNotice = "修复已执行，但收尾复测未通过 · 详情见诊断日志"
+        }
+        // 留 1.6 秒让回执可见,再重新检查。立刻复查会把回执清掉,
+        // 用户只看到「修复中」一闪而过,不知道到底修好了什么。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            self.checkEnvironment { _ in self.isBusy = false }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+                if !self.isBusy { self.fixNotice = "" }
             }
         }
     }

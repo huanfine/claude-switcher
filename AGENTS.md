@@ -294,6 +294,12 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 - Linux 版：`linux/`（核心 `claude-switch.sh` / 保镖 `claude-bodyguard.sh` / 安装器 `install.sh`）
 - Web 版：`docs/` 下的 index.html/app.js/style.css（纯静态环境检测页，GitHub Pages 从 docs/ 发布）
 
+## 一键修复「点了没反应」的三层根因（1.8.7-dev）
+
+- **解释器 PATH 不一致**：安装器在终端做 `python3 --version`，菜单栏 App 从 Finder 启动继承的却是 launchd 极简 PATH。终端能跑 `fix`、界面 0 秒失败，就是这么来的。核心脚本顶部 `resolve_python()` 按绝对路径解析并 `export CLAUDE_SWITCHER_PYTHON`，所有内嵌 Python 一律写 `"${CLAUDE_SWITCHER_PYTHON:-python3}"`，禁止再写裸 `python3`。注意 `fix()` 函数体会被 `test_webrtc_rules` 单独抽出来跑，**里面不能依赖顶层函数**（解释器缺失的提示放在 `clash_rules policy` 失败分支里，用 `case` 自包含判断）。
+- **非零退出抹掉回执**：`fix()` 收尾 `WebRTC ✗` 会 `return 1`，而 App 旧代码对任何非零退出都 `fixStates = [:]` + `phase = .failed`，把「已修好 8 项」显示成「脚本执行失败（退出码 1）」。判定依据只能是完整输出里有没有**唯一**的 `FIX:修复流程结束`：有 = 流程跑完，保留回执、点名剩余项并复查；没有 = 启动阶段就退出，才显示原始错误 + 可操作提示。流式 `onLine` 跑在后台队列，必须回主线程改 `@Published`，并在 `done` 里用完整输出幂等重放一次。
+- **诊断包看不到失败点**：`export-diagnostics` 的 `client.log` 白名单只留 `command=... exit=... duration_ms=...`，`recent-status.json` 只有状态摘要，两者都定位不了 `fix` 卡在哪一行。App 现在把 `fix` 原始输出写到 `~/Library/Logs/claude-switcher/last-fix.log`（0600），导出时经 `safe_fix_log()` 白名单 + IP/IPv6/本机路径/URL/凭据脱敏后作为 `last-fix.log` 入包。**新增任何输出文件都要先过这道脱敏，别整份塞进 zip。** 文件不存在（旧版 App / 还没点过修复）要静默跳过。
+
 ## 维护者本机纪律（Agent 必须遵守）
 
 **除非维护者在当次对话中明确要求，否则不得更新/部署维护者本机的已安装版本。** 具体包括：

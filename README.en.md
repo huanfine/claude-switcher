@@ -213,6 +213,37 @@ converged — got an empty trace and ended with `WebRTC ✗` / `Exit IP ✗` and
 waits for egress before re-testing; when nothing changed and no restart happens,
 no extra request is made.
 
+## Clicking "Repair" appears to do nothing
+
+Starting with `1.8.7-dev`, the UI separates three cases instead of reporting one
+generic "script failed":
+
+- **The script never started** (preflight exits immediately, `duration_ms=0` in
+  the log): the raw error plus an actionable hint are shown. The usual cause is
+  that a Finder-launched menu bar app inherits a minimal PATH and cannot find
+  `python3`, while the installer checked it from a full Terminal PATH. The core
+  now resolves the interpreter by absolute path instead of relying on PATH. If
+  Python really is missing, follow the hint and run `xcode-select --install`.
+- **The flow finished but the final re-test failed**: previously any non-zero
+  exit wiped every `FIX:` receipt and showed only "script failed (exit 1)", which
+  looked like nothing had been repaired. Receipts are now kept, remaining items
+  needing manual action are named, and a fresh check runs afterwards.
+- **Items a script cannot fix**: exit IP, ASN, IP purity, ecosystem reachability
+  and "better node" require switching lines/nodes; the button will not turn them
+  green.
+
+For troubleshooting, use "Export diagnostics" in the app: `1.8.7-dev` adds a
+`last-fix.log` with the step-by-step `FIX:` output of the last repair (IPs, local
+paths and credentials redacted). For the full picture, run one line in Terminal
+**on the affected Mac** and send back `claude-fix-diagnosis.txt` from the Desktop:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/diagnose-fix.sh)
+```
+
+It runs `fix` once for real (an admin password prompt may appear) and records
+every step, the exit code and a follow-up check.
+
 ## Usage
 
 1. Open the desktop app and wait for the 16 checks.

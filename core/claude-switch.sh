@@ -4,6 +4,53 @@
 set -u
 export LC_ALL=en_US.UTF-8
 
+# ---- 解释器解析(必须排在 _support 分支之前) ----
+# 菜单栏 App 从 Finder 启动时继承的是 launchd 的极简 PATH,终端里能用的
+# brew / python.org python3 在 App 里都找不到;而安装器是在终端里做的
+# `python3 --version` 前置检查,两边结论不一致 —— 表现为「终端跑 fix 正常,
+# 点界面上的修复却 0 秒失败」。这里把解释器解析成绝对路径并导出,后面所有
+# 内嵌 Python 统一走它,不再赌 PATH。
+# 测试会显式注入 CLAUDE_SWITCHER_PYTHON=sys.executable,这里不覆盖。
+python_works() {
+    local c="${1:-}"
+    [ -n "$c" ] || return 1
+    case "$c" in
+        /*) ;;
+        *) c="$(command -v -- "$c" 2>/dev/null || true)"; [ -n "$c" ] || return 1 ;;
+    esac
+    [ -x "$c" ] || return 1
+    # macOS 没装 Command Line Tools 时 /usr/bin/python3 只是个 xcrun 壳,
+    # 调用它会弹「安装开发者工具」对话框并卡住。先确认开发者目录存在。
+    if [ "$c" = "/usr/bin/python3" ] && [ "$(uname -s 2>/dev/null)" = "Darwin" ] \
+       && command -v xcode-select >/dev/null 2>&1 \
+       && ! xcode-select -p >/dev/null 2>&1; then
+        return 1
+    fi
+    "$c" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1
+}
+
+resolve_python() {
+    local cand
+    # 先尊重当前 PATH(终端/CI 里通常是最新的解释器),保持既有行为不变;
+    # 找不到或跑不起来才按绝对路径兜底 —— 极简 PATH 的 GUI 就靠这一步救回来。
+    if command -v python3 >/dev/null 2>&1; then
+        cand="$(command -v python3)"
+        if python_works "$cand"; then printf '%s' "$cand"; return 0; fi
+    fi
+    for cand in /usr/local/bin/python3 /opt/homebrew/bin/python3 \
+                /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+                /usr/bin/python3; do
+        if python_works "$cand"; then printf '%s' "$cand"; return 0; fi
+    done
+    return 1
+}
+
+if [ -z "${CLAUDE_SWITCHER_PYTHON:-}" ]; then
+    _resolved_py="$(resolve_python 2>/dev/null || true)"
+    [ -n "$_resolved_py" ] && export CLAUDE_SWITCHER_PYTHON="$_resolved_py"
+    unset _resolved_py
+fi
+
 if [ "${1:-}" = "_support" ]; then
     shift
     exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_SUPPORT'
@@ -35,6 +82,11 @@ def fail():
 def paths():
     home = Path.home()
     return home / ".claude-switcher", home / "Library/Logs/claude-switcher/client.log"
+
+
+def fix_log_path():
+    """App 每次点「一键修复」都会把原始输出落到这里(见 persistFixOutput)。"""
+    return Path.home() / "Library/Logs/claude-switcher/last-fix.log"
 
 
 # ---- 环境层 ----
@@ -214,6 +266,38 @@ def safe_log_lines():
     return [line for line in lines[-2000:] if allowed.fullmatch(line)]
 
 
+IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+IPV6_RE = re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
+URL_RE = re.compile(r"https?://\S+")
+SECRET_RE = re.compile(r"(?i)\b(token|secret|password|authorization|bearer)\s*[=: ]+\S+")
+
+
+def safe_fix_log():
+    """最近一次「一键修复」的逐步输出,只留 FIX:/错误行并脱敏。
+
+    client.log 里只有 `command=fix exit=1 duration_ms=0` 这类元数据,看不出
+    卡在哪一步 —— 这正是「点了修复没反应」一直查不动的原因。但 FIX: 原文
+    可能带出口 IP、本机绝对路径,所以和 client.log 一样走白名单,不能整份塞。
+    """
+    try:
+        lines = fix_log_path().read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    kept = []
+    for line in lines:
+        if not (line.startswith("FIX:") or line.startswith("FAIL:")
+                or line.startswith("脚本执行失败") or line.startswith("操作超时")
+                or "command not found" in line):
+            continue
+        line = line.replace(str(Path.home()), "~")
+        line = IPV4_RE.sub("[IP]", line)
+        line = IPV6_RE.sub("[IP6]", line)
+        line = URL_RE.sub("[URL]", line)
+        line = SECRET_RE.sub(lambda m: m.group(1) + "=[REDACTED]", line)
+        kept.append(line[:300])
+    return ("\n".join(kept[-200:]) + "\n") if kept else None
+
+
 def export_diagnostics(args):
     if len(args) != 1 or not args[0] or "\x00" in args[0]:
         fail()
@@ -230,10 +314,15 @@ def export_diagnostics(args):
                                 ("checks.json", load_config())):
                 archive.writestr(name, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
             archive.writestr("client.log", "\n".join(safe_log_lines()) + "\n")
+            # 最近一次修复的逐步回执。文件不存在(旧版 App / 还没点过修复)就跳过,
+            # 不影响老客户端读取诊断包。
+            fix_log = safe_fix_log()
+            if fix_log is not None:
+                archive.writestr("last-fix.log", fix_log)
         os.chmod(destination, 0o600)
     except OSError:
         fail()
-    print("OK:诊断日志已导出（不含 IP、凭据、账号或代理配置）")
+    print("OK:诊断日志已导出（不含 IP、凭据、账号或代理配置；含脱敏后的最近一次修复逐步输出）")
 
 
 def main(args):
@@ -2857,7 +2946,7 @@ drill() {
 
 # WebRTC/STUN 探测:返回 RESULT:ip,ip 或 RESULT:NONE 或空
 webrtc_test() {
-    python3 "$BASE/stun-probe.py" 2>/dev/null
+    "${CLAUDE_SWITCHER_PYTHON:-python3}" "$BASE/stun-probe.py" 2>/dev/null
 }
 
 # 日常检查与修复共用此判断。先确认规则，再允许探测，避免向已知直连路径发包。
@@ -3784,6 +3873,14 @@ fix() {
         local policy_result
         if ! policy_result=$(clash_rules policy 2>&1); then
             echo "FIX:WebRTC 策略无效 ✗ $policy_result"
+            # 解释器没找到时 policy 的报错是「python3: command not found」;
+            # 光把它塞进上面那行,用户还是不知道要装什么。这里给一句能照做的。
+            # 刻意不调用顶层函数:fix() 会被测试单独抽出来跑,外部函数不存在。
+            case "$policy_result" in
+                *python3*|*"command not found"*)
+                    echo "FIX:本机缺少可用的 python3;请在终端运行 xcode-select --install 后重试" ;;
+            esac
+            echo "FIX:修复在前置校验阶段退出,后面的项目一项都没动;请导出诊断日志或跑 diagnose-fix.sh"
             return 1
         fi
         WEBRTC_POLICY="$policy_result"
@@ -4287,7 +4384,7 @@ cli_info() {
     echo "# Claude Code CLI 体检 $(date '+%F %T')"
     path=$(command -v claude 2>/dev/null)
     if [ -n "$path" ]; then
-        real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path" 2>/dev/null || echo "$path")
+        real=$("${CLAUDE_SWITCHER_PYTHON:-python3}" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path" 2>/dev/null || echo "$path")
         ver=$(perl -e 'alarm 4; exec @ARGV' "$real" --version 2>/dev/null | head -1)
         [ -z "$ver" ] && ver=$(perl -e 'alarm 4; exec @ARGV' "$path" --version 2>/dev/null | head -1)
         echo "CLI=ok:$path"
@@ -4453,7 +4550,7 @@ snapshot_import() {
         cleanup_import
         echo "FAIL:不是本项目导出的快照镜像"; return 1
     fi
-    if ! python3 - "$marker" "$target" <<'PY'
+    if ! "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$marker" "$target" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as f: meta = json.load(f)
 assert meta.get("format") == "claude-switcher-snapshot"
