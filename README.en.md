@@ -98,9 +98,13 @@ The bundle already contains the compiled app, core script, daemons, and installe
 needs macOS 13+, Apple Silicon, python3, a running proxy client, and the Claude
 desktop app. The app is ad-hoc signed and not notarized, so the first launch may need
 right-click → Open (the launcher clears download quarantine inside the package).
-The entry point deliberately uses an ASCII filename: if an older zip or a non-UTF-8
-unarchiver renders the Chinese names as garbled text, `INSTALL.command` still works
-because every path it uses is ASCII. See `README-INSTALL.txt` inside the package.
+**Use only `INSTALL.command`.** Current full bundles are ASCII-only: after unzipping,
+that is the one and only `.command` in the folder. macOS Archive Utility renders
+Chinese filenames from older bundles as garbled text even when the UTF-8 flag is set;
+that garbled `.command` cannot be opened and is not an entry point — do not
+double-click it and do not paste its name into a terminal. If you already unzipped a
+bundle that contains `INSTALL.command`, just run `./INSTALL.command` there; no need
+to download again. See `README-INSTALL.txt` inside the package.
 
 **Do not use the old upstream `YOURSJEYO/claude-switcher` release**: its core script
 predates `node-scan` / `slot-node` and fails with `exit code 2` on node scan.

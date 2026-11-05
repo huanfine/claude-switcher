@@ -133,32 +133,35 @@ cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
 # 「新 App + 旧核心」时的急救脚本。只装了 app-only 包的人也需要能升级核心。
 cp "$ROOT/scripts/upgrade-core.sh" "$KIT_ROOT/scripts/"
 cp "$ROOT/SHA256SUMS" "$KIT_ROOT/SHA256SUMS"
-# zip 里的中文名在某些解压工具(macOS 归档实用工具)下会变成乱码。除了给 zip
-# 写 UTF-8 标记,再提供一整套纯 ASCII 路径,乱码时也能照常双击安装。
+# zip 里的中文名在 macOS「归档实用工具」下会变成乱码(连 zip 写了 UTF-8 标记
+# 也一样)。所以安装入口用纯 ASCII,一体化包更是不留任何中文文件名。
 cp "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/install.command"
 cp "$KIT_ROOT/installer/卸载.command" "$KIT_ROOT/installer/uninstall.command"
 cat > "$KIT_ROOT/INSTALL.command" <<'ASCII_EOF'
 #!/bin/bash
-# 安装入口(纯 ASCII 文件名)。中文文件名若被解压工具弄乱,双击这个一样能装。
+# 唯一安装入口。文件名和它调用的路径全是 ASCII,任何解压工具都弄不乱。
 HERE="$(cd "$(dirname "$0")" && pwd)"
 xattr -dr com.apple.quarantine "$HERE" 2>/dev/null || true
 cd "$HERE" || exit 1
 exec bash "$HERE/installer/install.command"
 ASCII_EOF
 cat > "$KIT_ROOT/README-INSTALL.txt" <<'ASCII_EOF'
-INSTALL (read me first)
+INSTALL - read this first / 先看这里
 
-1. Double-click INSTALL.command
-   (if macOS blocks it: right-click -> Open -> Open)
-2. Confirm the proxy group / region, enter your password once
-3. The app appears on your Desktop
+只认 INSTALL.command 这一个入口,双击它。
+首次被系统拦下:右键 -> 打开 -> 再点「打开」。
+按提示确认代理组 / 地区,输入一次开机密码,桌面出现「Claude 环境检查器」。
 
-This package contains the compiled app, core script, daemons and installer.
-No Xcode, no other package, no separate upgrade command needed.
+Only double-click INSTALL.command. Ignore every other .command file in this
+folder, especially ones whose names look garbled (a...command) - they are from
+old packages and cannot be opened. Never paste a garbled name into a terminal.
+
+包内已经带上编译好的 App、核心脚本、守护进程与安装器:
+不需要 Xcode、不需要另下别的包、不需要再跑升级命令。
 Needs macOS 13+, Apple Silicon, python3, a running proxy client, Claude desktop.
 
-If the Chinese-named files show up as garbled text after unzipping, ignore them:
-INSTALL.command and installer/install.command are plain ASCII and work anyway.
+一体化包(*-full.zip)内所有文件名均为 ASCII,解压后不会出现乱码。
+安装入口及其内部路径全是 ASCII,不受解压工具影响。
 ASCII_EOF
 chmod +x "$KIT_ROOT/INSTALL.command" "$KIT_ROOT/installer/install.command" \
          "$KIT_ROOT/installer/uninstall.command" \
@@ -182,56 +185,67 @@ echo "==> 生成一体化安装包 ($ARCH_LABEL, 免编译)"
 # 一份包里同时带上编译好的 App、核心脚本、守护进程与安装器。
 FULL_ROOT="$WORK/$FULL_NAME"
 ditto "$KIT_ROOT" "$FULL_ROOT"
-ditto "$APP" "$FULL_ROOT/Claude 环境检查器.app"
-cat > "$FULL_ROOT/一键安装.command" <<'LAUNCH_EOF'
-#!/bin/bash
-# 中文入口,和 INSTALL.command 等价;统一走 ASCII 路径,乱码也不受影响。
-HERE="$(cd "$(dirname "$0")" && pwd)"
-# 网上下载的 zip 会给每个文件打 com.apple.quarantine。清掉本包内的隔离属性,
-# 免得装好的 App 又被 Gatekeeper 拦一次。只处理解压目录,不碰系统其它位置。
-xattr -dr com.apple.quarantine "$HERE" 2>/dev/null || true
-cd "$HERE" || exit 1
-exec bash "$HERE/installer/install.command"
-LAUNCH_EOF
-cat > "$FULL_ROOT/先读我.txt" <<'NOTE_EOF'
-一个包全装好 —— 三步
-
-1. 双击 INSTALL.command(和「一键安装.command」完全一样)
-   (首次若被 macOS 拦下:右键点它 → 打开 → 再点「打开」)
-2. 按提示确认代理组 / 地区,输入一次开机密码
-3. 完成后桌面出现「Claude 环境检查器」,双击启动
-
-包内已经带上编译好的界面 App、核心脚本、守护进程和安装器:
-不需要 Xcode、不需要另下 app-only 包、不需要再跑升级命令。
-目标机仍需 python3(python.org 或 brew install python 均可)、macOS 13+、
-Apple Silicon、一个正在运行的代理客户端和 Claude 桌面版。
-
-如果解压后中文文件名变成乱码(老版本 zip 的问题),直接双击 ASCII 文件名的
-INSTALL.command 即可,内部路径全是 ASCII,不受影响;详细说明见 README-INSTALL.txt。
-
-特殊场景才用别的包:
-  *-installer-kit.zip   Intel Mac 或想自己从源码编译
-  *-app-only.dmg        只想换界面,核心脚本已经是新的
-  scripts/upgrade-core.sh  旧机器只升级核心脚本
-NOTE_EOF
-chmod +x "$FULL_ROOT/INSTALL.command" "$FULL_ROOT/一键安装.command" \
+# 随包 App 也用 ASCII 名;安装器会认出它,装到桌面时仍叫「Claude 环境检查器」。
+ditto "$APP" "$FULL_ROOT/ClaudeSwitcher.app"
+# 一体化包里不留任何中文文件名。macOS 归档实用工具会把中文名解成
+# 「ä¸é®åè£.command」之类,用户在 Finder 里看到那个乱码 .command 就会去点,
+# 点了又报 no such file or directory。只保留 INSTALL.command 这一个入口,
+# 从根上消灭「选错文件」的可能,而不是靠文档提醒用户别点。
+rm -f "$FULL_ROOT/installer/安装.command" "$FULL_ROOT/installer/卸载.command"
+# 仓库的 SHA256SUMS 列的是中文名安装器。一体化包只留 ASCII 名,清单也要同步
+# 改写,否则用户跑 shasum -c 会报两个文件找不到。两个文件都是 cp 出来的副本,
+# 内容逐字节相同,哈希不变,只换路径。
+python3 - "$ROOT/SHA256SUMS" "$FULL_ROOT/SHA256SUMS" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+renames = {
+    "installer/安装.command": "installer/install.command",
+    "installer/卸载.command": "installer/uninstall.command",
+}
+out = []
+with open(src, encoding="utf-8") as f:
+    for line in f:
+        line = line.rstrip("\n")
+        digest, sep, path = line.partition("  ")
+        out.append(f"{digest}  {renames.get(path, path)}" if sep else line)
+with open(dst, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+PY
+( cd "$FULL_ROOT" && shasum -a 256 -c SHA256SUMS >/dev/null ) \
+    || { echo "✗ 一体化包内 SHA256SUMS 校验失败" >&2; exit 1; }
+chmod +x "$FULL_ROOT/INSTALL.command" \
          "$FULL_ROOT/installer/install.command" "$FULL_ROOT/installer/uninstall.command" \
-         "$FULL_ROOT/installer/安装.command" \
-         "$FULL_ROOT/installer/卸载.command" \
          "$FULL_ROOT/scripts/upgrade-core.sh"
-for ITEM in "INSTALL.command" "README-INSTALL.txt" "一键安装.command" "先读我.txt" \
-            "Claude 环境检查器.app/Contents/MacOS/ClaudeSwitcher" \
+for ITEM in "INSTALL.command" "README-INSTALL.txt" \
+            "ClaudeSwitcher.app/Contents/MacOS/ClaudeSwitcher" \
             "core/claude-switch.sh" "core/stun-probe.py" \
             "daemons/claude-bodyguard.sh" "installer/install.command" \
-            "installer/安装.command" "scripts/upgrade-core.sh" "SHA256SUMS"; do
+            "installer/uninstall.command" "scripts/upgrade-core.sh" "SHA256SUMS"; do
     if [ ! -e "$FULL_ROOT/$ITEM" ]; then
         echo "✗ 一体化安装包缺少 $ITEM" >&2
         exit 1
     fi
 done
-for ITEM in "INSTALL.command" "一键安装.command" "installer/install.command"; do
+for ITEM in "INSTALL.command" "installer/install.command" \
+            "installer/uninstall.command" "scripts/upgrade-core.sh"; do
     [ -x "$FULL_ROOT/$ITEM" ] || { echo "✗ $ITEM 不可执行" >&2; exit 1; }
 done
+# 构建期硬门禁:一体化包里只要还有一个非 ASCII 文件名,就直接打包失败。
+# 之前 1.8.5 版虽然给 zip 写了 UTF-8 标记,系统归档工具照样解成乱码。
+NON_ASCII="$(python3 - "$FULL_ROOT" <<'PY'
+import os, sys
+root = sys.argv[1]
+for base, dirs, files in os.walk(root):
+    for name in dirs + files:
+        if not name.isascii():
+            print(os.path.relpath(os.path.join(base, name), root))
+PY
+)"
+if [ -n "$NON_ASCII" ]; then
+    echo "✗ 一体化包里还有非 ASCII 文件名(解压会乱码):" >&2
+    echo "$NON_ASCII" >&2
+    exit 1
+fi
 python3 "$ROOT/scripts/make-zip.py" "$FULL_ROOT" "$FULL_ZIP" "$FULL_NAME"
 
 echo ""
