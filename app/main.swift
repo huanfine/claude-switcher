@@ -299,6 +299,18 @@ struct AccountStamp: Equatable {
     let date: String
 }
 
+/// 扫描报告里的一条候选出口。给「把这条线绑定到槽位」的菜单用。
+/// 分数只用来在菜单里给人一个比较依据，不参与绑定判定。
+struct NodeCandidate: Identifiable, Equatable {
+    let leaf: String
+    let score: String
+    var id: String { leaf }
+    /// 菜单一行要同时说清「是哪条」和「凭什么」。名字太长交给 SwiftUI 截断。
+    var label: String {
+        score.isEmpty ? leaf : "\(leaf) · \(score) 分"
+    }
+}
+
 /// 一个槽位「还能不能直接用」。
 ///
 /// 这个状态以前根本没有 —— 界面只有「已保存 / 未初始化」，而「已保存」说的是
@@ -396,6 +408,9 @@ final class VM: ObservableObject {
     @Published var current = "?"
     @Published var archived: Set<String> = []
     @Published var stamps: [String: AccountStamp] = [:]
+    /// 槽位里那份 Claude Code 状态（~/.claude/ + ~/.claude.json）的体积和日期。
+    /// 槽位现在不止搬桌面版目录，卡上得看得出来「这个槽位是全套的」。
+    @Published private(set) var cliStamps: [String: AccountStamp] = [:]
     /// 每个槽位「会话还有没有效」。由 Cookies 库直接读，和脚本的 status 并行取。
     @Published var slotLogin: [String: SlotLogin] = [:]
     @Published var banner = ""
@@ -431,6 +446,16 @@ final class VM: ObservableObject {
     /// 换槽位顺带换节点时的一句话回执:换成了哪条、或者为什么没换。
     /// 空串 = 这次切换没碰节点（没什么可换，或者扫描没跑成）。
     @Published private(set) var nodeSwitchNote = ""
+    /// 槽位 → 绑定的出口节点（叶子名）。空 = 没绑。
+    ///
+    /// 读盘而不走核心脚本，和 `probeSlotLogin` 同一个理由：这是**显示**需求，
+    /// 塞进 `status` 的输出契约里要连带改 SHA256SUMS、旧版兼容和一堆断言。
+    /// 写入仍然只走 `slot-node set`，路径与格式以核心脚本为准
+    /// （见 core/claude-switch.sh 的 SLOT_NODE_DIR）。
+    @Published private(set) var slotNodes: [String: String] = [:]
+    /// 上次扫描报告里排在最前的几条候选，给「绑定到槽位」当选项用。
+    /// 只从报告里取，不自己算分 —— 分数怎么来的归核心脚本解释。
+    @Published private(set) var nodeCandidates: [NodeCandidate] = []
     /// 门禁是保守并集(App 运行时通常会有守护驻守),所以这个按钮很少出现 ——
     /// 那正是用户要的形状:宁可让人去客户端点一下,不能替在用的会话换线路。
     var canApplyBestNode: Bool {
@@ -1075,7 +1100,7 @@ final class VM: ObservableObject {
             if pair.count == 2 { values[pair[0]] = pair[1] }
         }
         func reset() -> Bool {
-            current = "未知"; archived = []; stamps = [:]
+            current = "未知"; archived = []; stamps = [:]; cliStamps = [:]
             return false
         }
         guard result.succeeded, let account = fields["current"],
@@ -1105,12 +1130,24 @@ final class VM: ObservableObject {
             guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return reset() }
             parsed[letter] = AccountStamp(size: String(parts[0]), date: String(parts[1]))
         }
+        // CLI 存档是可选字段：老脚本不输出，缺了就当没有，不能因此判 status 失败。
+        var cli: [String: AccountStamp] = [:]
+        for letter in Self.accountLetters {
+            guard let raw = fields["cli\(letter)"] else { continue }
+            let parts = raw.split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { continue }
+            cli[letter] = AccountStamp(size: String(parts[0]), date: String(parts[1]))
+        }
         current = account == "none" ? "未初始化" : account
         stamps = parsed
+        cliStamps = cli
         archived = known
         // 登录态要跟着切槽位/归档变化重算：切完之后实时档案换了一份，
         // 「当前槽位」的会话有效性也就换了。
         refreshSlotLogin()
+        // 绑定是显示需求，跟着账号状态一起刷新：命令行里刚 `slot-node set`
+        // 完，界面重开/重新检查一次就该看见，不必重启 App。
+        loadSlotNodes()
         return true
     }
 
@@ -1240,6 +1277,78 @@ final class VM: ObservableObject {
         return result
     }
 
+    /// `TOPn=叶子|分数|出口IP|判据|说明` —— 报告里按分数排好的前三名。
+    /// 只认 TOP 行，不把 BEST 混进来：BEST 是「值得换」的结论，未必是全部候选。
+    static func parseNodeCandidates(_ output: String) -> [NodeCandidate] {
+        var out: [NodeCandidate] = []
+        var seen = Set<String>()
+        for line in output.split(separator: "\n") {
+            guard line.hasPrefix("TOP") else { continue }
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let fields = parts[1].split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count >= 2 else { continue }
+            let leaf = String(fields[0])
+            let score = String(fields[1])
+            guard !leaf.isEmpty, seen.insert(leaf).inserted else { continue }
+            out.append(NodeCandidate(leaf: leaf, score: score))
+        }
+        return out
+    }
+
+    // MARK: - 槽位 ↔ 节点绑定
+
+    /// 与 core/claude-switch.sh 的 `SLOT_NODE_DIR="$BASE/slot-node"` 同一处。
+    /// 这里读、脚本写；两边各自拼路径，改一边必须改另一边（tests/test_node_scan.py 盯着）。
+    static var slotNodeDir: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-switcher/slot-node").path
+    }
+    /// 生产走上面的固定路径；测试把它指到夹具目录，免得读到本机真实绑定。
+    var slotNodeRoot: String = VM.slotNodeDir
+
+    /// 把四个绑定文件读回来。文件格式 selector<TAB>leaf<TAB>epoch，
+    /// 由核心脚本写；这里只取第二个字段，坏行/半行直接跳过。
+    func loadSlotNodes() {
+        var found: [String: String] = [:]
+        for letter in Self.accountLetters {
+            let path = "\(slotNodeRoot)/\(letter)"
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+                  let line = text.split(separator: "\n").first else { continue }
+            let leaf = Self.parseSlotNode(String(line))
+            if !leaf.isEmpty { found[letter] = leaf }
+        }
+        slotNodes = found
+    }
+
+    /// 给槽位声明「就走这条线」。不改当前出口，也不切账号 ——
+    /// 真正换线路发生在下次切到这个槽位时（optimizeNodeForSwitch）。
+    func bindSlotNode(_ slot: String, leaf: String) {
+        guard !isBusy, !leaf.isEmpty, Self.accountLetters.contains(slot), coreAvailable() else { return }
+        run(["slot-node", "set", slot, leaf], timeout: 15) { [weak self] result in
+            guard let self else { return }
+            guard result.succeeded, !result.output.contains("FAIL:") else {
+                self.note = "绑定失败：\(Self.failureLine(result.output))"
+                return
+            }
+            self.loadSlotNodes()
+            self.note = "账号\(slot) 已绑定 \(leaf)，下次切到它会先换这条出口"
+        }
+    }
+
+    func clearSlotNode(_ slot: String) {
+        guard !isBusy, Self.accountLetters.contains(slot), coreAvailable() else { return }
+        run(["slot-node", "clear", slot], timeout: 15) { [weak self] result in
+            guard let self else { return }
+            guard result.succeeded, !result.output.contains("FAIL:") else {
+                self.note = "解除绑定失败：\(Self.failureLine(result.output))"
+                return
+            }
+            self.loadSlotNodes()
+            self.note = "账号\(slot) 已解除节点绑定，切过去时改由本次扫描决定"
+        }
+    }
+
     /// 结论后面必须挂得上证据,不能只丢一句「没有更优节点」却看不到扫了什么。
     /// 旧格式报告缺字段时逐项省略 —— 拿 0 冒充实测值比没有数字更糟。
     /// 格式与 core/claude-switch.sh 的 checkdetail 第 16 项保持一致。
@@ -1314,6 +1423,7 @@ final class VM: ObservableObject {
                 // 先拿完整 stdout 解析,再把人话部分留给用户看。
                 let info = Self.parseNodeScan(result.output)
                 self.nodeScanInfo = info
+                self.nodeCandidates = Self.parseNodeCandidates(result.output)
                 self.applyNodeScan(info)
                 self.nodeScanReport = Self.displayableNodeReport(result.output)
             } else {
@@ -1335,6 +1445,7 @@ final class VM: ObservableObject {
             if result.succeeded {
                 let info = Self.parseNodeScan(result.output)
                 self.nodeScanInfo = info
+                self.nodeCandidates = Self.parseNodeCandidates(result.output)
                 self.applyNodeScan(info)
             }
             // 无论切换成功与否都重新完整检查:通过会自动 startWatch(),
@@ -1643,7 +1754,7 @@ final class VM: ObservableObject {
                 self.switchRequested = false; self.isBusy = false
                 return
             }
-            self.optimizeNodeForSwitch { safeToSwitch in
+            self.optimizeNodeForSwitch(for: target) { safeToSwitch in
                 // 换完线路审计没过就不切账号：新账号第一次连上的就是这条出口，
                 // 明知不干净还切过去，等于把风险转嫁给下一个身份。
                 guard safeToSwitch else {
@@ -1661,16 +1772,36 @@ final class VM: ObservableObject {
     /// 49 分的线，用户得自己点工具栏的地球图标、再在面板里点一次「应用」。
     /// 现在扫描和应用接进切换流程，切完账号直接用上最干净的出口。
     ///
+    /// 槽位如果绑了固定节点（`slot-node set B <节点名>`），那条优先 ——
+    /// 绑定的意思是「这个槽位就走这条线」，不该被「本次分数最高的那条」盖掉。
+    ///
     /// 三道闸一道都没放宽：
-    ///   · 只有报告里真有 BEST（比当前高 10 分以上）才动手，没得换就直接过；
+    ///   · 没绑定又没 BEST（比当前高 10 分以上）就直接过，不折腾；
     ///   · 动手前先 stopWatch()，`node-apply` 自己的执行门禁还会再判一次
     ///     「Claude 在不在跑」—— 开着 Claude 时它照样拒绝，这里只是失败退出；
     ///   · 换完线路必须重新跑完整审计，没过就不切账号（fail-closed）。
     ///
     /// 报告里的 GATE 是保守并集，有守护驻守时一定是 report-only；能不能真切
-    /// 由执行门禁在停完守护之后判。所以这里不看 GATE，只看有没有 BEST。
-    private func optimizeNodeForSwitch(done: @escaping (Bool) -> Void) {
+    /// 由执行门禁在停完守护之后判。所以这里不看 GATE。
+    private func optimizeNodeForSwitch(for target: String,
+                                       done: @escaping (Bool) -> Void) {
         guard coreAvailable() else { done(true); return }
+        run(["slot-node", "get", target], timeout: 10) { [weak self] bound in
+            guard let self else { done(true); return }
+            let leaf = bound.succeeded ? Self.parseSlotNode(bound.output) : ""
+            self.applyNodeForSwitch(bound: leaf, done: done)
+        }
+    }
+
+    /// `slot-node get` 的格式是 selector<TAB>leaf<TAB>epoch，没绑定输出 NONE。
+    static func parseSlotNode(_ output: String) -> String {
+        guard let line = output.split(separator: "\n").first else { return "" }
+        let parts = line.split(separator: "\t").map(String.init)
+        guard parts.count >= 2, parts[1] != "NONE" else { return "" }
+        return parts[1]
+    }
+
+    private func applyNodeForSwitch(bound: String, done: @escaping (Bool) -> Void) {
         // 扫一轮实测 13s 上下。不给话就是「点完槽位卡，界面僵在那儿」——
         // 切换本身只要一两秒，这段时间全花在扫描上，必须说清楚在等什么。
         banner = "正在扫描可用节点…"
@@ -1685,15 +1816,20 @@ final class VM: ObservableObject {
             }
             let info = Self.parseNodeScan(result.output)
             self.nodeScanInfo = info
+            self.nodeCandidates = Self.parseNodeCandidates(result.output)
             self.applyNodeScan(info)
             self.nodeScanReport = Self.displayableNodeReport(result.output)
-            guard let best = info["BEST"], !best.isEmpty else {
+            // 绑定优先，其次才是「本次更优」。
+            let leaf = bound.isEmpty ? (info["BEST"] ?? "") : bound
+            guard !leaf.isEmpty else {
                 done(true)
                 return
             }
-            banner = "正在切到更干净节点 \(best)…"
+            let note = bound.isEmpty ? "已切到更干净节点 \(leaf)" : "已切到槽位绑定节点 \(leaf)"
+            banner = "正在切到 \(leaf)…"
             self.stopWatch()
-            self.run(["node-apply"], timeout: 120) { [weak self] applied in
+            // 显式把叶子交给 node-apply：绑定时它可能不是本次的 BEST。
+            self.run(["node-apply", leaf], timeout: 120) { [weak self] applied in
                 guard let self else { done(true); return }
                 self.banner = ""
                 let after = Self.parseNodeScan(applied.output)
@@ -1707,7 +1843,7 @@ final class VM: ObservableObject {
                     self.checkEnvironment { _ in done(true) }
                     return
                 }
-                self.nodeSwitchNote = "已切到更干净节点 \(best)"
+                self.nodeSwitchNote = note
                 self.checkEnvironment { ok in done(ok) }
             }
         }
@@ -3126,6 +3262,17 @@ struct ContentView: View {
                         .font(.system(size: 9))
                     Text(archived ? "独立指纹" : "点击绑定")
                         .font(Type.microFont)
+                    // 槽位现在连 Claude Code 的状态一起搬。有存档才画这个角标：
+                    // 老脚本 / 从没用过 CLI 的机器不该平白多一个看不懂的 CLI。
+                    if let stamp = vm.cliStamps[t] {
+                        HStack(spacing: 3) {
+                            Image(systemName: "terminal").font(.system(size: 8))
+                            Text("CLI").font(Type.microFont)
+                        }
+                        .foregroundColor(ClaudeTheme.muted)
+                        .help("该槽位还存着 Claude Code 的 ~/.claude 与 ~/.claude.json"
+                              + "：\(stamp.size) · \(shortDate(stamp.date))")
+                    }
                     Spacer(minLength: 6)
                     // 「档案在不在」和「会话还有没有效」是两件事，以前只说了前一件。
                     // 实测有个槽位快照完好、卡片写着「已保存」，但 Cookies 里根本
@@ -3155,6 +3302,14 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .disabled(vm.isBusy)
+        // 绑定入口挂在卡片右上角，不藏进右键菜单：之前扫描入口放在工具栏
+        // 就被用户吐槽「找不到」。这里是个常驻的小图标，绑没绑一眼看得出来。
+        // overlay 而不是塞进 Button 的 label —— 嵌套的交互控件收不到点击。
+        .overlay(alignment: .topTrailing) {
+            slotNodeMenu(t)
+                .padding(.top, 6)
+                .padding(.trailing, 8)
+        }
         .onHover { inside in
             withAnimation(.easeOut(duration: Motion.micro)) {
                 if inside { hoveredAccount = t }
@@ -3162,6 +3317,44 @@ struct ContentView: View {
             }
         }
         .help(isCurrent ? "当前正在使用账号 \(t)" : "切换到账号 \(t)（会先重新检查一遍环境）")
+    }
+
+    /// 槽位 → 出口的绑定菜单。选项只来自最近一次扫描报告，
+    /// 没扫过就先给一个「去扫描」，不让人手敲节点名（敲错就是切到不存在的线）。
+    private func slotNodeMenu(_ t: String) -> some View {
+        let bound = vm.slotNodes[t] ?? ""
+        let current = vm.nodeScanInfo["CURRENT"] ?? ""
+        let candidates = vm.nodeCandidates
+        return Menu {
+            Section("账号 \(t) 切换时固定走") {
+                if !current.isEmpty && !candidates.contains(where: { $0.leaf == current }) {
+                    Button("当前出口 · \(current)") { vm.bindSlotNode(t, leaf: current) }
+                }
+                ForEach(candidates) { candidate in
+                    Button(candidate.label) { vm.bindSlotNode(t, leaf: candidate.leaf) }
+                }
+                if candidates.isEmpty && current.isEmpty {
+                    Button("先扫描可用节点…") { vm.scanNodes() }
+                }
+            }
+            if !bound.isEmpty {
+                Button("解除绑定（\(bound)）") { vm.clearSlotNode(t) }
+            }
+            Button("重新扫描节点…") { vm.scanNodes() }
+        } label: {
+            Image(systemName: bound.isEmpty ? "link.badge.plus" : "link")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(bound.isEmpty ? ClaudeTheme.faint : ClaudeTheme.terracottaDeep)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(vm.isBusy)
+        .help(bound.isEmpty
+              ? "给账号 \(t) 绑定一条固定出口"
+              : "账号 \(t) 固定走 \(bound)。点这里改绑或解除")
     }
 
     /// 登录角标。三种确定状态各给一个图标 + 一句人话；

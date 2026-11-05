@@ -40,6 +40,12 @@ repository, command-line script, and build artifact name.
   never counts as a pass.
 - **Snapshot switching (A–D)** — archives and restores whole account
   directories; APFS copy-on-write cloning avoids duplicating unchanged data.
+  A slot also carries the Claude Code CLI state (`~/.claude/` and
+  `~/.claude.json`), so the terminal and the desktop app never share a session.
+  Switching is refused while `claude` is running in a terminal.
+- **Per-slot exit node binding** — declare one fixed exit for each slot; switching
+  to that slot applies the bound node before switching accounts. Unbound slots
+  use the best node from the current scan. Binding takes priority over the scan.
 - **Fail-closed bodyguard** — checks the proxy kernel and virtual interface
   every ten seconds and terminates protected processes when the tunnel is lost.
 - **Runtime egress watchdog** — samples the exit every 10s, runs a full audit
@@ -113,8 +119,12 @@ For Windows, see [`windows/README.md`](windows/README.md); for Linux, see
 2. If everything is green, choose an account and launch Claude. If a blocking
    check is red, use the one-click repair action.
 3. Sign in once for each additional account; later switches keep sessions
-   independent.
-4. After changing to a node in another country, run
+   independent — for both the desktop app and the `claude` CLI. Exit the CLI
+   before switching (it writes to the directory being swapped).
+4. To pin an exit to a slot, scan once from the "更优节点 / Better node" row,
+   then use the link icon in the top-right corner of a slot card and pick a
+   candidate from the report (`slot-node set <A-D> <node>` on the command line).
+5. After changing to a node in another country, run
    `~/.local/bin/claude-switch.sh set-region`.
 
 The full command set, menu bar behavior, and troubleshooting notes are in the

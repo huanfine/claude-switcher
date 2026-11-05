@@ -66,6 +66,8 @@
 - **四维加权评分**：身份 / 隔离 / 一致 / 守护四个维度，颜色只按分数分档，能否启动由徽章单独表达。
 - **IP 纯净度**：四源交叉（ipquery / ip-api / ipinfo / stopforumspam）+ 本地 PTR，类型基线减分；机房只给警告，代理特征与 Tor 才拦启动。
 - **节点扫描与应用**：只读扫描当前控路 Selector 的候选节点并排名；「应用最优节点」只在门禁允许时出现，按下时实时复核门禁、切后复查出口国家，任一步不达标自动回滚。细节见 [AGENTS.md](AGENTS.md)。
+- **一槽一套环境**：切 A–D 时连同 Claude Code 的 `~/.claude/` 与 `~/.claude.json` 一起换，桌面版和终端不再共用同一份登录态。槽位卡上的 `CLI` 角标表示这个槽位也存了终端状态。
+- **槽位绑定出口**：可以给每个槽位声明「就走这条线」，切过去时先换线路再切账号；没绑定的槽位沿用「本次扫描最优节点」。绑定优先于本次扫描结果。
 - **运行期守护**：放行后每 10s 比对出口、每 60s 跑整轮审计；异常连续两次才停 Claude，拦截写 `incidents.log` 并走窗口横幅 / 菜单栏 / 系统通知三条提醒。
 - **菜单栏常驻**：关窗口只隐藏、Dock 不显示图标；菜单显示当前槽位与最近检查结果。
 - **检查设置与脱敏诊断**：`checks.json` 控制 8 项非关键检查；客户端日志只记命令元数据，诊断包不含 IP、凭据、账号内容。
@@ -88,13 +90,14 @@ Windows / Linux Beta 见 [windows/README.md](windows/README.md) · [linux/README
 ## 日常使用
 
 1. 双击桌面应用图标 → 等 16 项检查；硬性项全绿再选账号启动，红项用「一键修复」。
-2. B/C/D 首次各登录一次，之后 A–D 随切随用、互不干扰。
+2. B/C/D 首次各登录一次，之后 A–D 随切随用、互不干扰。桌面版和终端里的 `claude` 各算一套状态，切槽位时两份一起换；**终端里开着 `claude` 时不能切**，先退出再点。
 3. 换国家节点后跑 `~/.local/bin/claude-switch.sh set-region` 重新锁定国家 / 时区 / 地区格式。
 4. 换代理客户端在界面下拉框切换，或 `set-client <mode>`；切换后自动重审。
+5. 要给某个槽位固定出口：先点清单里「更优节点」那一行扫描一次，再点槽位卡右上角的链接图标，从报告里的候选里选一条。想还原成「每次按扫描结果决定」，在同一个菜单里解除绑定即可。命令行等价写法见下表 `slot-node`。
 
 ## 命令速查
 
-下表路径前缀均为 `~/.local/bin/claude-switch.sh`；完整参数与结论含义运行 `help`（按「日常 / 出问题时 / 区域与客户端 / 维护」分组）。
+下表路径前缀均为 `~/.local/bin/claude-switch.sh`；完整参数与结论含义运行 `help`（按「日常 / 出问题时 / 区域与客户端 / 槽位与出口 / 维护」分组）。
 
 | 场景 | 命令 |
 |---|---|
@@ -102,7 +105,8 @@ Windows / Linux Beta 见 [windows/README.md](windows/README.md) · [linux/README
 | 一键修复 | `fix` |
 | 切账号 / 状态 | `switch A\|B\|C\|D` / `status` |
 | 运行期看门狗 | `watch [间隔] [整轮周期]` |
-| 节点扫描 / 应用 | `node-scan` / `node-apply` |
+| 节点扫描 / 应用 | `node-scan` / `node-apply [节点名]` |
+| 槽位绑定出口 | `slot-node list` / `slot-node get <A\|B\|C\|D>` / `slot-node set <A\|B\|C\|D> <节点名>` / `slot-node clear <A\|B\|C\|D>` |
 | 重锁地区 / 换客户端 | `set-region` / `set-client <mode>` / `get-client` |
 | 故障演练 / 离线复核 | `drill [--auto\|--manual]` / `verdict [报告]` / `evidence <file>` |
 | 只读体检 | `fingerprint` / `cli-info` / `diagnose-proxy --proxy URL` / `open-safe <url>` |

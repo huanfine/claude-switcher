@@ -23,6 +23,10 @@ FUNCTIONS = (
     "stage_keep_paths",
     "restore_keep_paths",
     "archive_current",
+    # 槽位现在连 Claude Code 的状态一起搬，switch_to / status 会调到这三个。
+    "cli_slot_has_payload",
+    "archive_cli",
+    "restore_cli",
     "switch_to",
 )
 
@@ -73,6 +77,10 @@ class MultiAccountTests(unittest.TestCase):
             "HOME": str(self.fixture),
             "BASE": str(self.base),
             "DATA": str(self.data),
+            # 全套槽位数据都落在夹具 HOME 里，绝不碰真实的 ~/.claude。
+            "CLI_DIR": str(self.fixture / ".claude"),
+            "CLI_JSON": str(self.fixture / ".claude.json"),
+            "CLI_BASE": str(self.base / "cli"),
             "LOG": str(self.fixture / "switch.log"),
             "FIXTURE": str(self.fixture),
             "INJECT": injection,
@@ -87,6 +95,9 @@ copy_tree() {
 }
 quit_claude() { return 0; }
 open() { printf 'called' > "$FIXTURE/launched"; }
+# 夹具里没有、也不该有真的 claude 进程。用 stub 固定成「没在跑」，
+# 否则本机终端恰好开着 Claude Code 时，这批测试会随机拒绝切换。
+claude_cli_running() { return 1; }
 ditto() {
     if [ "$INJECT" = "stage_error" ]; then
         case "$1 $2" in *keep-stage*) return 44 ;; esac

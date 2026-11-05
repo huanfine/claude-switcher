@@ -1422,6 +1422,14 @@ FAKE_PREFIX="198.18."          # 由 FAKE_IP_RANGE 换算,供 case 匹配
 
 DATA="$HOME/Library/Application Support/Claude"
 BASE="$HOME/.claude-switcher"
+# Claude Code 的状态不在 DATA 里:它用 ~/.claude/ 加一个顶层 ~/.claude.json。
+# 槽位只搬 DATA 的话,A/B/C/D 对终端里的 claude 来说就是同一个账号 ——
+# 登录态、历史、配置一份都不变。这两个路径因此也纳入槽位。
+CLI_DIR="$HOME/.claude"
+CLI_JSON="$HOME/.claude.json"
+CLI_BASE="$BASE/cli"
+# 槽位 → 节点的绑定:每个槽位可以钉一条固定出口,切槽位时按它换线路。
+SLOT_NODE_DIR="$BASE/slot-node"
 LOG="$HOME/Library/Logs/claude-switch.log"
 ROUTE_MISSED=""
 KEEP_STAGED=0
@@ -3483,6 +3491,9 @@ node_apply_gate() {
 }
 
 node_apply() {
+    # 可选参数:指定要切的叶子。槽位绑定走这条路 —— 「切到 B 就换 B 绑的那条线」,
+    # 而不是「换成本次扫描分数最高的那条」。不给参数时维持原语义(用报告里的 BEST)。
+    local want_leaf="${1:-}"
     local epoch now best="" best_score=0 best_ip="" best_sel="" selector="" current=""
     local gate reason tmp raw="" original="" now_leaf="" trace loc="" ip_after="" i verified=0
     [ -f "$NODE_SCAN_FILE" ] || { echo "FAIL:还没有扫描报告,请先运行 node-scan" >&2; return 1; }
@@ -3491,13 +3502,20 @@ node_apply() {
     case "${epoch:-}" in ''|*[!0-9]*) epoch=0 ;; esac
     [ $((now - epoch)) -le "$NODE_SCAN_TTL" ] || {
         echo "FAIL:扫描报告已过期,请先重新扫描" >&2; return 1; }
-    best=$(sed -n 's/^BEST=//p' "$NODE_SCAN_FILE" | head -1)
-    [ -n "$best" ] || { echo "FAIL:当前没有值得切换的更优节点,无需应用" >&2; return 1; }
-    best_score=$(sed -n 's/^BEST_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
-    best_ip=$(sed -n 's/^BEST_IP=//p' "$NODE_SCAN_FILE" | head -1)
-    best_sel=$(sed -n 's/^BEST_SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
     selector=$(sed -n 's/^SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
     current=$(sed -n 's/^CURRENT=//p' "$NODE_SCAN_FILE" | head -1)
+    if [ -n "$want_leaf" ]; then
+        # 绑定节点没有「分数」这回事,分数只用于「谁更值得换」的比较。
+        best="$want_leaf"
+        best_sel="$selector"
+        best_ip=""
+    else
+        best=$(sed -n 's/^BEST=//p' "$NODE_SCAN_FILE" | head -1)
+        [ -n "$best" ] || { echo "FAIL:当前没有值得切换的更优节点,无需应用" >&2; return 1; }
+        best_score=$(sed -n 's/^BEST_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
+        best_ip=$(sed -n 's/^BEST_IP=//p' "$NODE_SCAN_FILE" | head -1)
+        best_sel=$(sed -n 's/^BEST_SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
+    fi
     [ -n "$best_sel" ] || best_sel="$selector"
     [ -n "$best_sel" ] || { echo "FAIL:报告里没有可用的 Selector,请重新扫描" >&2; return 1; }
 
@@ -3521,6 +3539,11 @@ node_apply() {
          '$1=="NODE" && $2==s && $3==l {hit=1} END{exit !hit}' "$raw"; then
         echo "FAIL:候选节点已不在内核里(订阅可能更新过),请重新扫描" >&2
         rm -rf "$tmp"; return 1
+    fi
+    # 绑定节点时报告里没有它的 IP,从内核枚举里补一条,好让 PREFERRED 记全。
+    if [ -z "$best_ip" ]; then
+        best_ip=$(awk -F'\t' -v s="$best_sel" -v l="$best" \
+                  '$1=="NODE" && $2==s && $3==l {print $4; exit}' "$raw")
     fi
 
     echo "切换:$original → $best (Selector $best_sel)"
@@ -3560,7 +3583,11 @@ node_apply() {
     printf '%s\t%s\t%s\t%s\n' "$best_sel" "$best" "$best_ip" "$(date +%s)" \
         > "$PREFERRED_NODE_FILE.tmp" 2>/dev/null \
         && mv "$PREFERRED_NODE_FILE.tmp" "$PREFERRED_NODE_FILE"
-    echo "OK:已应用并固定 $best($best_score 分) · 出口 ${ip_after:-未知}/${loc:-未知}"
+    if [ -n "$best_score" ]; then
+        echo "OK:已应用并固定 $best($best_score 分) · 出口 ${ip_after:-未知}/${loc:-未知}"
+    else
+        echo "OK:已应用并固定 $best · 出口 ${ip_after:-未知}/${loc:-未知}"
+    fi
     echo "已建立的连接不会迁移;启动 Claude 前请在客户端确认线路"
     # 静默重扫:刷新 CURRENT / 门禁 / PREFERRED_MATCH,让「更优节点」立刻落成真值。
     NODE_SCAN_QUIET=1 scan_nodes >/dev/null 2>&1 || true
@@ -3572,9 +3599,49 @@ node_apply() {
     return 0
 }
 
+# ---------- 槽位 ↔ 节点绑定 ----------
+# 一个槽位一套环境的最小可行做法:数据目录分开之外,出口也分开。
+# 存 selector<TAB>leaf<TAB>epoch;切槽位时 App 读它,再用 node-apply <leaf> 切过去。
+# 不存分数:分数是「谁更值得换」的比较结果,绑定是「就是这条」的声明。
+slot_node_show() {
+    local f="$SLOT_NODE_DIR/${1:-}"
+    [ -n "${1:-}" ] && [ -f "$f" ] || { echo "NONE"; return 0; }
+    awk -F'\t' 'NF>=2 && $2!="" {print; found=1; exit} END{if(!found) print "NONE"}' "$f"
+}
+
+slot_node_list() {
+    local a line
+    for a in A B C D; do
+        line=$(slot_node_show "$a")
+        [ "$line" = "NONE" ] || printf '%s\t%s\n' "$a" "$line"
+    done
+}
+
+slot_node_set() {
+    local slot="${1:-}" leaf="${2:-}" sel="${3:-}"
+    valid_account "$slot" || return 1
+    [ -n "$leaf" ] || { echo "FAIL:要指定节点名"; return 1; }
+    if [ -z "$sel" ]; then
+        [ -f "$NODE_SCAN_FILE" ] || { echo "FAIL:还没有扫描报告,请先运行 node-scan"; return 1; }
+        sel=$(sed -n 's/^SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
+    fi
+    [ -n "$sel" ] || { echo "FAIL:报告里没有可用的 Selector,请先 node-scan"; return 1; }
+    mkdir -p "$SLOT_NODE_DIR" || return 1
+    printf '%s\t%s\t%s\n' "$sel" "$leaf" "$(date +%s)" > "$SLOT_NODE_DIR/$slot.tmp" \
+        && mv "$SLOT_NODE_DIR/$slot.tmp" "$SLOT_NODE_DIR/$slot" \
+        || { echo "FAIL:写入绑定失败"; return 1; }
+    echo "OK:账号$slot 已绑定节点 $leaf"
+}
+
+slot_node_clear() {
+    local slot="${1:-}"
+    valid_account "$slot" || return 1
+    rm -f "$SLOT_NODE_DIR/$slot"
+    echo "OK:已解除账号$slot 的节点绑定"
+}
+
 # 保留隐藏入口供安装器调用;现在生成全局 Script.js 并迁移旧管理块。
 write_merge_rules() { clash_rules write; }
-
 flclash_repair() {
     "${BASH:-/bin/bash}" "$0" flclash-repair "$@"
 }
@@ -4319,6 +4386,13 @@ status() {
         size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
         stamp=$(date -r "$dir" '+%Y-%m-%d' 2>/dev/null)
         extras="$extras acc$a=${size:-?}@${stamp:-?}"
+        # Claude Code 那半边单独报:它不在 accounts/ 里,体积也不小(实测 151M),
+        # 混进 acc 会让「这个槽位多大」对不上磁盘。
+        if cli_slot_has_payload "$a"; then
+            csize=$(du -sh "$CLI_BASE/$a" 2>/dev/null | awk '{print $1}')
+            cstamp=$(date -r "$CLI_BASE/$a" '+%Y-%m-%d' 2>/dev/null)
+            extras="$extras cli$a=${csize:-?}@${cstamp:-?}"
+        fi
     done
     echo "current=$cur hasA=$hasA hasB=$hasB hasC=$hasC hasD=$hasD accounts=${accounts:-none}$extras"
 }
@@ -4565,6 +4639,101 @@ archive_current() {
     log "已存档账号$cur ($(( $(date +%s) - t0 ))s)"
 }
 
+# ---------- Claude Code 那半边(独立目录树,不碰 accounts/) ----------
+# 为什么另起 $BASE/cli 而不是塞进 accounts/$X:
+#   accounts/$X 的语义就是「~/Library/Application Support/Claude 的内容」,
+#   往里面加子目录,restore 时会原样复制回 App 数据目录,凭空多出个 cli/。
+#   而且老快照(用户已经存好的 A/B)没有这层,放进同一棵树就得做迁移 ——
+#   迁移 473 MB 的账号快照是有风险的,不如并列放,老快照一个字节都不用动。
+#
+# 布局:
+#   $BASE/cli/A/home/       ← ~/.claude
+#   $BASE/cli/A/home.json   ← ~/.claude.json
+# 两者都可能缺(老槽位没存过 CLI,或者用户从没用过 Claude Code)。
+
+cli_slot_has_payload() {
+    [ -d "$CLI_BASE/$1/home" ] || [ -f "$CLI_BASE/$1/home.json" ]
+}
+
+# 归档当前 Claude Code 状态到账号槽位。移动语义,和 archive_current 一致:
+# 成功之后 ~/.claude 就不在原位了,由 restore_cli 把目标槽位的那份放回来。
+archive_cli() {
+    local cur="$1"
+    local staged="$CLI_BASE/$cur.new" current="$CLI_BASE/$cur" previous="$CLI_BASE/$cur.previous"
+    local had_old=0 moved=0
+    mkdir -p "$CLI_BASE" || { log "FAIL:无法创建 Claude Code 快照目录"; return 1; }
+    if [ -e "$staged" ] || [ -e "$previous" ]; then
+        log "FAIL:账号$cur 存在待恢复的 Claude Code 快照,拒绝覆盖"
+        return 1
+    fi
+    rm -rf "$staged"
+    mkdir -p "$staged" || return 1
+
+    if [ -d "$CLI_DIR" ]; then
+        if mv "$CLI_DIR" "$staged/home" 2>/dev/null; then
+            moved=1
+        elif ! copy_tree "$CLI_DIR" "$staged/home"; then
+            rm -rf "$staged"
+            log "FAIL:账号$cur 的 Claude Code 目录归档失败"
+            return 1
+        fi
+    fi
+    if [ -f "$CLI_JSON" ]; then
+        # 和 ~/.claude 一样是移动语义:归档完现场就该是空的,否则「归档到一半
+        # 失败」时会出现 ~/.claude 没了、~/.claude.json 还在的半截状态。
+        if ! { mv "$CLI_JSON" "$staged/home.json" 2>/dev/null \
+               || { cp -p "$CLI_JSON" "$staged/home.json" 2>/dev/null && rm -f "$CLI_JSON"; }; }; then
+            if [ "$moved" -eq 1 ]; then mv "$staged/home" "$CLI_DIR" 2>/dev/null; fi
+            rm -rf "$staged"
+            log "FAIL:账号$cur 的 ~/.claude.json 归档失败"
+            return 1
+        fi
+    fi
+
+    if [ -e "$current" ]; then
+        if ! mv "$current" "$previous"; then
+            if [ "$moved" -eq 1 ]; then mv "$staged/home" "$CLI_DIR" 2>/dev/null; fi
+            rm -rf "$staged"
+            log "FAIL:账号$cur 旧 Claude Code 快照无法转存"
+            return 1
+        fi
+        had_old=1
+    fi
+    if ! mv "$staged" "$current"; then
+        if [ "$had_old" -eq 1 ]; then mv "$previous" "$current" 2>/dev/null; fi
+        rm -rf "$staged"
+        log "FAIL:账号$cur Claude Code 快照提交失败"
+        return 1
+    fi
+    [ "$had_old" -eq 1 ] && rm -rf "$previous"
+    return 0
+}
+
+# 把目标槽位的 Claude Code 状态放回原位。目标没有存档时**清空**现场 ——
+# 这才是「每个槽位一套环境」:不然没存过的槽位会接着用上一个账号的登录态。
+restore_cli() {
+    local target="$1"
+    local src="$CLI_BASE/$1" staged="$CLI_BASE/$1.new"
+    rm -rf "$staged"
+    if [ -d "$src" ]; then
+        copy_tree "$src" "$staged" || { log "FAIL:账号$target 的 Claude Code 快照载入失败"; return 1; }
+    else
+        mkdir -p "$staged" || return 1
+    fi
+    rm -rf "$CLI_DIR" 2>/dev/null
+    rm -f "$CLI_JSON" 2>/dev/null
+    if [ -d "$staged/home" ] && ! mv "$staged/home" "$CLI_DIR"; then
+        log "FAIL:账号$target 的 Claude Code 目录还原失败"
+        return 1
+    fi
+    if [ -f "$staged/home.json" ] && ! mv "$staged/home.json" "$CLI_JSON"; then
+        log "FAIL:账号$target 的 ~/.claude.json 还原失败"
+        return 1
+    fi
+    rm -rf "$staged"
+    return 0
+}
+
 # 快照复制:APFS 上用 clonefile(COW) 近乎瞬时,不改写已有快照;不支持时回退 ditto 全量复制
 copy_tree() {
     src="$1"; dst="$2"
@@ -4662,6 +4831,12 @@ restore_keep_paths() {
 switch_to() {
     target="${1:-}"
     valid_account "$target" || return 1
+    # 槽位现在也换 ~/.claude。终端里开着 claude 就动它,等于把正在写的目录
+    # 抽走 —— 必须让人先退出。桌面 App 能 osascript 优雅退出,CLI 没有这个口子。
+    if claude_cli_running; then
+        echo "FAIL:Claude Code 正在运行，请先在终端退出（切换会换掉 ~/.claude）"
+        return 1
+    fi
     cur="none"; [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
     just_archived=0
 
@@ -4674,6 +4849,10 @@ switch_to() {
         archive_current A || {
             rm -rf "$BASE/keep-stage"
             echo "FAIL:首次账号归档失败，已停止切换"; return 1
+        }
+        archive_cli A || {
+            rm -rf "$BASE/keep-stage"
+            echo "FAIL:首次归档 Claude Code 状态失败，已停止切换"; return 1
         }
         just_archived=1
         cur="A"; echo "$cur" > "$BASE/current"
@@ -4695,6 +4874,11 @@ switch_to() {
         if [ -d "$BASE/keep-stage" ]; then
             restore_keep_paths || { echo "FAIL:跨身份保留还原失败，暂存保留在 $BASE/keep-stage"; return 1; }
         fi
+        # 中断后 ~/.claude 可能已经不在原位,从存档补回来。只在现场确实缺了
+        # 才动手 —— restore_cli 会先清空现场,不能拿它做「顺手刷新」。
+        if [ ! -d "$CLI_DIR" ] && cli_slot_has_payload "$target"; then
+            restore_cli "$target" || { echo "FAIL:账号$target 的 Claude Code 状态还原失败"; return 1; }
+        fi
         open -a "Claude"
         echo "INFO:当前已是账号$target"
         return 0
@@ -4709,6 +4893,10 @@ switch_to() {
         archive_current "$cur" || {
             rm -rf "$BASE/keep-stage"
             echo "FAIL:账号$cur 归档失败，已停止切换"; return 1
+        }
+        archive_cli "$cur" || {
+            rm -rf "$BASE/keep-stage"
+            echo "FAIL:账号$cur 的 Claude Code 状态归档失败，已停止切换"; return 1
         }
     fi
 
@@ -4732,6 +4920,13 @@ switch_to() {
     if ! { rm -rf "$DATA" && mv "$DATA.new" "$DATA"; }; then
         log "FAIL:载入账号$target 失败"
         echo "FAIL:载入账号$target 失败，暂存保留在 $BASE/keep-stage"
+        return 1
+    fi
+    # 目标槽位没有 Claude Code 存档时,restore_cli 会把 ~/.claude 清空 ——
+    # 这是有意的:不然没存过的槽位会接着用上一个账号的登录态,等于没隔离。
+    if ! restore_cli "$target"; then
+        log "FAIL:账号$target 的 Claude Code 状态还原失败"
+        echo "FAIL:账号$target 的 Claude Code 状态还原失败，暂存保留在 $BASE/cli"
         return 1
     fi
     echo "$target" > "$BASE/current"
@@ -4784,6 +4979,13 @@ help() {
   get-client           打印当前选定的代理客户端
   open-safe <url>      在受控环境里打开链接
 
+槽位与出口
+  切换账号会连同 Claude Code 的 ~/.claude 一起换;出口可以单独声明:
+  slot-node list                   列出 A-D 各自绑定的出口节点
+  slot-node get <A|B|C|D>          查看某个槽位的绑定(没绑输出 NONE)
+  slot-node set <A|B|C|D> <节点名> 声明固定出口(须先 node-scan,切到该槽位时生效)
+  slot-node clear <A|B|C|D>        解除绑定,切过去时改由本次扫描决定
+
 维护
   update               更新核心脚本(校验 SHA256,自检失败自动回滚)
   update-check         只检查有没有新版本,不写入
@@ -4828,7 +5030,15 @@ case "$operation" in
         ;;
     fix) fix ;;
     node-scan) scan_nodes ;;
-    node-apply) node_apply ;;
+    node-apply) node_apply "${2:-}" ;;
+    slot-node)
+        case "${2:-list}" in
+            list)  slot_node_list ;;
+            get)   slot_node_show "${3:-}" ;;
+            set)   slot_node_set "${3:-}" "${4:-}" "${5:-}" ;;
+            clear) slot_node_clear "${3:-}" ;;
+            *) echo "FAIL:slot-node 支持 list | get <A-D> | set <A-D> <节点名> | clear <A-D>"; return 1 ;;
+        esac ;;
     watch) watch "${2:-10}" "${3:-6}" ;;
     status) status ;;
     switch) switch_to "${2:-}" ;;

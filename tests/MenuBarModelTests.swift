@@ -58,6 +58,17 @@ private final class Fixture {
             if [ -f "$root/node-apply" ]; then cat "$root/node-apply"
             else echo 'FAIL:演示环境没有可应用节点'; fi
             result node-apply ;;
+          # 槽位绑定的节点。没有绑定就回 NONE,切换流程照旧走「本次更优」。
+          slot-node) case "$2" in
+              get) if [ -f "$root/slot-node-$3" ]; then cat "$root/slot-node-$3"; else echo NONE; fi ;;
+              set) printf 'SEL\t%s\t%s\n' "$4" "$(date +%s)" > "$root/slot-node-$3"
+                   # 界面直接读盘(VM.loadSlotNodes),写两份好让两边看到同一状态。
+                   cp "$root/slot-node-$3" "$root/$3"
+                   echo "OK:账号$3 已绑定节点 $4" ;;
+              clear) rm -f "$root/slot-node-$3" "$root/$3"
+                     echo "OK:已解除账号$3 的节点绑定" ;;
+              *) exit 2 ;;
+            esac ;;
           fix) delay fix; if [ -f "$root/fix-output" ]; then cat "$root/fix-output"; else echo 'FIX:演示修复完成'; fi; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
           watch)
@@ -150,12 +161,15 @@ struct MenuBarModelTests {
                 try expect(f.calls == ["checkdetail", "get-client", "status"], "启动不应重复检查")
                 try expect(vm.phase == .ready && vm.lastCheckSummary == "通过" && vm.current == "A", "初始状态不一致")
             case "multi_account_status":
-                try f.write("status", "current=A hasA=1 hasB=1 hasC=1 hasD=0 accounts=A,B,C accA=1.2G@2026-10-20 accB=900M@2026-10-19 accC=2.0G@2026-10-18\n")
+                try f.write("status", "current=A hasA=1 hasB=1 hasC=1 hasD=0 accounts=A,B,C accA=1.2G@2026-10-20 accB=900M@2026-10-19 accC=2.0G@2026-10-18 cliA=151M@2026-11-04\n")
                 try f.write("switch-output", "OK:已切换到账号 C\n")
                 let vm = f.vm()
                 vm.start(); try f.idle(vm)
                 try expect(vm.archived == Set(["A", "B", "C"]), "应解析三个已建档账号")
                 try expect(vm.stamps["A"] == AccountStamp(size: "1.2G", date: "2026-10-20"), "应解析账号大小与日期")
+                try expect(vm.cliStamps["A"] == AccountStamp(size: "151M", date: "2026-11-04"),
+                           "槽位里的 Claude Code 存档体积要单独解析，实际 \(vm.cliStamps)")
+                try expect(vm.cliStamps["B"] == nil, "没有 CLI 存档的槽位不该冒出角标")
                 let card = ContentView(vm: vm)
                 // 卡片是两行:第一行状态,第二行体积和日期。两行都要断言,
                 // 否则状态和它的存档信息对不上也发现不了。
@@ -208,7 +222,8 @@ struct MenuBarModelTests {
                 vm.switchTo("B")
                 try f.idle(vm)
                 try expect(vm.lastCheckSummary == "有警告" && vm.current == "B", "警告应展示并允许切换")
-                try expect(f.calls == ["checkdetail", "get-client", "status", "node-scan", "switch B"],
+                try expect(f.calls == ["checkdetail", "get-client", "status", "slot-node get B",
+                                  "node-scan", "switch B"],
                            "切换前必须先完整审计,再扫一遍节点")
             case "skipped_optional_allowed":
                 try f.audit(["DNS": "skip:用户已禁用", "WebRTC": "skip:用户已禁用"])
@@ -351,7 +366,8 @@ struct MenuBarModelTests {
                 try expect(!vm.canQuit, "切换请求开始后不可退出")
                 vm.switchTo("A"); vm.refresh(); vm.fixAll(); vm.inspectFingerprint()
                 try f.idle(vm)
-                try expect(f.calls == ["checkdetail", "get-client", "status", "node-scan", "switch B"],
+                try expect(f.calls == ["checkdetail", "get-client", "status", "slot-node get B",
+                                  "node-scan", "switch B"],
                            "忙碌时应忽略重复操作")
                 try expect(vm.canQuit && vm.current == "B", "切换完成后应允许退出")
             case "fix_guard":
@@ -732,7 +748,11 @@ struct MenuBarModelTests {
                 let vm = f.vm()
                 vm.switchTo("B"); try f.idle(vm)
                 try expect(f.calls.contains("node-scan"), "切槽位时应扫描节点: \(f.calls)")
-                try expect(f.calls.contains("node-apply"), "发现更优节点时应先换线路: \(f.calls)")
+                // 断言必须是前缀匹配:真正发出去的调用带叶子名(`node-apply <节点>`),
+                // 精确相等会永远不成立 —— 而这正是「有没有真的切」要验的东西。
+                try expect(f.calls.contains { $0.hasPrefix("node-apply ") }, "发现更优节点时应先换线路: \(f.calls)")
+                try expect(f.calls.contains("node-apply 鱼3·美国-犹他州"),
+                           "应用时应把本次最优叶子显式传下去: \(f.calls)")
                 try expect(vm.current == "B", "换完节点仍要切账号")
                 try expect(vm.note.contains("已切到更干净节点 鱼3·美国-犹他州"),
                            "回执要说清换了哪条,实际 \(vm.note)")
@@ -759,6 +779,64 @@ struct MenuBarModelTests {
                 vm.switchTo("B"); try f.idle(vm)
                 try expect(vm.current == "B", "节点切换失败仍应切账号")
                 try expect(vm.note.contains("节点未切换"), "回执要说明节点没换,实际 \(vm.note)")
+
+            case "switch_prefers_slot_bound_node":
+                // 槽位绑了节点就认绑定,不认本次扫描的 BEST。
+                // 两者语义不同:BEST 是「现在谁更干净」,绑定是「这个身份就该走这条线」。
+                // 后者是用户对身份-出口关系的声明,不能被一次扫描结果盖掉。
+                try f.audit()
+                try f.write("node-scan", """
+                CURRENT=鱼1·美国-犹他州
+                CURRENT_SCORE=49
+                BEST=鱼3·美国-犹他州
+                BEST_SCORE=88
+                DELTA=39
+                GATE=report-only
+                ELIGIBLE=4
+                """)
+                try f.write("node-apply", "OK:已切到 鱼9·日本-东京\n")
+                try f.write("slot-node-B", "🧠 AI·干净IP\t鱼9·日本-东京\t1793859910\n")
+                let vm = f.vm()
+                vm.switchTo("B"); try f.idle(vm)
+                try expect(f.calls.contains("node-apply 鱼9·日本-东京"),
+                           "绑定了节点就必须走绑定的那条: \(f.calls)")
+                try expect(!f.calls.contains("node-apply 鱼3·美国-犹他州"),
+                           "绑定优先时不该再去切本次 BEST: \(f.calls)")
+                try expect(vm.note.contains("已切到槽位绑定节点 鱼9·日本-东京"),
+                           "回执要说明走的是绑定节点,实际 \(vm.note)")
+                try expect(vm.current == "B", "换完节点仍要切账号")
+
+            case "slot_node_binding_round_trip":
+                // 槽位 ↔ 节点绑定要在界面里能设、能看、能解除。
+                // 以前只有命令行 `slot-node set B <节点名>`，界面上没有任何线索。
+                let vm = f.vm()
+                vm.slotNodeRoot = f.root.path
+                try f.write("B", "SEL\t鱼7·日本-东京\t1793859910\n")
+                vm.start(); try f.idle(vm)
+                try expect(vm.slotNodes["B"] == "鱼7·日本-东京",
+                           "启动时应把已有绑定读回来，实际 \(vm.slotNodes)")
+
+                // 报告里的 TOP 行是绑定菜单的唯一选项来源。
+                let candidates = VM.parseNodeCandidates("""
+                TOP1=鱼3·美国-犹他州|88|1.2.3.4|优秀|住宅
+                TOP2=鱼5·德国|75|5.6.7.8|良好|机房
+                TOP3=鱼3·美国-犹他州|88|1.2.3.4|优秀|重复行
+                BAD=不该被读进来
+                """)
+                try expect(candidates.map(\.leaf) == ["鱼3·美国-犹他州", "鱼5·德国"],
+                           "候选要去重且只认 TOP 行，实际 \(candidates)")
+                try expect(candidates.first?.label == "鱼3·美国-犹他州 · 88 分",
+                           "菜单行要带分数，实际 \(candidates.first?.label ?? "")")
+
+                vm.bindSlotNode("B", leaf: "鱼3·美国-犹他州")
+                try spin { vm.slotNodes["B"] == "鱼3·美国-犹他州" }
+                try expect(f.calls.contains("slot-node set B 鱼3·美国-犹他州"),
+                           "绑定应写进核心脚本: \(f.calls)")
+                try expect(vm.note.contains("账号B 已绑定"), "绑定要有回执，实际 \(vm.note)")
+
+                vm.clearSlotNode("B")
+                try spin { vm.slotNodes.isEmpty }
+                try expect(f.calls.contains("slot-node clear B"), "解除绑定应写进核心脚本: \(f.calls)")
 
             case "node_scan_report_updates_row":
                 // 扫描报告必须能就地更新「更优节点」这一行,且不能把其他行改掉。

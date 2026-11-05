@@ -118,8 +118,24 @@
 - 差距不足 `NODE_SCAN_MARGIN`（10 分）不出 `BEST`，免得每次扫描都催用户改线路；清空 `BEST` 时必须连 `BEST_IP` / `BEST_SCORE` / `BEST_SELECTOR` 一起清，别留半截报告。
 - `checkdetail` 的第 16 项**只读报告文件**，绝不在 45 秒检查预算里发网络请求。没有报告 / 报告过期 → `skip`，不是 `ok`；`skip` 不扣分，用户关掉检查项不该反而掉分。有 `preferred-node` 时，`PREFERRED_MATCH=0` 优先于「还有更优节点」报「已偏离固定节点」。
 - 报告门禁 `node_gate()` 只看两个**瞬时**事实：Claude 进程 / CLI 在跑、看门狗仍在驻守，任一成立即 `report-only`。**不要**再把「任一 A–D 已建档槽位」算进去 —— 槽位是常驻资产，存过一次 `hasA=1` 就永远为真，那条判据会让 `node-apply` 对任何用过本工具的人永久拒绝，界面上「应用最优节点」从不出现。执行门禁 `node_apply_gate()` 必须**重新实时判定**，不信报告里的旧快照；看门狗那条从「pidfile 存在」升级为「进程确实已不在跑」的事实检查，残留 pidfile 不阻塞、真有守护仍拒绝。
-- 换槽位时这条链自己会走一遍（`VM.optimizeNodeForSwitch`）：审计通过 → `node-scan` → 报告里真有 `BEST` 就 `stopWatch()` + `node-apply` → 重新审计 → 再切账号。三个例外都必须保留：扫描失败不阻断切换；`node-apply` 失败不阻断切换（只把原因写进回执）；换完线路重新审计没过就**不切账号**（fail-closed，新账号第一次连上的就是那条出口）。
+- 换槽位时这条链自己会走一遍（`VM.optimizeNodeForSwitch`）：审计通过 → `slot-node get <目标>` → `node-scan` → 有绑定就切绑定那条、否则报告里真有 `BEST` 才切 → `stopWatch()` + `node-apply <叶子>` → 重新审计 → 再切账号。三个例外都必须保留：扫描失败不阻断切换；`node-apply` 失败不阻断切换（只把原因写进回执）；换完线路重新审计没过就**不切账号**（fail-closed，新账号第一次连上的就是那条出口）。
+- **绑定优先于本次最优**：`BEST` 是「现在谁更干净」的比较结果，绑定是「这个身份就该走这条线」的声明，后者不能被一次扫描盖掉。所以 `node_apply` 支持显式叶子（`node-apply <leaf>`），无参时才取报告里的 `BEST`。绑定存 `$BASE/slot-node/<A-D>`，格式 `selector<TAB>leaf<TAB>epoch`，**不存分数**；命令族 `slot-node list|get|set|clear`。界面在槽位卡右上角给常驻的链接图标菜单，选项只来自最近一次报告的 `CURRENT` / `TOP1-3`，不让人手敲节点名。
+- 界面读绑定是直接读盘（`VM.loadSlotNodes`），核心脚本负责写。两处各自拼同一个路径，改动必须同步；`tests/test_cli_slot.py::SlotNodeBindingTests` 钉着这条契约。跟 `probeSlotLogin` 一样，读取属于显示需求，不塞进 `status` 的输出契约。
 - 守护归 App 管、切换归脚本管：App 先 `stopWatch()`，`node-apply` 不杀 App 持有的守护（否则 App 会误报「守护意外退出」），切完由 `checkEnvironment` 通过后自动 `startWatch()`。已建立的连接不会迁移；只对 `Selector` 生效，`URLTest` / `Fallback` 会被自动选路覆盖。
+
+## 槽位隔离的边界（桌面版 + Claude Code）
+
+一个槽位不只是一个目录，是「一组目录 + 一个文件」：
+
+| 内容 | 桌面版 Claude | Claude Code |
+| --- | --- | --- |
+| 实时路径 | `~/Library/Application Support/Claude` | `~/.claude/`、`~/.claude.json` |
+| 槽内存档 | `$BASE/accounts/<A-D>/` | `$BASE/cli/<A-D>/home/`、`$BASE/cli/<A-D>/home.json` |
+
+- **不要**把 `~/.claude` 塞进 `accounts/<A-D>` 树：那棵树的语义是「桌面版数据目录的内容」，混入子目录会被原样复制回 `DATA`。并列放 `$BASE/cli` 也不动老快照，避免迁移几百 MB 历史目录。
+- 归档用**移动语义**：`archive_cli` 先 `mv ~/.claude`，失败要能把已挪走的部分放回原位，不能留「目录没了、`~/.claude.json` 还在」的半截状态；`restore_cli` 会**先清空现场**再放回，目标槽位没存档时 `~/.claude` 和 `~/.claude.json` 一并删除 —— 否则没存过的槽位会接着用上一个账号的登录态，等于没隔离。
+- `switch_to` 开头用 `claude_cli_running` 挡住「终端里开着 claude 就切」：CLI 没有 osascript 那种优雅退出口子，直接把正在写的目录抽走会丢状态。进程判据三选一：`pgrep -x claude`（brew / `~/.local/bin` 的原生二进制，`argv[0]` 就是 `claude`）、`claude-code/cli.js`、`@anthropic-ai/claude-code`；大小写敏感，不能误伤桌面 App 的 `Claude`。
+- `status` 会把每个槽位的 CLI 存档体积报成 `cliA=151M@2026-11-04`，界面据此在卡片上加一个 `CLI` 角标；老脚本不输出这个字段，缺了就当没有，不能因此判 `status` 失败。
 
 ## 独立代理诊断
 
