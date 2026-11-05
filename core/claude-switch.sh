@@ -3208,30 +3208,29 @@ preferred_node_leaf() {
     awk -F'\t' 'NF >= 2 && $2 != "" {print $2; exit}' "$PREFERRED_NODE_FILE" 2>/dev/null
 }
 
-# 能不能自动应用,只看「有没有正在使用的实例」。用户定的口径:
-#   没启动、没账号 → 可以扫描并应用;已有实例环境 → 只出报告。
-# 这里取并集的保守侧:Claude 进程 / CLI / 任何已建档槽位 / 看门狗驻守,
-# 四者任一成立就只出报告。宁可少自动一次,不能把用户正在用的会话切掉。
+# 能不能自动应用,只看「此刻有没有东西在用这条出口」。
+#
+# 这里原来还有第四条:status 里 hasA..hasD=1 —— 只要**存过**任何账号快照就判
+# 「已有实例环境」。那是个死条件:槽位是常驻资产,存过一次就永远为真,于是
+# node-apply 对任何用过本工具的人都是永久拒绝,和 Claude 有没有在跑无关。
+# 实测 hasA=1 hasB=1 时门禁恒为 report-only,界面上「应用最优节点」从不出现。
+# 现在只认「进程在跑」和「看门狗还驻守」这两个瞬时事实 —— 存着快照本身
+# 不占用出口,换线路不会动到它。
 node_gate() {
-    local st reasons="" active=0 pid=""
+    local reasons="" pid=""
     if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 \
        || pgrep -f "claude-code/cli.js" >/dev/null 2>&1 \
        || pgrep -f "@anthropic-ai/claude-code" >/dev/null 2>&1; then
-        active=1; reasons="Claude 正在运行"
+        reasons="Claude 正在运行"
     fi
-    st=$(status)
-    case "$st" in
-        *hasA=1*|*hasB=1*|*hasC=1*|*hasD=1*)
-            active=1; reasons="${reasons:+${reasons}、}已有账号槽位" ;;
-    esac
     pid=$(awk -F'\t' '{print $1; exit}' "$BASE/watch.pid" 2>/dev/null)
     if [ -n "$pid" ] && watch_pid_is_watchdog "$pid"; then
-        active=1; reasons="${reasons:+${reasons}、}看门狗驻守中"
+        reasons="${reasons:+${reasons}、}看门狗驻守中"
     fi
-    if [ "$active" = 1 ]; then
+    if [ -n "$reasons" ]; then
         printf 'report-only|%s\n' "$reasons"
     else
-        printf 'auto-ok|未启动、无账号槽位、无驻守\n'
+        printf 'auto-ok|未启动、无驻守\n'
     fi
 }
 
@@ -3438,25 +3437,24 @@ scan_nodes() {
 #   · node_apply_gate()   执行门禁,只按此刻的真实状态重新判定。看门狗不算
 #                         「实例」,但必须**确实已经不在跑**才放行 —— 把那条
 #                         从信号升级成事实,而不是放宽。
+#
+# 两层都不再看「存过几个槽位」。那条判据是死条件(见 node_gate 的注释),
+# 留着等于让 node-apply 永久不可用。真正要防的是「有东西正在用这条出口」,
+# 而槽位快照只是磁盘上的目录,不占用出口。
 node_apply_gate() {
-    local st reasons="" pid="" i
+    local reasons="" pid="" i
     if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 \
        || pgrep -f "claude-code/cli.js" >/dev/null 2>&1 \
        || pgrep -f "@anthropic-ai/claude-code" >/dev/null 2>&1; then
         reasons="Claude 正在运行"
     fi
-    st=$(status)
-    case "$st" in
-        *hasA=1*|*hasB=1*|*hasC=1*|*hasD=1*)
-            reasons="${reasons:+${reasons}、}已有账号槽位" ;;
-    esac
     [ -n "$reasons" ] && { printf 'denied|%s\n' "$reasons"; return 0; }
     # stopWatch() 发完 SIGTERM 后 bash 可能还卡在 sleep 里,App 0.5s 后补 SIGKILL。
     # 给最多 3 秒等它退干净;pidfile 残留但进程已死,watch_pid_is_watchdog 会返回假。
     for i in 1 2 3 4 5 6; do
         pid=$(awk -F'\t' '{print $1; exit}' "$BASE/watch.pid" 2>/dev/null)
         if [ -z "$pid" ] || ! watch_pid_is_watchdog "$pid"; then
-            printf 'allowed|未启动、无账号槽位、无驻守\n'
+            printf 'allowed|未启动、无驻守\n'
             return 0
         fi
         sleep 0.5
@@ -3487,7 +3485,7 @@ node_apply() {
     # 拿一份旧报告在用户已经开起 Claude 之后偷偷换线路。
     IFS='|' read -r gate reason <<<"$(node_apply_gate)"
     [ "$gate" = "allowed" ] || {
-        echo "FAIL:已有实例环境,按约定只出报告($reason)" >&2; return 1; }
+        echo "FAIL:当前有实例在用,按约定只出报告($reason)" >&2; return 1; }
 
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/node-apply.XXXXXX") || return 1
     raw="$tmp/raw"

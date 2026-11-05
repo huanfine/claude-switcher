@@ -32,6 +32,8 @@ SCENARIOS = (
     "incidents_loaded", "incidents_malformed_ignored", "incidents_missing_file",
     # 节点扫描报告 → 界面只更新「更优节点」这一行
     "node_scan_report_updates_row",
+    # 换槽位要先扫节点、有更干净的先换线路再切账号;换失败也不能拖死切账号
+    "switch_scans_and_applies_better_node", "switch_survives_node_apply_failure",
     # 菜单栏品牌图标：两态同一枚盾牌 + Claude 星芒，拦截态额外感叹号徽章
     "menu_bar_brand_icon",
 )

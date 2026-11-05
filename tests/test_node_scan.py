@@ -320,18 +320,44 @@ esac''')
         run = self.run_core("node-apply")
         self.assertNotEqual(run.returncode, 0)
         blob = run.stdout + run.stderr
-        self.assertIn("已有实例环境", blob)
+        self.assertIn("按约定只出报告", blob)
         self.assertIn("Claude 正在运行", blob)
         self.assertNotIn("读不到运行中的内核节点", blob,
                          "门禁必须在碰内核之前拦住,不能先切了再说")
 
-    def test_apply_rejects_existing_account_slot(self):
+    def test_existing_account_slot_does_not_block_apply(self):
+        """存过账号快照不等于有实例在跑。
+
+        这条原来断言的是「已有账号槽位就拒绝」。可槽位是常驻资产:存过一次
+        hasA=1 就永远为真,于是 node-apply 对任何用过本工具的人都是永久拒绝,
+        界面上「应用最优节点」从不出现 —— 节点切换功能等于没有。
+        现在只认「进程在跑」和「看门狗驻守」,槽位在不在不参与判定。
+        """
         self.report()
         (self.home / ".claude-switcher/accounts/A").mkdir(parents=True)
-        run = self.run_core("node-apply")
-        blob = run.stdout + run.stderr
-        self.assertIn("已有账号槽位", blob)
-        self.assertNotIn("读不到运行中的内核节点", blob)
+        (self.home / ".claude-switcher/accounts/B").mkdir(parents=True)
+        blob = self.run_core("node-apply").stdout + self.run_core("node-apply").stderr
+        self.assertNotIn("已有账号槽位", blob, blob)
+        self.assertNotIn("按约定只出报告", blob, blob)
+        self.assertIn("读不到运行中的内核节点", blob,
+                      "门禁应放行;后面的失败来自假环境没有内核,不是门禁")
+
+    def test_scan_gate_ignores_existing_slots(self):
+        """报告门禁同理:有槽位但没东西在跑,应当给 auto-ok。
+
+        直接抽 node_gate 出来跑:完整 node-scan 要先读到内核,假环境里到不了
+        打印门禁那一步,测不出这条。
+        """
+        (self.home / ".claude-switcher/accounts/A").mkdir(parents=True)
+        src = SOURCE.read_text(encoding="utf-8")
+        start = src.index("node_gate() {")
+        end = src.index("\n}\n", start) + len("\n}\n")
+        script = 'BASE="%s"\n%s\nnode_gate\n' % (self.home / ".claude-switcher",
+                                                 src[start:end])
+        run = subprocess.run(["/bin/bash", "-c", script], text=True,
+                             capture_output=True, env=self.env, timeout=10)
+        self.assertIn("auto-ok", run.stdout, run.stdout + run.stderr)
+        self.assertNotIn("已有账号槽位", run.stdout, run.stdout)
 
     def test_stale_watch_pidfile_does_not_block_apply(self):
         """看门狗这一条从「pidfile 在不在」升级成「进程真活着吗」。
@@ -344,7 +370,7 @@ esac''')
                                                               encoding="utf-8")
         run = self.run_core("node-apply")
         blob = run.stdout + run.stderr
-        self.assertNotIn("已有实例环境", blob, blob)
+        self.assertNotIn("按约定只出报告", blob, blob)
         self.assertIn("读不到运行中的内核节点", blob,
                       "门禁应放行;后面的失败来自假环境没有内核,不是门禁")
 

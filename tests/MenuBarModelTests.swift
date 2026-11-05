@@ -48,6 +48,16 @@ private final class Fixture {
           get-check-config) cat "$root/check-config"; result get-config ;;
           set-check-config) printf '%s\n' "$2" > "$root/saved-config"; result set-config ;;
           switch) delay switch; cat "$root/switch-output"; result switch ;;
+          # 切槽位现在会先扫一遍节点。默认报告里 BEST 为空 = 没什么可换,
+          # 切换流程照旧往下走,不会平白多出一次 node-apply。
+          node-scan) delay node-scan
+            if [ -f "$root/node-scan" ]; then cat "$root/node-scan"
+            else printf 'CURRENT=A\nCURRENT_SCORE=49\nBEST=\nGATE=auto-ok\n'; fi
+            result node-scan ;;
+          node-apply) delay node-apply
+            if [ -f "$root/node-apply" ]; then cat "$root/node-apply"
+            else echo 'FAIL:演示环境没有可应用节点'; fi
+            result node-apply ;;
           fix) delay fix; if [ -f "$root/fix-output" ]; then cat "$root/fix-output"; else echo 'FIX:演示修复完成'; fi; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
           watch)
@@ -198,7 +208,8 @@ struct MenuBarModelTests {
                 vm.switchTo("B")
                 try f.idle(vm)
                 try expect(vm.lastCheckSummary == "有警告" && vm.current == "B", "警告应展示并允许切换")
-                try expect(f.calls == ["checkdetail", "get-client", "status", "switch B"], "切换前必须先完整审计")
+                try expect(f.calls == ["checkdetail", "get-client", "status", "node-scan", "switch B"],
+                           "切换前必须先完整审计,再扫一遍节点")
             case "skipped_optional_allowed":
                 try f.audit(["DNS": "skip:用户已禁用", "WebRTC": "skip:用户已禁用"])
                 let vm = f.vm()
@@ -340,7 +351,8 @@ struct MenuBarModelTests {
                 try expect(!vm.canQuit, "切换请求开始后不可退出")
                 vm.switchTo("A"); vm.refresh(); vm.fixAll(); vm.inspectFingerprint()
                 try f.idle(vm)
-                try expect(f.calls == ["checkdetail", "get-client", "status", "switch B"], "忙碌时应忽略重复操作")
+                try expect(f.calls == ["checkdetail", "get-client", "status", "node-scan", "switch B"],
+                           "忙碌时应忽略重复操作")
                 try expect(vm.canQuit && vm.current == "B", "切换完成后应允许退出")
             case "fix_guard":
                 try f.write("fix-delay", "0.2")
@@ -702,6 +714,52 @@ struct MenuBarModelTests {
                 try expect(delegate.applicationShouldTerminate(app) == .terminateCancel, "系统退出也必须保护修复操作")
                 try f.idle(vm)
                 try expect(delegate.applicationShouldTerminate(app) == .terminateNow, "修复结束应该解除退出保护")
+            case "switch_scans_and_applies_better_node":
+                // 切槽位必须自己扫一遍节点,发现有更干净的就先换线路再切账号。
+                // 以前这条链上根本没有节点这一步:用户得自己点工具栏图标、
+                // 再在面板里点一次「应用」,而那个按钮因为门禁死条件从不出现。
+                try f.audit()
+                try f.write("node-scan", """
+                CURRENT=鱼1·美国-犹他州
+                CURRENT_SCORE=49
+                BEST=鱼3·美国-犹他州
+                BEST_SCORE=88
+                DELTA=39
+                GATE=report-only
+                ELIGIBLE=4
+                """)
+                try f.write("node-apply", "OK:已切到 鱼3·美国-犹他州\nBEST=鱼3·美国-犹他州\n")
+                let vm = f.vm()
+                vm.switchTo("B"); try f.idle(vm)
+                try expect(f.calls.contains("node-scan"), "切槽位时应扫描节点: \(f.calls)")
+                try expect(f.calls.contains("node-apply"), "发现更优节点时应先换线路: \(f.calls)")
+                try expect(vm.current == "B", "换完节点仍要切账号")
+                try expect(vm.note.contains("已切到更干净节点 鱼3·美国-犹他州"),
+                           "回执要说清换了哪条,实际 \(vm.note)")
+                // 换完线路必须重新审计:不能拿换之前那份结果放行。
+                let audits = f.calls.filter { $0 == "checkdetail" }.count
+                try expect(audits == 2, "换完节点要重新审计一遍,实际 \(audits) 次")
+
+            case "switch_survives_node_apply_failure":
+                // 换节点失败不该把账号切换一起拖死:出口没变,账号照切,
+                // 但原因必须写进回执,不能让人以为一切顺利。
+                try f.audit()
+                try f.write("node-scan", """
+                CURRENT=鱼1·美国-犹他州
+                CURRENT_SCORE=49
+                BEST=鱼3·美国-犹他州
+                BEST_SCORE=88
+                DELTA=39
+                GATE=report-only
+                ELIGIBLE=4
+                """)
+                try f.write("node-apply", "FAIL:候选节点已不在内核里\n")
+                try f.write("node-apply-exit", "1")
+                let vm = f.vm()
+                vm.switchTo("B"); try f.idle(vm)
+                try expect(vm.current == "B", "节点切换失败仍应切账号")
+                try expect(vm.note.contains("节点未切换"), "回执要说明节点没换,实际 \(vm.note)")
+
             case "node_scan_report_updates_row":
                 // 扫描报告必须能就地更新「更优节点」这一行,且不能把其他行改掉。
                 let vm = f.vm()
@@ -786,7 +844,7 @@ struct MenuBarModelTests {
                 // 门禁按钮只在 auto-ok 且确实有更优节点时出现(用户选的保守并集)。
                 try expect(!vm.canApplyBestNode, "没有报告信息时不该给按钮")
                 vm.setNodeScanInfoForTest(["GATE": "report-only", "BEST": "鱼2", "DELTA": "30"])
-                try expect(!vm.canApplyBestNode, "已有实例环境不该给自动应用按钮")
+                try expect(!vm.canApplyBestNode, "报告门禁不放行时不该给自动应用按钮")
                 vm.setNodeScanInfoForTest(["GATE": "auto-ok", "BEST": ""])
                 try expect(!vm.canApplyBestNode, "没有更优节点不该给按钮")
                 vm.setNodeScanInfoForTest(["GATE": "auto-ok", "BEST": "鱼2", "DELTA": "30"])
@@ -808,9 +866,9 @@ struct MenuBarModelTests {
                 vm.applyNodeScan(deniedInfo)
                 let deniedDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
                 try expect(!deniedDetail.contains("应用最优节点"),
-                           "已有实例环境时不该许诺自动应用按钮,实际 \(deniedDetail)")
+                           "报告门禁不放行时不该许诺自动应用按钮,实际 \(deniedDetail)")
                 try expect(deniedDetail.contains("手动切换"),
-                           "已有实例环境应指到客户端手动切换,实际 \(deniedDetail)")
+                           "报告门禁不放行时应指到客户端手动切换,实际 \(deniedDetail)")
             case "menu_bar_brand_icon":
                 // 菜单栏图标以前是系统符号 checkmark.shield.fill；窗口标记与 App 图标
                 // 换成 Claude 星芒后它成了唯一一枚「盾牌 + 对号」。这里锁住新的自绘图标：

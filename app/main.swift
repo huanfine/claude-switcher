@@ -426,6 +426,9 @@ final class VM: ObservableObject {
     @Published var showNodeScan = false
     /// 最近一次扫描/应用报告的键值,只用来决定「应用最优节点」按钮该不该出现。
     @Published private(set) var nodeScanInfo: [String: String] = [:]
+    /// 换槽位顺带换节点时的一句话回执:换成了哪条、或者为什么没换。
+    /// 空串 = 这次切换没碰节点（没什么可换，或者扫描没跑成）。
+    @Published private(set) var nodeSwitchNote = ""
     /// 门禁是保守并集(App 运行时通常会有守护驻守),所以这个按钮很少出现 ——
     /// 那正是用户要的形状:宁可让人去客户端点一下,不能替在用的会话换线路。
     var canApplyBestNode: Bool {
@@ -1587,14 +1590,89 @@ final class VM: ObservableObject {
         hideAfterSwitch?.cancel()
         isBusy = true
         switchRequested = true
+        nodeSwitchNote = ""
         // 常驻后旧检查可能已经过期。每次切换都重新审计，不使用落盘的旧结果放行。
         checkEnvironment { passed in
             guard passed else {
                 self.switchRequested = false; self.isBusy = false
                 return
             }
-            self.performSwitch(target)
+            self.optimizeNodeForSwitch { safeToSwitch in
+                // 换完线路审计没过就不切账号：新账号第一次连上的就是这条出口，
+                // 明知不干净还切过去，等于把风险转嫁给下一个身份。
+                guard safeToSwitch else {
+                    self.switchRequested = false; self.isBusy = false
+                    return
+                }
+                self.performSwitch(target)
+            }
         }
+    }
+
+    /// 换槽位前顺手把出口换成更干净的那条。
+    ///
+    /// 以前这条链上根本没有节点这一步：切账号只换磁盘目录，出口还是原来那条
+    /// 49 分的线，用户得自己点工具栏的地球图标、再在面板里点一次「应用」。
+    /// 现在扫描和应用接进切换流程，切完账号直接用上最干净的出口。
+    ///
+    /// 三道闸一道都没放宽：
+    ///   · 只有报告里真有 BEST（比当前高 10 分以上）才动手，没得换就直接过；
+    ///   · 动手前先 stopWatch()，`node-apply` 自己的执行门禁还会再判一次
+    ///     「Claude 在不在跑」—— 开着 Claude 时它照样拒绝，这里只是失败退出；
+    ///   · 换完线路必须重新跑完整审计，没过就不切账号（fail-closed）。
+    ///
+    /// 报告里的 GATE 是保守并集，有守护驻守时一定是 report-only；能不能真切
+    /// 由执行门禁在停完守护之后判。所以这里不看 GATE，只看有没有 BEST。
+    private func optimizeNodeForSwitch(done: @escaping (Bool) -> Void) {
+        guard coreAvailable() else { done(true); return }
+        // 扫一轮实测 13s 上下。不给话就是「点完槽位卡，界面僵在那儿」——
+        // 切换本身只要一两秒，这段时间全花在扫描上，必须说清楚在等什么。
+        banner = "正在扫描可用节点…"
+        run(["node-scan"], timeout: 90) { [weak self] result in
+            guard let self else { done(true); return }
+            self.banner = ""
+            // 扫描失败不该拦住切账号：这一步是顺手优化，不是前置条件。
+            guard result.succeeded else {
+                self.nodeSwitchNote = "节点扫描失败，已跳过"
+                done(true)
+                return
+            }
+            let info = Self.parseNodeScan(result.output)
+            self.nodeScanInfo = info
+            self.applyNodeScan(info)
+            self.nodeScanReport = Self.displayableNodeReport(result.output)
+            guard let best = info["BEST"], !best.isEmpty else {
+                done(true)
+                return
+            }
+            banner = "正在切到更干净节点 \(best)…"
+            self.stopWatch()
+            self.run(["node-apply"], timeout: 120) { [weak self] applied in
+                guard let self else { done(true); return }
+                self.banner = ""
+                let after = Self.parseNodeScan(applied.output)
+                self.nodeScanInfo = after
+                self.applyNodeScan(after)
+                self.nodeScanReport = Self.displayableNodeReport(applied.output)
+                guard applied.succeeded else {
+                    // 切节点失败不拖死账号切换：出口没变，账号照切，只把原因
+                    // 留在 note 里。守护刚被停过，必须重新审计把它拉回来。
+                    self.nodeSwitchNote = "节点未切换（\(Self.failureLine(applied.output))）"
+                    self.checkEnvironment { _ in done(true) }
+                    return
+                }
+                self.nodeSwitchNote = "已切到更干净节点 \(best)"
+                self.checkEnvironment { ok in done(ok) }
+            }
+        }
+    }
+
+    /// 从脚本输出里捞第一条 FAIL: 的原因，捞不到就给个兜底。
+    static func failureLine(_ output: String) -> String {
+        for line in output.split(separator: "\n") where line.hasPrefix("FAIL:") {
+            return String(line.dropFirst(5))
+        }
+        return "未知原因"
     }
 
     private func performSwitch(_ target: String) {
@@ -1619,7 +1697,13 @@ final class VM: ObservableObject {
             self.current = target
             self.phase = .done
             self.banner = unchanged ? "当前已是账号 \(target)" : "已切换到账号 \(target)"
-            self.note = extra
+            // 节点那句话拼在回执里,而不是塞进 banner:切换本身成功与否是主句,
+            // 换没换线路是附带信息,不该抢掉「已切换到账号 X」。
+            var note = extra
+            if !self.nodeSwitchNote.isEmpty {
+                note = note.isEmpty ? self.nodeSwitchNote : note + " · " + self.nodeSwitchNote
+            }
+            self.note = note
             self.switchRequested = false; self.isBusy = false
             let hide = DispatchWorkItem { [weak self] in
                 guard let self = self, self.phase == .done, !self.isBusy else { return }
@@ -2447,11 +2531,6 @@ struct ContentView: View {
             ClaudeIconButton(systemName: "arrow.clockwise", help: "重新检查环境", disabled: vm.isBusy) {
                 vm.refresh()
             }
-            ClaudeIconButton(systemName: "network",
-                             help: vm.nodeScanBusy ? "正在扫描可用节点…" : "扫描可用节点(只读,不切线路)",
-                             disabled: vm.nodeScanBusy) {
-                vm.scanNodes()
-            }
             ClaudeIconButton(systemName: "waveform.path.ecg", help: "设备指纹体检(字体/GPU/虚拟机)", disabled: vm.isBusy) {
                 showFingerprint = true
                 vm.inspectFingerprint()
@@ -3166,7 +3245,19 @@ struct ContentView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
-                            checkRow(row, index: idx)
+                            // 只有「更优节点」可点:其余各行点下去没有任何动作,
+                            // 整行都做成按钮会让人以为到处能点,试两次就学会了不点。
+                            if row.name == "更优节点" {
+                                Button { vm.scanNodes() } label: {
+                                    checkRow(row, index: idx)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(vm.nodeScanBusy)
+                                .help(vm.nodeScanBusy ? "正在扫描可用节点…"
+                                                      : "扫描可用节点（只读，不切线路）")
+                            } else {
+                                checkRow(row, index: idx)
+                            }
                         }
                     }
                     .padding(.horizontal, Rhythm.listInset)
@@ -3302,6 +3393,26 @@ struct ContentView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(width: Rhythm.nameColumn, alignment: .leading)
+
+                // 「更优节点」这一行自己就是入口:点它重新扫一遍候选。
+                // 以前挂在工具栏的地球图标上,离这一项太远 —— 用户读着
+                // 「过硬门槛内没有更优节点」,并不知道还能让它再比一次。
+                if row.name == "更优节点" {
+                    HStack(spacing: 3) {
+                        if vm.nodeScanBusy {
+                            SpinRing(size: 9, lineWidth: 1.2, duration: 0.9)
+                        } else {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 9, weight: .semibold))
+                        }
+                        Text(vm.nodeScanBusy ? "扫描中" : "扫描")
+                            .font(Type.microFont)
+                    }
+                    .foregroundColor(ClaudeTheme.brandText)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(ClaudeTheme.terracottaTint))
+                }
 
                 // 弹性空隙放在结论**之前**，结论一律贴右。
                 // 注意不能把弹性 frame 加在结论本身（`maxWidth:.infinity, alignment:.trailing`）：
@@ -3857,7 +3968,13 @@ struct CheckSettingsView: View {
 // MARK: - 设备指纹体检
 
 /// 节点扫描报告。报告本身只读;「应用最优节点」只在报告门禁为 auto-ok 且
-/// 确实存在更优节点时出现(见 VM.canApplyBestNode),已有实例环境一律只出报告。
+/// 确实存在更优节点时出现(见 VM.canApplyBestNode)。
+///
+/// 门禁原来还看「存过几个槽位」—— 那是死条件,槽位是常驻资产,存过一次就
+/// 永远为真,于是这个按钮对任何用过本工具的人都不出现。现在只看「Claude 在
+/// 不在跑」和「看门狗在不在驻守」这两个瞬时事实。
+///
+/// 换槽位时这条链会自己走一遍(见 VM.optimizeNodeForSwitch),不必等用户点。
 /// 切换动作归 VM.applyBestNode / 脚本 node-apply,面板不自己改线路。
 struct NodeScanSheet: View {
     @Environment(\.dismiss) private var dismiss
@@ -3888,7 +4005,7 @@ struct NodeScanSheet: View {
                     Text("门禁允许自动应用 · 停守护、只切一次、复查出口")
                         .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
                 } else {
-                    Text("已有实例环境时只生成报告,不会自动切换节点")
+                    Text("Claude 在跑或看门狗仍驻守时只生成报告,不会自动切换节点")
                         .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
                 }
                 Spacer()

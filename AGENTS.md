@@ -117,7 +117,8 @@
 - **硬门槛先于纯净度**：国家不符 / 国家取不到 / Tor 或代理判定 / UDP 未标注的节点都不参与推荐。带 `servername` / `Host` 的 CDN 前置节点 `server` 只是入口，标「出口未知」并排除，不能拿入口 IP 打分。多个叶子共用同一落地 IP 只查一次。
 - 差距不足 `NODE_SCAN_MARGIN`（10 分）不出 `BEST`，免得每次扫描都催用户改线路；清空 `BEST` 时必须连 `BEST_IP` / `BEST_SCORE` / `BEST_SELECTOR` 一起清，别留半截报告。
 - `checkdetail` 的第 16 项**只读报告文件**，绝不在 45 秒检查预算里发网络请求。没有报告 / 报告过期 → `skip`，不是 `ok`；`skip` 不扣分，用户关掉检查项不该反而掉分。有 `preferred-node` 时，`PREFERRED_MATCH=0` 优先于「还有更优节点」报「已偏离固定节点」。
-- 报告门禁 `node_gate()` 是**保守并集**（用户选定口径 A）：Claude 进程 / CLI / 任一 A–D 已建档槽位 / 看门狗驻守，任一成立即 `report-only`。执行门禁 `node_apply_gate()` 必须**重新实时判定**，不信报告里的旧快照；看门狗那条从「pidfile 存在」升级为「进程确实已不在跑」的事实检查，残留 pidfile 不阻塞、真有守护仍拒绝。
+- 报告门禁 `node_gate()` 只看两个**瞬时**事实：Claude 进程 / CLI 在跑、看门狗仍在驻守，任一成立即 `report-only`。**不要**再把「任一 A–D 已建档槽位」算进去 —— 槽位是常驻资产，存过一次 `hasA=1` 就永远为真，那条判据会让 `node-apply` 对任何用过本工具的人永久拒绝，界面上「应用最优节点」从不出现。执行门禁 `node_apply_gate()` 必须**重新实时判定**，不信报告里的旧快照；看门狗那条从「pidfile 存在」升级为「进程确实已不在跑」的事实检查，残留 pidfile 不阻塞、真有守护仍拒绝。
+- 换槽位时这条链自己会走一遍（`VM.optimizeNodeForSwitch`）：审计通过 → `node-scan` → 报告里真有 `BEST` 就 `stopWatch()` + `node-apply` → 重新审计 → 再切账号。三个例外都必须保留：扫描失败不阻断切换；`node-apply` 失败不阻断切换（只把原因写进回执）；换完线路重新审计没过就**不切账号**（fail-closed，新账号第一次连上的就是那条出口）。
 - 守护归 App 管、切换归脚本管：App 先 `stopWatch()`，`node-apply` 不杀 App 持有的守护（否则 App 会误报「守护意外退出」），切完由 `checkEnvironment` 通过后自动 `startWatch()`。已建立的连接不会迁移；只对 `Selector` 生效，`URLTest` / `Fallback` 会被自动选路覆盖。
 
 ## 独立代理诊断
