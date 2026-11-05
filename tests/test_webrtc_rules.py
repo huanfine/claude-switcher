@@ -486,5 +486,71 @@ curl() { ''' + curl_body + r'''; }
         run = self.run_status(probe_rc=7)
         self.assertIn(":7", run.stdout)
 
+class PolicyUnlockTests(unittest.TestCase):
+    """「当前节点不支持 UDP」时的自锁回归。
+
+    故障链:HTTP 节点 udp=false → proxy 策略下 validate_group 失败 → WebRTC 与
+    「规则置顶」一起红 → fix 走 write_merge_rules 又撞同一道校验,0 秒 return 1。
+    旧报错让用户「改用 reject 策略」,但写策略文件的唯一路径(clash_rules write)
+    恰恰被这道校验挡死,界面也没有入口 —— 用户只能原地打转。
+    """
+    ENV = {"schema": 1, "proxy_mode": "clash-verge", "proxy_group": "节点选择",
+           "country": "US", "timezone": "America/New_York", "locale": "en_US"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="webrtc-policy-")
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        base = self.home / ".claude-switcher"
+        base.mkdir()
+        (base / "env.json").write_text(json.dumps(self.ENV), encoding="utf-8")
+        self.policy = base / "webrtc-policy"
+
+    def run_core(self, *args):
+        return subprocess.run(["/bin/bash", str(SOURCE), *args], text=True,
+                              capture_output=True, timeout=30,
+                              env=dict(os.environ, HOME=str(self.home)))
+
+    def test_policy_can_be_changed_without_touching_the_kernel(self):
+        """不经过 validate_group 也能落盘策略,这是解开自锁的前提。"""
+        self.assertEqual(self.run_core("set-webrtc-policy", "reject").returncode, 0)
+        self.assertEqual(self.policy.read_text(encoding="utf-8").strip(), "reject")
+        self.assertEqual(self.run_core("set-webrtc-policy", "proxy").returncode, 0)
+        self.assertEqual(self.policy.read_text(encoding="utf-8").strip(), "proxy")
+
+    def test_invalid_policy_writes_nothing(self):
+        before = self.policy.read_text() if self.policy.exists() else None
+        run = self.run_core("set-webrtc-policy", "bogus")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("用法", run.stdout + run.stderr)
+        self.assertEqual(self.policy.read_text() if self.policy.exists() else None,
+                         before)
+
+    def test_help_documents_the_new_command(self):
+        self.assertIn("set-webrtc-policy", self.run_core("help").stdout)
+
+    def test_fix_switches_to_reject_when_node_has_no_udp(self):
+        """fix 必须在写规则**之前**落盘策略,且不能放松 UDP 门禁。"""
+        core = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("set_webrtc_policy reject", core)
+        self.assertIn("WEBRTC_POLICY=reject", core)
+        fix = core[core.index("fix() {"):core.index("echo \"FIX:开始一键修复\"")]
+        self.assertIn("clash_rules verify", fix, "要先探测 UDP 再决定切不切")
+        self.assertIn("未确认支持", fix)
+
+    def test_rule_hint_points_at_an_action_that_exists(self):
+        core = SOURCE.read_text(encoding="utf-8")
+        hint = core[core.index("rule_fix_hint() {"):]
+        hint = hint[:hint.index("\n}\n")]
+        self.assertIn("点「一键修复」自动切到拒绝策略", hint)
+        self.assertNotIn("换节点或改用拒绝策略", hint,
+                         "旧文案指向一个当时并不存在的入口")
+
+    def test_write_still_requires_udp_for_proxy_policy(self):
+        """门禁语义不因解锁而放松:proxy 策略照旧要求 udp=true。"""
+        core = SOURCE.read_text(encoding="utf-8")
+        self.assertIn('if policy == "proxy" and selected.get("udp") is not True:', core)
+
+
 if __name__ == "__main__":
     unittest.main()

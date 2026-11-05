@@ -379,6 +379,32 @@ esac''')
 
     # ---- 风险源全挂:降级判型,而不是一句「未评级」 ----
 
+    def test_dig_timeout_banner_is_not_a_ptr_or_evidence(self):
+        """dig 超时把「;; connection timed out;」写进 stdout,不能当 PTR 或存在证据。
+
+        本机实测:出口刚切换时四源全部超时、dig 也超时,结果这一行诊断文本被
+        head -1 取成 rdns,既让 known=1(零个有效数据源照样出分),又被当成运营商
+        名拼进检查项 —— 用户界面上出现「评分 60/100 · 机房 · ;; connection timed
+        out;」。诊断行必须以 ;; 开头丢掉:这时正确结论是「未评级」。
+        """
+        self.stub_net("", "", "", "")
+        self.set_ptr(";; connection timed out; no servers could be reached")
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("未评级", detail)
+        self.assertNotIn("connection timed out", detail)
+        self.assertNotIn(";;", detail)
+        self.assertNotIn("评分", detail)
+
+    def test_degraded_score_is_labelled_as_an_estimate(self):
+        """降级判型给出的分数只是类型基线,不能让人读成实测信誉分。"""
+        self.stub_net("", "", IPINFO_RESID)
+        _, detail, _ = self.run_detail()
+        self.assertIn("风险源不可达", detail)
+        self.assertIn("类型预估", detail)
+        self.assertIn("未实测信誉", detail)
+        self.assertEqual(self.score(detail), 70, detail)
+
     def test_risk_sources_down_still_types_from_operator(self):
         """ipquery 与 ip-api 同时连不上时,靠 ipinfo 的运营商名照样把类型判出来。
 

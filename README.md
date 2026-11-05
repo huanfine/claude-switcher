@@ -106,6 +106,20 @@ bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/mai
 
 > 账号切换在旧核心下仍可正常使用，只是节点扫描会跳过——不会因此把人卡在旧账号上。
 
+## 当前节点不支持 UDP（WebRTC 与「规则置顶」一起红）
+
+HTTP / 部分不支持 UDP 的节点在运行时内核里是 `udp:false`。`proxy` 策略要求节点能承载 UDP（否则 STUN 流量可能直连泄漏），所以 `WebRTC` 和「规则置顶」会一起判 fail，文案也一样——后者其实没在测规则，是被同一道前置校验连坐。
+
+点**「一键修复」**即可：它会先把 WebRTC 策略落盘成 `reject`（UDP 流量直接拒绝，同样不泄漏），再按新策略写入并验证置顶规则，期间会重启一次代理客户端。也可以手动切：
+
+```bash
+~/.local/bin/claude-switch.sh set-webrtc-policy reject   # 或换回 proxy
+```
+
+想维持 `proxy` 策略，就在客户端里换一个支持 UDP 的节点。
+
+> `IP纯净度` 显示「类型预估·未实测信誉」时，说明四家风险源当时都没答上来，分数只是按运营商名推出的类型基线，不是实测信誉；这类结果 5 分钟后会自动重查。
+
 ## 日常使用
 
 1. 双击桌面应用图标 → 等 16 项检查；硬性项全绿再选账号启动，红项用「一键修复」。
@@ -127,6 +141,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/mai
 | 节点扫描 / 应用 | `node-scan` / `node-apply [节点名]` |
 | 槽位绑定出口 | `slot-node list` / `slot-node get <A\|B\|C\|D>` / `slot-node set <A\|B\|C\|D> <节点名>` / `slot-node clear <A\|B\|C\|D>` |
 | 重锁地区 / 换客户端 | `set-region` / `set-client <mode>` / `get-client` |
+| WebRTC UDP 策略 | `set-webrtc-policy <proxy\|reject>`（节点不支持 UDP 时一键修复会自动切 `reject`） |
 | 故障演练 / 离线复核 | `drill [--auto\|--manual]` / `verdict [报告]` / `evidence <file>` |
 | 只读体检 | `fingerprint` / `cli-info` / `diagnose-proxy --proxy URL` / `open-safe <url>` |
 | 检查开关 | `get-check-config` / `set-check-config <json>` |

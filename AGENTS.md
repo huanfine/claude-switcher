@@ -132,6 +132,22 @@
 - **旧核心不能阻断切账号**：`optimizeNodeForSwitch` 里扫描失败仍 `done(true)`，只是把「核心脚本过旧，未扫描节点」写进回执。版本错配时把人卡在旧账号上，比跳过节点优化更糟。
 - `scripts/package-macos.sh` 必须把 `scripts/upgrade-core.sh` 和 `SHA256SUMS` 一起放进 installer-kit，并列入必备文件检查；只装过 app-only 的人也要有这条急救路径。改 kit 清单要同步改 `tests/test_upgrade_core.py` 的文档/命令契约断言。
 
+## WebRTC 策略自锁与 IP 评分的证据边界
+
+一次实测把三个看似独立的报障串成了同一条链：**当前节点是 HTTP 协议、运行时 `/proxies` 里 `udp:false`**。
+
+- `validate_group` 在 `policy == "proxy"` 时要求 `selected["udp"] is True`（**别删**：UDP 走代理是防 WebRTC 泄漏的正当前提）。它挂在 `clash_rules verify` 里，于是 `WebRTC` 与「规则置顶」双双 fail 且文案一模一样 —— 「规则置顶」其实没测规则，是被同一道前置校验连坐。
+- `fix` → `write_merge_rules` → `clash_rules write` 又过同一道校验，0 秒 `return 1`，客户端日志表现为 `command=fix exit=1 duration_ms=0`。
+- 最要命的是**自锁**：`webrtc-policy` 唯一写入方是 `clash_rules write`，而它先过这道校验；报错让用户「改用 reject 策略」，界面却没有任何入口能改。提示指向一个不存在的动作。
+
+修法是**不放松门禁，只补一条不经过内核校验的落盘路径**：`set-webrtc-policy <proxy|reject>` 只写策略文件；`fix` 在写规则前探测到「未确认支持 UDP」就先落盘 `reject` 并置 `WEBRTC_POLICY=reject`，后续规则按 `REJECT` 写、按 `REJECT` 验。UDP 直接拒绝，仍然不泄漏。`tests/test_webrtc_rules.py::PolicyUnlockTests` 钉住「入口存在 / 门禁仍在 / 先探测后切换」三件事。
+
+IP 纯净度那侧是独立的证据 bug，别和上面混：
+
+- `dig +short -x` 超时会把诊断行 `;; connection timed out; ...` 写到 **stdout**，`+short` 挡不住。它曾被 `head -1` 取成 `rdns`：既让 `known=1`（零个有效风险源也照常出分），又被当成运营商名拼进检查项，用户看到「评分 60/100 · 机房 · ;; connection timed out;」。诊断行必须以 `;;` 开头丢掉，用 `sed` 而不是 `grep`（空结果别带出非零码）。
+- 降级判型时 `score` 只是 `hosting=60` 这类**类型基线**，风险维度一个都没验过。保留 `评分 N/100` 前缀（下游按它取数），但补 `(类型预估·未实测信誉)`；这类结果写缓存时本来就把 epoch 调成 5 分钟后过期，不要改成 24h。
+- 节点扫描的 `TOPn` 分数来自 `purity-cache.v3`，可能比当前出口旧一天。两处分数对不上时先比 IP 和扫描时间，不要急着改评分模型。
+
 ## 槽位隔离的边界（桌面版 + Claude Code）
 
 一个槽位不只是一个目录，是「一组目录 + 一个文件」：

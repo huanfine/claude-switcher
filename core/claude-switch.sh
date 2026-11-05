@@ -1706,6 +1706,26 @@ clash_rules() {
     "${BASH:-/bin/bash}" "$0" clash-rules "$action" "$CLASH_DIR" "$BASE" "$PROXY_GROUP" "${WEBRTC_POLICY:-}" "$@"
 }
 
+# WebRTC UDP 策略的独立写入口。只改策略文件,不碰内核、不碰规则、不需要管理员权限。
+#
+# 为什么必须有它:`clash_rules write` 也会写这个文件,但它在写之前先跑
+# validate_group —— proxy 策略要求当前节点 udp=true。HTTP 之类不支持 UDP 的节点上,
+# 这道校验必失败,于是「把策略改成 reject」这个动作被它自己要修的校验挡死了:
+# 报错建议用户「改用 reject 策略」,界面和命令行却没有任何入口能改,一键修复
+# 永远在写规则那步 return 1。先给一条不经过内核校验的落盘路径解开这个自锁。
+set_webrtc_policy() {
+    local mode="${1:-}"
+    case "$mode" in
+        proxy|reject) ;;
+        *) echo "FAIL:用法 set-webrtc-policy <proxy|reject>"; return 1 ;;
+    esac
+    mkdir -p "$BASE" || { echo "FAIL:无法写入 $BASE"; return 1; }
+    printf '%s\n' "$mode" > "$BASE/webrtc-policy.tmp" \
+        && mv "$BASE/webrtc-policy.tmp" "$BASE/webrtc-policy" \
+        || { echo "FAIL:写入 WebRTC 策略失败"; return 1; }
+    echo "OK:WebRTC 策略已设为 $mode(下次检查生效)"
+}
+
 # 只接受运行中内核加载的规则，不再用配置文本或 fake-ip 代替。
 merge_ok() { clash_rules verify >/dev/null 2>&1; }
 stun_ok() { merge_ok; }
@@ -1727,7 +1747,9 @@ rule_fix_hint() {
         *没有可用的当前节点*|*直连或拒绝*)
             printf '代理组当前节点是直连或拒绝 · 换一个代理节点' ;;
         *UDP*)
-            printf '节点未确认支持 UDP · 换节点或改用拒绝策略' ;;
+            # 旧文案只叫用户换节点或换策略,可那时工具根本没有切策略的入口,
+            # 用户照着做只会原地打转。改成指向真能生效的那个动作。
+            printf '当前节点不支持 UDP · 点「一键修复」自动切到拒绝策略,或换支持 UDP 的节点' ;;
         *数量不足*)
             printf '内核规则条数不足 · 点「一键修复」' ;;
         *接口不可用*)
@@ -2098,7 +2120,13 @@ ip_purity() {
     b3=$(cat "$q3" 2>/dev/null); b4=$(cat "$q4" 2>/dev/null)
     rm -f "$q1" "$q2" "$q3" "$q4"
     # PTR 走本地解析器,不占网络预算。去掉结尾的点,便于按关键词匹配。
-    rdns=$(dig +short -x "$ip" +time=2 +tries=1 2>/dev/null | head -1 | sed 's/\.$//')
+    # dig 超时/解析失败时会把诊断行「;; connection timed out; ...」写到 **stdout**,
+    # +short 也挡不住。它曾一路混进 PTR:既让 known=1(等于拿一条报错当「这个 IP
+    # 存在」的证据,在零个数据源可达时照样出分),又被当成运营商名拼进检查项 ——
+    # 用户看到的就是「评分 60/100 · 机房 · ;; connection timed out;」。诊断行
+    # 一律以 ;; 开头,先丢掉再取第一条真 PTR;sed 而不是 grep,免得空结果带出非零码。
+    rdns=$(dig +short -x "$ip" +time=2 +tries=1 2>/dev/null \
+           | sed -e '/^;;/d' -e '/^[[:space:]]*$/d' | head -1 | sed 's/\.$//')
 
     local dc="" mob="" px="" tor="" risk="" tzip="" abfreq="" cc=""
     case "$(_ipfield "$b1" is_datacenter)" in true) dc=1 ;; esac
@@ -2323,7 +2351,12 @@ ip_purity() {
         # ipquery 只报 datacenter)。分数照算,但必须让用户知道这次的证据是不全的。
         flags="$flags ·仅一家风险源可达"
     fi
-    local detail="评分 ${score}/100 · ${tlabel} · ${who}${flags}${next:+ · $next}"
+    # 降级时 score 只是「按运营商名/PTR 推出的类型基线」,风险维度一个都没验证过。
+    # 不加标记地报「评分 60/100」,用户会当成实测信誉分,而这个数还会在缓存里
+    # 反复出现五分钟。保留「评分 N/100」前缀(下游与测试都按它取数),补上口径。
+    local score_label="评分 ${score}/100"
+    [ -n "$degraded" ] && score_label="评分 ${score}/100(类型预估·未实测信誉)"
+    local detail="${score_label} · ${tlabel} · ${who}${flags}${next:+ · $next}"
 
     # 证据不全的结果不能钉住 24h。实测:ipquery / ip-api 同时超时那次,分数被
     # 降级到 70 并写进缓存,之后整整一天每次检查都拿这句「风险源不可达」当结论,
@@ -3711,6 +3744,23 @@ fix() {
             return 1
         fi
         WEBRTC_POLICY="$policy_result"
+        # 当前节点不支持 UDP 时,proxy 策略根本无法成立:verify 会直接 fail,
+        # 一键修复走到 write_merge_rules 也会因同一道 validate_group 立刻 return 1
+        # (客户端日志里就是 fix exit=1 duration_ms=0)。旧文案让用户「改用 reject
+        # 策略」,却没有入口可改。这里先把策略落盘,后面写规则/校验就都走 reject:
+        # UDP 流量直接 REJECT,仍然不泄漏,门禁没有放松,只是换了一条能走通的路。
+        if [ "$WEBRTC_POLICY" = "proxy" ]; then
+            local udp_err
+            if ! udp_err=$(clash_rules verify 2>&1); then
+                case "$udp_err" in
+                    *未确认支持*UDP*)
+                        set_webrtc_policy reject >/dev/null
+                        WEBRTC_POLICY=reject
+                        echo "FIX:当前节点不支持 UDP · 已把 WebRTC 策略切为 reject(UDP 直接拒绝,不会泄漏)"
+                        ;;
+                esac
+            fi
+        fi
     fi
     echo "FIX:开始一键修复"
 
@@ -4976,6 +5026,7 @@ help() {
 区域与客户端
   set-region           按当前出口对齐时区 / 地区 / 语言
   set-client <mode>    指定代理客户端(clash-verge / flclash / shadowrocket / sing-box …)
+  set-webrtc-policy <proxy|reject>   WebRTC UDP 策略;节点不支持 UDP 时用 reject(「一键修复」会自动切)
   get-client           打印当前选定的代理客户端
   open-safe <url>      在受控环境里打开链接
 
@@ -5029,6 +5080,7 @@ case "$operation" in
         summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
         ;;
     fix) fix ;;
+    set-webrtc-policy) set_webrtc_policy "${2:-}" ;;
     node-scan) scan_nodes ;;
     node-apply) node_apply "${2:-}" ;;
     slot-node)

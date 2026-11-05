@@ -134,6 +134,25 @@ backs up the old script, migrates `env.json`, and self-checks via `help` /
 the latest `*-installer-kit.zip` (the same script ships inside the kit). Account
 switching keeps working on a stale core — only node scanning is skipped.
 
+## Node without UDP support
+
+HTTP and other nodes without UDP report `udp:false` in the running kernel. The
+`proxy` WebRTC policy requires a UDP-capable node (otherwise STUN traffic can
+bypass the tunnel), so **WebRTC** and **Pinned routing** both fail with the same
+message — the latter is not actually testing your rules. Click **One-click
+repair**: it persists the `reject` policy (UDP is rejected outright, so there is
+still no leak), then writes and verifies the pinned rules under that policy and
+restarts the proxy client once. To switch manually:
+
+```bash
+~/.local/bin/claude-switch.sh set-webrtc-policy reject   # or proxy
+```
+
+Keep `proxy` only if you switch to a UDP-capable node. When `IP purity` reports
+a "type estimate / reputation not measured" score, none of the risk sources
+answered: that number is a type-based baseline, not a measured reputation, and
+it is retried automatically after 5 minutes.
+
 ## Usage
 
 1. Open the desktop app and wait for the 16 checks.
