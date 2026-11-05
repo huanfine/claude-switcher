@@ -113,6 +113,27 @@ menu or allow it under **System Settings → Privacy & Security**.
 For Windows, see [`windows/README.md`](windows/README.md); for Linux, see
 [`linux/README.md`](linux/README.md).
 
+## New UI + old core script
+
+The `*-app-only.zip` / `*.dmg` artifacts replace the UI only; they do **not**
+update `~/.local/bin/claude-switch.sh`. Scanning for nodes then fails with
+`脚本执行失败（退出码 2）` followed by an old `用法: claude-switch.sh ...` usage
+line. If that line has no `node-scan` / `slot-node`, the core script is stale.
+
+Older cores (around v1.7.1) hard-coded the original upstream repository in
+`update`, so running `update` there will never fetch this fork. The app shows a
+copyable command instead; run it in a terminal:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
+```
+
+It downloads the core script and `SHA256SUMS` from `main`, verifies the hash,
+backs up the old script, migrates `env.json`, and self-checks via `help` /
+`status`; any failure rolls back automatically. Alternatively, reinstall from
+the latest `*-installer-kit.zip` (the same script ships inside the kit). Account
+switching keeps working on a stale core — only node scanning is skipped.
+
 ## Usage
 
 1. Open the desktop app and wait for the 16 checks.

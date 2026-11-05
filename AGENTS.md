@@ -123,6 +123,15 @@
 - 界面读绑定是直接读盘（`VM.loadSlotNodes`），核心脚本负责写。两处各自拼同一个路径，改动必须同步；`tests/test_cli_slot.py::SlotNodeBindingTests` 钉着这条契约。跟 `probeSlotLogin` 一样，读取属于显示需求，不塞进 `status` 的输出契约。
 - 守护归 App 管、切换归脚本管：App 先 `stopWatch()`，`node-apply` 不杀 App 持有的守护（否则 App 会误报「守护意外退出」），切完由 `checkEnvironment` 通过后自动 `startWatch()`。已建立的连接不会迁移；只对 `Selector` 生效，`URLTest` / `Fallback` 会被自动选路覆盖。
 
+## 界面与核心的版本契约（新 App + 旧脚本）
+
+`*-app-only.*` 只换 App，`installer-kit` 才带核心脚本、守护与安装器。所以「新版界面 + v1.7.1 一带旧核心」是可复现的常态，不是个例：旧核心不认识 `node-scan` / `slot-node`，甩一行老 `用法:` 后以退出码 2 退出。
+
+- App 侧 `VM.isStaleCore(_:)` 只认「退出码 2 + 老 usage / 未知命令」这个组合，普通扫描失败不能误判成版本问题；命中后 `coreOutdated` 置位、节点面板显示人话原因和**可复制**的升级命令，`NodeScanSheet` 也带一个复制按钮。`VM.upgradeCoreCommand` 是这条命令的唯一来源，README 与测试都引它，别在多个地方手抄 URL。
+- 升级走 `scripts/upgrade-core.sh`，唯一对外入口是 `bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)`：旧版 `self_update` 写死原上游 `YOURSJEYO/claude-switcher`，**不能**指望用户跑 `update` 自愈。脚本从本仓库 `main` 拉 `core/claude-switch.sh` + `SHA256SUMS`，校验哈希、`bash -n`、备份旧脚本、`_support env-migrate` 迁移环境配置、落盘后跑 `help` / `status` 自检；单一 `EXIT` trap + `DONE` 成功标记保证任一步失败都从备份回滚。别用 `ERR` trap —— `die` 走 `exit 1` 时它不触发。
+- **旧核心不能阻断切账号**：`optimizeNodeForSwitch` 里扫描失败仍 `done(true)`，只是把「核心脚本过旧，未扫描节点」写进回执。版本错配时把人卡在旧账号上，比跳过节点优化更糟。
+- `scripts/package-macos.sh` 必须把 `scripts/upgrade-core.sh` 和 `SHA256SUMS` 一起放进 installer-kit，并列入必备文件检查；只装过 app-only 的人也要有这条急救路径。改 kit 清单要同步改 `tests/test_upgrade_core.py` 的文档/命令契约断言。
+
 ## 槽位隔离的边界（桌面版 + Claude Code）
 
 一个槽位不只是一个目录，是「一组目录 + 一个文件」：

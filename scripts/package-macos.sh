@@ -124,14 +124,19 @@ done
 for DIR in core daemons installer app; do
     ditto "$ROOT/$DIR" "$KIT_ROOT/$DIR"
 done
-mkdir -p "$KIT_ROOT/assets" "$KIT_ROOT/docs"
+mkdir -p "$KIT_ROOT/assets" "$KIT_ROOT/docs" "$KIT_ROOT/scripts"
 cp "$ROOT/assets/icon-2048.png" "$KIT_ROOT/assets/"
 cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
-chmod +x "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command"
+# 「新 App + 旧核心」时的急救脚本。只装了 app-only 包的人也需要能升级核心。
+cp "$ROOT/scripts/upgrade-core.sh" "$KIT_ROOT/scripts/"
+cp "$ROOT/SHA256SUMS" "$KIT_ROOT/SHA256SUMS"
+chmod +x "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command" \
+         "$KIT_ROOT/scripts/upgrade-core.sh"
 for ITEM in \
-    README.md README.en.md AGENTS.md SECURITY.md LICENSE \
+    README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS \
     core/claude-switch.sh daemons/claude-bodyguard.sh installer/安装.command \
-    app/main.swift assets/icon-2048.png docs/screenshot.png; do
+    app/main.swift assets/icon-2048.png docs/screenshot.png \
+    scripts/upgrade-core.sh; do
     if [ ! -e "$KIT_ROOT/$ITEM" ]; then
         echo "✗ installer kit 缺少 $ITEM" >&2
         exit 1

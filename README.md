@@ -87,6 +87,25 @@ cd claude-switcher
 
 Windows / Linux Beta 见 [windows/README.md](windows/README.md) · [linux/README.md](linux/README.md)。浏览器侧检测页在 `docs/`，线上地址 [huanfine.github.io/claude-switcher](https://huanfine.github.io/claude-switcher/)（需在仓库 Settings → Pages 选 `main` / `/docs` 启用），本地预览见 [docs/WEB-README.md](docs/WEB-README.md)。
 
+## 新界面 + 旧核心脚本（扫描报「退出码 2」）
+
+`*-app-only.zip` / `*.dmg` 只替换界面，**不会**更新 `~/.local/bin/claude-switch.sh`。这时候点节点扫描会看到：
+
+```
+扫描失败：脚本执行失败（退出码 2）
+用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|...
+```
+
+`用法` 那行里没有 `node-scan` / `slot-node`，就说明核心脚本还是旧版。**旧版（v1.7.1 一带）的 `update` 指向原上游仓库，直接跑 `update` 拉不到本仓库的新核心**，所以界面会给一条专用升级命令，在终端执行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
+```
+
+它从 `main` 下载核心脚本与 `SHA256SUMS`，逐项校验哈希、备份旧脚本、迁移 `env.json`、跑 `help` / `status` 自检；任一步失败自动回滚到升级前。也可以直接下载最新的 `*-installer-kit.zip` 重装（kit 里附带了同一份脚本）。升级完成后 `update` 就恢复指向本仓库。
+
+> 账号切换在旧核心下仍可正常使用，只是节点扫描会跳过——不会因此把人卡在旧账号上。
+
 ## 日常使用
 
 1. 双击桌面应用图标 → 等 16 项检查；硬性项全绿再选账号启动，红项用「一键修复」。

@@ -441,6 +441,10 @@ final class VM: ObservableObject {
     @Published private(set) var nodeScanBusy = false
     @Published var nodeScanReport = ""
     @Published var showNodeScan = false
+    /// 本机核心脚本比界面旧（典型症状:调 node-scan 回退出码 2 + 一行老 usage）。
+    /// 只装了 app-only DMG、没跑安装器时必然踩到;给明确的升级指引，
+    /// 别让人对着「脚本执行失败」猜。
+    @Published private(set) var coreOutdated = false
     /// 最近一次扫描/应用报告的键值,只用来决定「应用最优节点」按钮该不该出现。
     @Published private(set) var nodeScanInfo: [String: String] = [:]
     /// 换槽位顺带换节点时的一句话回执:换成了哪条、或者为什么没换。
@@ -1277,6 +1281,33 @@ final class VM: ObservableObject {
         return result
     }
 
+    /// 旧核心不认识 `node-scan` / `slot-node`:`run` 会把退出码 2 和脚本打印的
+    /// 那行 usage 一起塞进 output。命中就别再当普通扫描失败处理。
+    /// 注意 v1.7.1 的 `update` 指向旧上游仓库，升级必须走新仓库，见 upgrade-core.sh。
+    static func isStaleCore(_ output: String) -> Bool {
+        guard output.contains("退出码 2") else { return false }
+        return output.contains("用法: claude-switch.sh")
+            || output.contains("未知命令: node-scan")
+            || output.contains("未知命令: slot-node")
+    }
+
+    /// 界面里所有「升级核心脚本」入口共用这一条，别在面板和文案里各写一份慢慢漂移。
+    static let upgradeCoreCommand =
+        "bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)"
+
+    static let staleCoreHelp = """
+    核心脚本版本过旧，不认识节点扫描命令。
+
+    常见原因：只装了「仅 App」的 DMG/ZIP，没有同步更新核心脚本，或旧版脚本的
+    自动更新仍指向原上游仓库（拉不到本仓库的新版）。
+
+    修复：在终端执行下面这一行（会先校验 SHA256、备份旧脚本、再自检，失败自动回滚）：
+
+    \(upgradeCoreCommand)
+
+    完成后回到本界面点「重新检查」。
+    """
+
     /// `TOPn=叶子|分数|出口IP|判据|说明` —— 报告里按分数排好的前三名。
     /// 只认 TOP 行，不把 BEST 混进来：BEST 是「值得换」的结论，未必是全部候选。
     static func parseNodeCandidates(_ output: String) -> [NodeCandidate] {
@@ -1426,6 +1457,11 @@ final class VM: ObservableObject {
                 self.nodeCandidates = Self.parseNodeCandidates(result.output)
                 self.applyNodeScan(info)
                 self.nodeScanReport = Self.displayableNodeReport(result.output)
+                self.coreOutdated = false
+            } else if Self.isStaleCore(result.output) {
+                self.coreOutdated = true
+                self.nodeScanReport = Self.staleCoreHelp
+                self.banner = "核心脚本版本过旧，需要先更新"
             } else {
                 self.nodeScanReport = "扫描失败：\(result.output.isEmpty ? "脚本没有返回结果" : result.output)"
             }
@@ -1810,7 +1846,13 @@ final class VM: ObservableObject {
             self.banner = ""
             // 扫描失败不该拦住切账号：这一步是顺手优化，不是前置条件。
             guard result.succeeded else {
-                self.nodeSwitchNote = "节点扫描失败，已跳过"
+                if Self.isStaleCore(result.output) {
+                    self.coreOutdated = true
+                    self.banner = "核心脚本版本过旧，节点扫描已跳过"
+                    self.nodeSwitchNote = "核心脚本过旧，未扫描节点（请在节点面板查看升级方法）"
+                } else {
+                    self.nodeSwitchNote = "节点扫描失败，已跳过"
+                }
                 done(true)
                 return
             }
@@ -4218,14 +4260,17 @@ struct CheckSettingsView: View {
 struct NodeScanSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var vm: VM
+    @State private var copiedFix = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Geo.inline) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("可用节点扫描").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
-                    Text("只读 · 不切线路 · 不写 48h IP 漂移记录")
-                        .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
+                    Text(vm.coreOutdated ? "核心脚本版本过旧 · 只读 · 不切线路" :
+                         "只读 · 不切线路 · 不写 48h IP 漂移记录")
+                        .font(Type.microFont)
+                        .foregroundColor(vm.coreOutdated ? ClaudeTheme.warning : ClaudeTheme.muted)
                 }
                 Spacer()
                 Button("关闭") { dismiss() }
@@ -4238,6 +4283,24 @@ struct NodeScanSheet: View {
                     .foregroundColor(ClaudeTheme.ink)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if vm.coreOutdated {
+                // 报错里那句「脚本执行失败（退出码 2）」没人看得懂，
+                // 这里给一条可以直接贴进终端的命令，别让人去翻文档找升级办法。
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(ClaudeTheme.warning)
+                    Text("旧版脚本的自动更新指向原上游仓库，需要手动升级一次")
+                        .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
+                    Spacer()
+                    Button(copiedFix ? "已复制" : "复制升级命令") {
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        _ = pb.setString(VM.upgradeCoreCommand, forType: .string)
+                        copiedFix = true
+                    }
+                    .buttonStyle(.bordered)
+                }
             }
             HStack(spacing: 8) {
                 if vm.canApplyBestNode {

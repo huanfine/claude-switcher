@@ -51,6 +51,11 @@ private final class Fixture {
           # 切槽位现在会先扫一遍节点。默认报告里 BEST 为空 = 没什么可换,
           # 切换流程照旧往下走,不会平白多出一次 node-apply。
           node-scan) delay node-scan
+            # 旧核心的表现：不认识这个命令，甩一行老 usage 后 exit 2。
+            if [ -f "$root/stale-core" ]; then
+              echo '用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region' >&2
+              exit 2
+            fi
             if [ -f "$root/node-scan" ]; then cat "$root/node-scan"
             else printf 'CURRENT=A\nCURRENT_SCORE=49\nBEST=\nGATE=auto-ok\n'; fi
             result node-scan ;;
@@ -837,6 +842,30 @@ struct MenuBarModelTests {
                 vm.clearSlotNode("B")
                 try spin { vm.slotNodes.isEmpty }
                 try expect(f.calls.contains("slot-node clear B"), "解除绑定应写进核心脚本: \(f.calls)")
+
+            case "stale_core_scan_explains_upgrade":
+                // 只装了 app-only 包的人：界面新、核心旧，扫描回退出码 2 + 老 usage。
+                // 报错必须说清「版本不对」并给一条能直接贴进终端的升级命令。
+                let vm = f.vm()
+                try f.write("stale-core", "1")
+                vm.start(); try f.idle(vm)
+                try expect(VM.isStaleCore("脚本执行失败（退出码 2）\n用法: claude-switch.sh check|status"),
+                           "退出码 2 + usage 应判成旧核心")
+                try expect(!VM.isStaleCore("脚本执行失败（退出码 1）\n扫描超时"),
+                           "普通失败不该误判成版本问题")
+                vm.scanNodes()
+                try spin { !vm.nodeScanBusy }
+                try expect(vm.coreOutdated, "应标记为旧核心")
+                try expect(vm.nodeScanReport.contains("核心脚本版本过旧"),
+                           "报告要说明原因，实际 \(vm.nodeScanReport)")
+                try expect(vm.nodeScanReport.contains(VM.upgradeCoreCommand),
+                           "报告要给出可直接执行的升级命令")
+                try expect(vm.banner.contains("版本过旧"), "横幅要点明版本问题，实际 \(vm.banner)")
+
+                // 旧核心不能把切账号一起拖死：扫描是顺手优化，不是前置条件。
+                vm.switchTo("B"); try f.idle(vm)
+                try expect(vm.current == "B", "旧核心下仍应完成账号切换")
+                try expect(vm.note.contains("核心脚本过旧"), "回执要说明跳过了节点扫描，实际 \(vm.note)")
 
             case "node_scan_report_updates_row":
                 // 扫描报告必须能就地更新「更优节点」这一行,且不能把其他行改掉。
