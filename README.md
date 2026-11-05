@@ -75,29 +75,30 @@
 
 ## 安装
 
-### 装到另一台机器：从本仓库 Release 下载（推荐）
+### 装到另一台机器：一个包搞定（推荐）
 
-最新版在 [huanfine/claude-switcher Releases](https://github.com/huanfine/claude-switcher/releases)，`*-installer-kit.zip` 用于全新安装，`*-app-only.dmg` / `.zip` 只换界面，`SHA256SUMS-release.txt` 用于校验。**不要从旧上游 `YOURSJEYO/claude-switcher` 的 Release 下载**：那里的核心脚本不认识 `node-scan` / `slot-node`，装完点节点扫描会报「脚本执行失败（退出码 2）」。
+从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-arm64-full.zip`，解压后**双击「一键安装.command」**，按提示确认代理组 / 地区、输入一次开机密码，桌面就出现「Claude 环境检查器」。
+
+这一个包里已经带上编译好的 App、核心脚本、守护进程与安装器：**不用装 Xcode、不用挑包、不用再跑升级命令**。目标机只需 macOS 13+ / Apple Silicon / python3 / 一个正在运行的代理客户端 / Claude 桌面版。App 是 ad-hoc 签名、未公证，首次被系统拦下时右键点 `一键安装.command` →「打开」即可（它会顺手清掉下载带来的隔离属性）。
+
+**不要从旧上游 `YOURSJEYO/claude-switcher` 的 Release 下载**：那里的核心脚本不认识 `node-scan` / `slot-node`，装完点节点扫描会报「脚本执行失败（退出码 2）」。
 
 ```bash
-# 全新 Mac：下载 *-installer-kit.zip → 解压 → 双击 installer/安装.command
-xcode-select --install   # 安装器现场编译界面 App，需要 Xcode 命令行工具
-
-# 已经装过、只是核心脚本旧：界面里的「复制升级命令」就是这一条
-bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
-
 # 校验下载包
 shasum -a 256 -c SHA256SUMS-release.txt
-```
 
-装完在终端确认核心不是旧版（两条都能看到才算装对）：
-
-```bash
+# 装完确认核心不是旧版
 ~/.local/bin/claude-switch.sh help | grep -E 'node-scan|slot-node'
-~/.local/bin/claude-switch.sh status
 ```
 
-`app-only` 包不含核心脚本，且仅适用于 Apple Silicon；Intel Mac 请用 `installer-kit` 在本机编译。Windows / Linux Beta 包也在同一个 Release 页。
+只有特殊场景才需要其它包：
+
+| 文件 | 什么时候用 |
+| --- | --- |
+| `*-installer-kit.zip` | Intel Mac，或想从源码自己编译（需 Xcode 命令行工具） |
+| `*-app-only.dmg` / `.zip` | 只想换界面，核心脚本已经是新版 |
+| `scripts/upgrade-core.sh` | 旧机器只升级核心，不碰账号数据 |
+| `*-windows.zip` / `*-linux.tar.gz` | Windows / Linux Beta |
 
 ### 从源码安装
 

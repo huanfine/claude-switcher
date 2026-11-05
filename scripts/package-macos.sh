@@ -30,13 +30,16 @@ ZIP="$BUILD/ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-app-only.zip"
 DMG="$BUILD/ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-app-only.dmg"
 KIT_NAME="ClaudeSwitcher-$VERSION"
 KIT_ZIP="$BUILD/ClaudeSwitcher-$VERSION-installer-kit.zip"
+# 一体化包:kit 的全部内容 + 编译好的 App + 双击即装的入口,别的机器只需这一个文件。
+FULL_NAME="ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-full"
+FULL_ZIP="$BUILD/$FULL_NAME.zip"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/claude-switcher-package.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
 mkdir -p "$BUILD"
-rm -rf "$APP" "$ZIP" "$DMG" "$KIT_ZIP"
+rm -rf "$APP" "$ZIP" "$DMG" "$KIT_ZIP" "$FULL_ZIP"
 
 echo "==> 编译 $APP_NAME $VERSION ($ARCH_LABEL)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -144,9 +147,60 @@ for ITEM in \
 done
 ditto -c -k --keepParent --norsrc --noextattr "$KIT_ROOT" "$KIT_ZIP"
 
+echo "==> 生成一体化安装包 ($ARCH_LABEL, 免编译)"
+# 不再让别的机器在 kit / app-only / 升级脚本之间做选择题:
+# 一份包里同时带上编译好的 App、核心脚本、守护进程与安装器。
+FULL_ROOT="$WORK/$FULL_NAME"
+ditto "$KIT_ROOT" "$FULL_ROOT"
+ditto "$APP" "$FULL_ROOT/Claude 环境检查器.app"
+cat > "$FULL_ROOT/一键安装.command" <<'LAUNCH_EOF'
+#!/bin/bash
+# 一体化安装包唯一入口:双击这个文件即可。
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# 网上下载的 zip 会给每个文件打 com.apple.quarantine。清掉本包内的隔离属性,
+# 免得装好的 App 又被 Gatekeeper 拦一次。只处理解压目录,不碰系统其它位置。
+xattr -dr com.apple.quarantine "$HERE" 2>/dev/null || true
+cd "$HERE" || exit 1
+exec bash "$HERE/installer/安装.command"
+LAUNCH_EOF
+cat > "$FULL_ROOT/先读我.txt" <<'NOTE_EOF'
+一个包全装好 —— 三步
+
+1. 双击「一键安装.command」
+   (首次若被 macOS 拦下:右键点它 → 打开 → 再点「打开」)
+2. 按提示确认代理组 / 地区,输入一次开机密码
+3. 完成后桌面出现「Claude 环境检查器」,双击启动
+
+包内已经带上编译好的界面 App、核心脚本、守护进程和安装器:
+不需要 Xcode、不需要另下 app-only 包、不需要再跑升级命令。
+目标机仍需 python3(python.org 或 brew install python 均可)、macOS 13+、
+Apple Silicon、一个正在运行的代理客户端和 Claude 桌面版。
+
+特殊场景才用别的包:
+  *-installer-kit.zip   Intel Mac 或想自己从源码编译
+  *-app-only.dmg        只想换界面,核心脚本已经是新的
+  scripts/upgrade-core.sh  旧机器只升级核心脚本
+NOTE_EOF
+chmod +x "$FULL_ROOT/一键安装.command" \
+         "$FULL_ROOT/installer/安装.command" \
+         "$FULL_ROOT/installer/卸载.command" \
+         "$FULL_ROOT/scripts/upgrade-core.sh"
+for ITEM in "一键安装.command" "先读我.txt" \
+            "Claude 环境检查器.app/Contents/MacOS/ClaudeSwitcher" \
+            "core/claude-switch.sh" "core/stun-probe.py" \
+            "daemons/claude-bodyguard.sh" "installer/安装.command" \
+            "scripts/upgrade-core.sh" "SHA256SUMS"; do
+    if [ ! -e "$FULL_ROOT/$ITEM" ]; then
+        echo "✗ 一体化安装包缺少 $ITEM" >&2
+        exit 1
+    fi
+done
+[ -x "$FULL_ROOT/一键安装.command" ] || { echo "✗ 一键安装.command 不可执行" >&2; exit 1; }
+ditto -c -k --keepParent --norsrc --noextattr "$FULL_ROOT" "$FULL_ZIP"
+
 echo ""
 echo "✓ 打包完成:"
-for FILE in "$ZIP" "$DMG" "$KIT_ZIP"; do
+for FILE in "$FULL_ZIP" "$ZIP" "$DMG" "$KIT_ZIP"; do
     [ -f "$FILE" ] || { echo "✗ 缺少产物 $FILE" >&2; exit 1; }
     printf '  %-58s %8s\n' "$(basename "$FILE")" "$(du -h "$FILE" | cut -f1)"
 done

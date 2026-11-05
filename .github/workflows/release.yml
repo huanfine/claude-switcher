@@ -76,6 +76,7 @@ jobs:
           set -euo pipefail
           cd build
           shasum -a 256 \
+            "ClaudeSwitcher-${VERSION}-macos-arm64-full.zip" \
             "ClaudeSwitcher-${VERSION}-macos-arm64-app-only.zip" \
             "ClaudeSwitcher-${VERSION}-macos-arm64-app-only.dmg" \
             "ClaudeSwitcher-${VERSION}-installer-kit.zip" \
@@ -89,6 +90,7 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           ASSETS=(
+            "build/ClaudeSwitcher-${VERSION}-macos-arm64-full.zip"
             "build/ClaudeSwitcher-${VERSION}-macos-arm64-app-only.zip"
             "build/ClaudeSwitcher-${VERSION}-macos-arm64-app-only.dmg"
             "build/ClaudeSwitcher-${VERSION}-installer-kit.zip"

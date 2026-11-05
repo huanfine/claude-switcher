@@ -3,6 +3,11 @@
 cd "$(dirname "$0")"
 REPO="$(cd .. && pwd)"
 H="$HOME"
+# 一体化安装包(*-full.zip)把编译好的 App 一起带上了。检测到就直接复制，
+# 不再要求目标机装 Xcode / swiftc——SwiftUI 宏在部分系统上是装不上的重灾区。
+PREBUILT_APP="$REPO/Claude 环境检查器.app"
+USE_PREBUILT=0
+[ -x "$PREBUILT_APP/Contents/MacOS/ClaudeSwitcher" ] && USE_PREBUILT=1
 clear
 echo "=================================="
 echo "  Claude 账号切换器 · 安装程序"
@@ -188,16 +193,22 @@ if [ ! -d /Applications/Claude.app ]; then
     read -n 1 -s -r -p "按任意键退出..."; exit 1
 fi
 if ! python3 --version >/dev/null 2>&1; then
-    echo "⚠️  未检测到 python3,请先安装 Xcode 命令行工具: xcode-select --install"
+    echo "⚠️  未检测到 python3(核心脚本解析代理配置要用)。"
+    echo "   任意来源都行: python.org 安装包、brew install python,或 xcode-select --install"
     read -n 1 -s -r -p "按任意键退出..."; exit 1
 fi
-if ! command -v swiftc >/dev/null 2>&1; then
-    echo "⚠️  未检测到 swiftc(界面 App 需要现场编译),请先运行: xcode-select --install"
+if [ "$USE_PREBUILT" -eq 0 ] && ! command -v swiftc >/dev/null 2>&1; then
+    echo "⚠️  本包没有附带编译好的 App,需要现场编译,请先运行: xcode-select --install"
     echo "   注意:macOS 26/27 上仅装 Command Line Tools 可能因缺少 SwiftUIMacros 插件编译失败,"
     echo "   如遇失败请安装完整 Xcode 并执行: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+    echo "   (改用 *-full.zip 一体化安装包可完全跳过编译)"
     read -n 1 -s -r -p "按任意键退出..."; exit 1
 fi
-echo "✓ 前置检查通过($MODE / Claude / python3 / swiftc)"
+if [ "$USE_PREBUILT" -eq 1 ]; then
+    echo "✓ 前置检查通过($MODE / Claude / python3 / 随包 App,无需编译)"
+else
+    echo "✓ 前置检查通过($MODE / Claude / python3 / swiftc)"
+fi
 
 # ---- 1. 自动探测代理组名(仅 Clash Verge;多个 select 组时让用户选,避免静默选错专线) ----
 GRP=""
@@ -312,11 +323,18 @@ cp "$REPO/daemons/local.claude-bodyguard.plist" "$REPO/daemons/local.tz-watchdog
 sed "s|__HOME__|$H|g" "$REPO/daemons/local.claude-update.plist" > "$H/.local/bin/local.claude-update.plist"
 echo "✓ 核心文件已安装"
 
-# ---- 4. 现场编译 App 到桌面 ----
+# ---- 4. 安装 App 到桌面:一体化包复制随包成品,源码包才现场编译 ----
 APP="$H/Desktop/Claude 环境检查器.app"
 mkdir -p "$H/Desktop"
 pkill -x ClaudeSwitcher 2>/dev/null
 rm -rf "$APP"
+if [ "$USE_PREBUILT" -eq 1 ]; then
+    ditto "$PREBUILT_APP" "$APP" || {
+        echo "✗ 随包 App 复制失败,请重新解压安装包"; read -n 1 -s -r -p "按任意键退出..."; exit 1; }
+    codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
+    APPVER=$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist" 2>/dev/null || echo "未知版本")
+    echo "✓ 已装入随包 App($APPVER),跳过编译"
+else
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # 必须带 -target,否则新 SDK 编出的二进制在老系统被拒启动
 if swiftc -O -parse-as-library -Xfrontend -disable-sandbox -target "$(uname -m)-apple-macos13.0" \
@@ -360,6 +378,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
+fi
 echo "✓ App 已放到桌面"
 
 # ---- 5. 生成全局扩展脚本(仅 Clash Verge;保留已有 main 与无关配置) ----

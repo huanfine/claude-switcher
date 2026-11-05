@@ -86,27 +86,31 @@ repository, command-line script, and build artifact name.
 
 ## Install
 
-### Another machine: download from this repo's Releases (recommended)
+### Another machine: one package, one double-click (recommended)
 
-Grab `*-installer-kit.zip` (fresh install), `*-app-only.dmg` / `.zip` (UI only), and
-`SHA256SUMS-release.txt` from [huanfine/claude-switcher Releases](https://github.com/huanfine/claude-switcher/releases).
+Download `*-macos-arm64-full.zip` from the
+[latest release](https://github.com/huanfine/claude-switcher/releases/latest),
+unzip it, and double-click `一键安装.command`. Confirm the proxy group / region and
+enter your password once; the app appears on the Desktop.
+
+The bundle already contains the compiled app, core script, daemons, and installer:
+**no Xcode, no choosing between packages, no separate upgrade command.** The target
+needs macOS 13+, Apple Silicon, python3, a running proxy client, and the Claude
+desktop app. The app is ad-hoc signed and not notarized, so the first launch may need
+right-click → Open (the launcher clears download quarantine inside the package).
+
 **Do not use the old upstream `YOURSJEYO/claude-switcher` release**: its core script
 predates `node-scan` / `slot-node` and fails with `exit code 2` on node scan.
 
 ```bash
-# Fresh Mac: unzip the kit and double-click installer/安装.command
-xcode-select --install   # the installer compiles the UI app locally
-
-# Already installed, only the core script is stale
-bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
-
-# Verify downloads
 shasum -a 256 -c SHA256SUMS-release.txt
+~/.local/bin/claude-switch.sh help | grep -E 'node-scan|slot-node'
 ```
 
-The `app-only` packages contain no core script and are arm64-only; on Intel Macs
-build from the installer kit. Pushing a `v*` tag triggers the release workflow to
-build and publish all platform packages.
+Other packages are only for special cases: `*-installer-kit.zip` (Intel Mac or
+build from source), `*-app-only.dmg` (UI only), `scripts/upgrade-core.sh` (upgrade
+a stale core in place), `*-windows.zip` / `*-linux.tar.gz` (Beta). Pushing a `v*`
+tag triggers the release workflow to rebuild and publish every package.
 
 ### From source
 
