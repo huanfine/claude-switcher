@@ -5,9 +5,16 @@ REPO="$(cd .. && pwd)"
 H="$HOME"
 # 一体化安装包(*-full.zip)把编译好的 App 一起带上了。检测到就直接复制，
 # 不再要求目标机装 Xcode / swiftc——SwiftUI 宏在部分系统上是装不上的重灾区。
-PREBUILT_APP="$REPO/Claude 环境检查器.app"
+# 中文目录名可能被某些解压工具弄成乱码,所以依次试正式名 / ASCII 名 / 通配,
+# 绝不能因为名字对不上就退回需要 Xcode 的编译路径。
+PREBUILT_APP=""
+for _candidate in "$REPO/Claude 环境检查器.app" "$REPO/ClaudeSwitcher.app" "$REPO"/*.app; do
+    [ -x "$_candidate/Contents/MacOS/ClaudeSwitcher" ] || continue
+    PREBUILT_APP="$_candidate"
+    break
+done
 USE_PREBUILT=0
-[ -x "$PREBUILT_APP/Contents/MacOS/ClaudeSwitcher" ] && USE_PREBUILT=1
+[ -n "$PREBUILT_APP" ] && USE_PREBUILT=1
 clear
 echo "=================================="
 echo "  Claude 账号切换器 · 安装程序"

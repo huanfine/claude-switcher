@@ -90,7 +90,7 @@ repository, command-line script, and build artifact name.
 
 Download `*-macos-arm64-full.zip` from the
 [latest release](https://github.com/huanfine/claude-switcher/releases/latest),
-unzip it, and double-click `一键安装.command`. Confirm the proxy group / region and
+unzip it, and double-click `INSTALL.command`. Confirm the proxy group / region and
 enter your password once; the app appears on the Desktop.
 
 The bundle already contains the compiled app, core script, daemons, and installer:
@@ -98,6 +98,9 @@ The bundle already contains the compiled app, core script, daemons, and installe
 needs macOS 13+, Apple Silicon, python3, a running proxy client, and the Claude
 desktop app. The app is ad-hoc signed and not notarized, so the first launch may need
 right-click → Open (the launcher clears download quarantine inside the package).
+The entry point deliberately uses an ASCII filename: if an older zip or a non-UTF-8
+unarchiver renders the Chinese names as garbled text, `INSTALL.command` still works
+because every path it uses is ASCII. See `README-INSTALL.txt` inside the package.
 
 **Do not use the old upstream `YOURSJEYO/claude-switcher` release**: its core script
 predates `node-scan` / `slot-node` and fails with `exit code 2` on node scan.

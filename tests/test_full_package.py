@@ -14,6 +14,7 @@ import os
 import plistlib
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -118,45 +119,111 @@ class FullPackageTests(unittest.TestCase):
         self.assertTrue(installed)
         self.assertIn("App 编译完成", proc.stdout)
 
-    def test_launcher_delegates_to_installer(self):
-        """双击「一键安装.command」要能找到包内 installer/安装.command。"""
-        packager = PACKAGER.read_text()
-        match = re.search(
-            r"cat > \"\$FULL_ROOT/一键安装\.command\" <<'LAUNCH_EOF'\n(.*?)\nLAUNCH_EOF",
-            packager, re.S,
-        )
-        self.assertIsNotNone(match, "打包脚本里找不到一键安装入口")
+    def test_prebuilt_lookup_survives_garbled_app_name(self):
+        """真实故障:zip 解压后 App 目录名是乱码,仍要认出随包 App。"""
+        text = INSTALLER.read_text()
+        start = text.index("# 一体化安装包")
+        end = text.index("clear", start)
+        body = text[start:end]
         with tempfile.TemporaryDirectory() as td:
-            pkg = Path(td) / "pkg"
-            (pkg / "installer").mkdir(parents=True)
-            (pkg / "installer/安装.command").write_text(
-                '#!/bin/bash\necho "LAUNCH_OK:$PWD"\n'
+            tmp = Path(td)
+            repo = tmp / "repo"
+            repo.mkdir()
+            garbled = "Claude τÄ»σóâµúÇµƒÑσÖ¿.app"  # 归档工具解错的样子
+            exe = repo / garbled / "Contents/MacOS/ClaudeSwitcher"
+            exe.parent.mkdir(parents=True)
+            exe.write_text("#!/bin/sh\nexit 0\n")
+            exe.chmod(0o755)
+            script = tmp / "probe.sh"
+            script.write_text(
+                "#!/bin/bash\n"
+                f'H="{tmp / "home"}"\n'
+                f'REPO="{repo}"\n'
+                + body
+                + '\nprintf "FOUND:%s|%s\\n" "$PREBUILT_APP" "$USE_PREBUILT"\n'
             )
-            launcher = pkg / "一键安装.command"
-            launcher.write_text(match.group(1))
-            launcher.chmod(0o755)
             proc = subprocess.run(
-                ["bash", str(launcher)], capture_output=True, text=True,
+                ["bash", str(script)], capture_output=True, text=True,
                 stdin=subprocess.DEVNULL, timeout=30,
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn(f"LAUNCH_OK:{pkg}", proc.stdout)
+            self.assertIn(f"FOUND:{repo / garbled}|1", proc.stdout)
+
+    def test_launcher_delegates_to_installer(self):
+        """两个入口都必须走 ASCII 安装器路径,中文名乱码时也能装。"""
+        packager = PACKAGER.read_text()
+        patterns = (
+            ("INSTALL.command",
+             r"cat > \"\$KIT_ROOT/INSTALL\.command\" <<'ASCII_EOF'\n(.*?)\nASCII_EOF"),
+            ("一键安装.command",
+             r"cat > \"\$FULL_ROOT/一键安装\.command\" <<'LAUNCH_EOF'\n(.*?)\nLAUNCH_EOF"),
+        )
+        for name, pattern in patterns:
+            with self.subTest(entry=name):
+                match = re.search(pattern, packager, re.S)
+                self.assertIsNotNone(match, f"打包脚本里找不到 {name} 入口")
+                self.assertIn("installer/install.command", match.group(1))
+                with tempfile.TemporaryDirectory() as td:
+                    pkg = Path(td) / "pkg"
+                    (pkg / "installer").mkdir(parents=True)
+                    (pkg / "installer/install.command").write_text(
+                        '#!/bin/bash\necho "LAUNCH_OK:$PWD"\n'
+                    )
+                    launcher = pkg / name
+                    launcher.write_text(match.group(1))
+                    launcher.chmod(0o755)
+                    proc = subprocess.run(
+                        ["bash", str(launcher)], capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn(f"LAUNCH_OK:{pkg}", proc.stdout)
 
     def test_packager_contract(self):
         script = PACKAGER.read_text()
         for needle in (
             "FULL_ZIP=", "FULL_NAME=", "一键安装.command", "先读我.txt",
-            'ditto "$APP" "$FULL_ROOT/Claude 环境检查器.app"',
+            "INSTALL.command", "README-INSTALL.txt", "installer/install.command",
+            "scripts/make-zip.py", 'ditto "$APP" "$FULL_ROOT/Claude 环境检查器.app"',
             "com.apple.quarantine", "一体化安装包缺少",
         ):
             self.assertIn(needle, script, f"打包脚本缺少: {needle}")
+        self.assertNotIn("ditto -c -k", script, "不应再用 ditto 打 zip(中文名会乱码)")
 
     def test_installer_contract(self):
         script = INSTALLER.read_text()
-        self.assertIn('PREBUILT_APP="$REPO/Claude 环境检查器.app"', script)
-        self.assertIn('[ -x "$PREBUILT_APP/Contents/MacOS/ClaudeSwitcher" ]', script)
+        self.assertIn('"$REPO/Claude 环境检查器.app"', script)
+        self.assertIn('"$REPO/ClaudeSwitcher.app"', script)
+        self.assertIn('"$REPO"/*.app', script)
+        self.assertIn('[ -x "$_candidate/Contents/MacOS/ClaudeSwitcher" ]', script)
         self.assertIn('if [ "$USE_PREBUILT" -eq 0 ] && ! command -v swiftc', script)
         self.assertIn('ditto "$PREBUILT_APP" "$APP"', script)
+
+    def test_make_zip_sets_utf8_flag_and_executable_bits(self):
+        """回归:ditto 打出的 zip 中文名缺 UTF-8 标记,归档实用工具会解成乱码。"""
+        maker = PROJECT / "scripts/make-zip.py"
+        self.assertTrue(maker.exists())
+        self.assertIn("0x800", maker.read_text())
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            src = tmp / "src"
+            (src / "installer").mkdir(parents=True)
+            (src / "INSTALL.command").write_text("#!/bin/sh\nexit 0\n")
+            (src / "INSTALL.command").chmod(0o755)
+            (src / "一键安装.command").write_text("#!/bin/sh\nexit 0\n")
+            (src / "installer/install.command").write_text("#!/bin/sh\n")
+            out = tmp / "out.zip"
+            proc = subprocess.run(
+                [sys.executable, str(maker), str(src), str(out), "TOP"],
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with zipfile.ZipFile(out) as zf:
+                by_name = {i.filename: i for i in zf.infolist()}
+                self.assertIn("TOP/INSTALL.command", by_name)
+                self.assertIn("TOP/一键安装.command", by_name)
+                self.assertTrue(by_name["TOP/一键安装.command"].flag_bits & 0x800)
+                self.assertTrue(by_name["TOP/INSTALL.command"].external_attr >> 16 & 0o111)
 
     def test_release_workflow_publishes_full_zip(self):
         workflow = WORKFLOW.read_text()
@@ -167,16 +234,18 @@ class FullPackageTests(unittest.TestCase):
         readme = README.read_text()
         self.assertIn("-full.zip", readme)
         self.assertIn("一个包搞定", readme)
-        self.assertIn("一键安装.command", readme)
+        self.assertIn("INSTALL.command", readme)
+        self.assertIn("README-INSTALL.txt", readme)
         self.assertIn("releases/latest", readme)
 
     def test_built_full_zip_if_present(self):
         """本地跑过打包时，顺手验一下产物清单与可执行位。"""
-        zips = sorted((PROJECT / "build").glob("ClaudeSwitcher-*-macos-*-full.zip"))
+        zips = list((PROJECT / "build").glob("ClaudeSwitcher-*-macos-*-full.zip"))
         if not zips:
             self.skipTest("本地尚未运行 package-macos.sh")
-        # ditto 写 zip 时中文名是 UTF-8 字节但没置 UTF-8 flag,zipfile 会按 cp437
-        # 解成乱码。这里把字节还原回来,免得误报「包里缺文件」。
+        zips.sort(key=lambda p: p.stat().st_mtime)
+        # 老包用 ditto 打,中文名缺 UTF-8 flag,zipfile 会按 cp437 解成乱码;
+        # 新包已置位,fixed() 对它直接返回原名。保留兼容是为了不误报缺文件。
         def fixed(name):
             try:
                 return name.encode("cp437").decode("utf-8")
@@ -192,15 +261,22 @@ class FullPackageTests(unittest.TestCase):
                 info = infos.get(f"{root}/{rel}")
                 return bool(info and info.external_attr >> 16 & 0o111)
             for rel in (
-                "一键安装.command", "先读我.txt", "core/claude-switch.sh",
-                "core/stun-probe.py", "daemons/claude-bodyguard.sh",
-                "installer/安装.command", "installer/卸载.command",
-                "scripts/upgrade-core.sh", "SHA256SUMS", APP_REL,
+                "INSTALL.command", "README-INSTALL.txt", "installer/install.command",
+                "installer/uninstall.command", "一键安装.command", "先读我.txt",
+                "core/claude-switch.sh", "core/stun-probe.py",
+                "daemons/claude-bodyguard.sh", "installer/安装.command",
+                "installer/卸载.command", "scripts/upgrade-core.sh",
+                "SHA256SUMS", APP_REL,
             ):
                 self.assertTrue(has(rel), f"full 包缺少 {rel}")
-            for rel in ("一键安装.command", "installer/安装.command",
+            for rel in ("INSTALL.command", "一键安装.command",
+                        "installer/install.command", "installer/安装.command",
                         "scripts/upgrade-core.sh", APP_REL):
                 self.assertTrue(executable(rel), f"full 包里 {rel} 丢了可执行位")
+            for info in infos.values():
+                if not info.filename.isascii():
+                    self.assertTrue(info.flag_bits & 0x800,
+                                    f"{info.filename} 缺 UTF-8 标记,解压会变乱码")
 
 
 if __name__ == "__main__":

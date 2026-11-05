@@ -77,9 +77,11 @@
 
 ### 装到另一台机器：一个包搞定（推荐）
 
-从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-arm64-full.zip`，解压后**双击「一键安装.command」**，按提示确认代理组 / 地区、输入一次开机密码，桌面就出现「Claude 环境检查器」。
+从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-arm64-full.zip`，解压后**双击 `INSTALL.command`**，按提示确认代理组 / 地区、输入一次开机密码，桌面就出现「Claude 环境检查器」。
 
-这一个包里已经带上编译好的 App、核心脚本、守护进程与安装器：**不用装 Xcode、不用挑包、不用再跑升级命令**。目标机只需 macOS 13+ / Apple Silicon / python3 / 一个正在运行的代理客户端 / Claude 桌面版。App 是 ad-hoc 签名、未公证，首次被系统拦下时右键点 `一键安装.command` →「打开」即可（它会顺手清掉下载带来的隔离属性）。
+这一个包里已经带上编译好的 App、核心脚本、守护进程与安装器：**不用装 Xcode、不用挑包、不用再跑升级命令**。目标机只需 macOS 13+ / Apple Silicon / python3 / 一个正在运行的代理客户端 / Claude 桌面版。App 是 ad-hoc 签名、未公证，首次被系统拦下时右键点 `INSTALL.command` →「打开」即可（它会顺手清掉下载带来的隔离属性）。
+
+> 入口特意用了纯 ASCII 文件名。若解压后中文文件名显示成乱码（旧版 zip 或某些解压工具会把 UTF-8 按 MacRoman 解读），忽略它们，双击 `INSTALL.command` 即可——它内部的路径全是 ASCII，安装不受影响；同名的「一键安装.command」是同一个入口。详见包内 `README-INSTALL.txt`。
 
 **不要从旧上游 `YOURSJEYO/claude-switcher` 的 Release 下载**：那里的核心脚本不认识 `node-scan` / `slot-node`，装完点节点扫描会报「脚本执行失败（退出码 2）」。
 
