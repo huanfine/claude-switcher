@@ -132,6 +132,8 @@ cp "$ROOT/assets/icon-2048.png" "$KIT_ROOT/assets/"
 cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
 # 「新 App + 旧核心」时的急救脚本。只装了 app-only 包的人也需要能升级核心。
 cp "$ROOT/scripts/upgrade-core.sh" "$KIT_ROOT/scripts/"
+# 「点了修复没反应」的一键诊断。随包带上,目标机没网也能跑(另可从 main raw 获取)。
+cp "$ROOT/scripts/diagnose-fix.sh" "$KIT_ROOT/scripts/"
 cp "$ROOT/SHA256SUMS" "$KIT_ROOT/SHA256SUMS"
 # zip 里的中文名在 macOS「归档实用工具」下会变成乱码(连 zip 写了 UTF-8 标记
 # 也一样)。所以安装入口用纯 ASCII,一体化包更是不留任何中文文件名。
@@ -162,17 +164,21 @@ Needs macOS 13+, Apple Silicon, python3, a running proxy client, Claude desktop.
 
 一体化包(*-full.zip)内所有文件名均为 ASCII,解压后不会出现乱码。
 安装入口及其内部路径全是 ASCII,不受解压工具影响。
+
+装好后若「一键修复」看起来没生效,进入本目录在终端跑一次:
+  bash scripts/diagnose-fix.sh
+它会原样执行一次修复并记录每一步,把桌面的 claude-fix-diagnosis.txt 发回即可。
 ASCII_EOF
 chmod +x "$KIT_ROOT/INSTALL.command" "$KIT_ROOT/installer/install.command" \
          "$KIT_ROOT/installer/uninstall.command" \
          "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command" \
-         "$KIT_ROOT/scripts/upgrade-core.sh"
+         "$KIT_ROOT/scripts/upgrade-core.sh" "$KIT_ROOT/scripts/diagnose-fix.sh"
 for ITEM in \
     README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS \
     INSTALL.command README-INSTALL.txt installer/install.command \
     core/claude-switch.sh daemons/claude-bodyguard.sh installer/安装.command \
     app/main.swift assets/icon-2048.png docs/screenshot.png \
-    scripts/upgrade-core.sh; do
+    scripts/upgrade-core.sh scripts/diagnose-fix.sh; do
     if [ ! -e "$KIT_ROOT/$ITEM" ]; then
         echo "✗ installer kit 缺少 $ITEM" >&2
         exit 1
@@ -215,19 +221,21 @@ PY
     || { echo "✗ 一体化包内 SHA256SUMS 校验失败" >&2; exit 1; }
 chmod +x "$FULL_ROOT/INSTALL.command" \
          "$FULL_ROOT/installer/install.command" "$FULL_ROOT/installer/uninstall.command" \
-         "$FULL_ROOT/scripts/upgrade-core.sh"
+         "$FULL_ROOT/scripts/upgrade-core.sh" "$FULL_ROOT/scripts/diagnose-fix.sh"
 for ITEM in "INSTALL.command" "README-INSTALL.txt" \
             "ClaudeSwitcher.app/Contents/MacOS/ClaudeSwitcher" \
             "core/claude-switch.sh" "core/stun-probe.py" \
             "daemons/claude-bodyguard.sh" "installer/install.command" \
-            "installer/uninstall.command" "scripts/upgrade-core.sh" "SHA256SUMS"; do
+            "installer/uninstall.command" "scripts/upgrade-core.sh" \
+            "scripts/diagnose-fix.sh" "SHA256SUMS"; do
     if [ ! -e "$FULL_ROOT/$ITEM" ]; then
         echo "✗ 一体化安装包缺少 $ITEM" >&2
         exit 1
     fi
 done
 for ITEM in "INSTALL.command" "installer/install.command" \
-            "installer/uninstall.command" "scripts/upgrade-core.sh"; do
+            "installer/uninstall.command" "scripts/upgrade-core.sh" \
+            "scripts/diagnose-fix.sh"; do
     [ -x "$FULL_ROOT/$ITEM" ] || { echo "✗ $ITEM 不可执行" >&2; exit 1; }
 done
 # 构建期硬门禁:一体化包里只要还有一个非 ASCII 文件名,就直接打包失败。

@@ -198,7 +198,8 @@ class FullPackageTests(unittest.TestCase):
             "installer/install.command", "installer/uninstall.command",
             "ClaudeSwitcher.app/Contents/MacOS/ClaudeSwitcher",
             "scripts/make-zip.py", 'ditto "$APP" "$FULL_ROOT/ClaudeSwitcher.app"',
-            "com.apple.quarantine", "一体化安装包缺少", "renames = {",
+            "scripts/diagnose-fix.sh", "com.apple.quarantine",
+            "一体化安装包缺少", "renames = {",
             "shasum -a 256 -c SHA256SUMS",
         ):
             self.assertIn(needle, script, f"打包脚本缺少: {needle}")
@@ -271,12 +272,13 @@ class FullPackageTests(unittest.TestCase):
                 "INSTALL.command", "README-INSTALL.txt", "installer/install.command",
                 "installer/uninstall.command", "core/claude-switch.sh",
                 "core/stun-probe.py", "daemons/claude-bodyguard.sh",
-                "scripts/upgrade-core.sh", "SHA256SUMS", APP_REL,
+                "scripts/upgrade-core.sh", "scripts/diagnose-fix.sh",
+                "SHA256SUMS", APP_REL,
             ):
                 self.assertTrue(has(rel), f"full 包缺少 {rel}")
             for rel in ("INSTALL.command", "installer/install.command",
                         "installer/uninstall.command", "scripts/upgrade-core.sh",
-                        APP_REL):
+                        "scripts/diagnose-fix.sh", APP_REL):
                 self.assertTrue(executable(rel), f"full 包里 {rel} 丢了可执行位")
             # 中文名安装器移除后,清单不能还指向它们,否则 shasum -c 会报缺文件。
             sums = zf.read(f"{root}/SHA256SUMS").decode("utf-8")
