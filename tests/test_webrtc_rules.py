@@ -551,6 +551,27 @@ class PolicyUnlockTests(unittest.TestCase):
         core = SOURCE.read_text(encoding="utf-8")
         self.assertIn('if policy == "proxy" and selected.get("udp") is not True:', core)
 
+    def test_fix_waits_for_egress_only_after_a_real_restart(self):
+        """重启客户端后先等路由收敛,别拿空 trace 把已修好的结果报成 ✗。
+
+        1.8.2-dev 实测:规则已写入并验证加载,收尾却报「WebRTC ✗ 未获取有效
+        IPv4 出口 / 出口IP ✗ 无」并 exit=1;紧接着单独跑 checkdetail 两项全绿。
+        原因是 TUN 设备先于默认路由就绪。守卫必须只在真重启过时生效,否则
+        「规则无变化、不重启」那条省钱路径会被平白拖慢。
+        """
+        core = SOURCE.read_text(encoding="utf-8")
+        # 按行首锚定:直接 index("fix() {") 会先撞上别的函数名(如 *_fix())。
+        fix = core[core.index("\nfix() {") + 1:]
+        fix = fix[:fix.index("\n}\n")]
+        self.assertIn("local just_reloaded=0", fix)
+        mark = fix.index("just_reloaded=1")
+        self.assertIn("quit_clash_verge", fix[mark:mark + 60],
+                      "标记必须落在真正重启客户端那条分支")
+        guard = fix.index('if [ "$just_reloaded" -eq 1 ]; then', mark)
+        self.assertIn("cdn-cgi/trace", fix[guard:guard + 400])
+        self.assertLess(guard, fix.index("for i in 1 2 3; do"),
+                        "等待块必须在 C 段复测之前")
+
 
 if __name__ == "__main__":
     unittest.main()

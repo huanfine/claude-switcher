@@ -2206,11 +2206,24 @@ ip_purity() {
     case "$rdns" in
         *static*|*cloud*|*vps*|*dedicated*|*server*|*hosting*|*datacenter*|*colo*) host_hint=1 ;;
     esac
+    # 名字不在住宅白名单时 ip_class 一律回 hosting(保守默认:宁可少收录,
+    # 也不能把真机房洗成住宅)。但两家风险源都明确答「不是机房/不是托管」时,
+    # 再按默认把人钉成机房就是假阳性:实测 GTT(AS3257)的三份响应写着
+    # is_datacenter:false / hosting:false / risk_score:0,界面却报
+    # 「评分 60/100 · 机房 · 机房出口风险偏高,建议换住宅 IP」。
+    # 这里不授予住宅分(那才是危险的假绿),只退回「类型不明」的 70 分基线,
+    # 判定依旧是 warn —— 门槛一点没松,只是不再凭名字冤枉人。
+    local name_only_host=""
+    if [ -z "$dc" ] && [ -z "$host_hint" ] && [ "$asn_kind" = "hosting" ] \
+       && [ "$src_n" -ge 2 ]; then
+        name_only_host=1
+    fi
     if [ -n "$tor" ]; then
         type=tor
     elif [ -n "$px" ]; then
         type=vpn
-    elif [ -n "$dc" ] || [ -n "$host_hint" ] || [ "$asn_kind" = "hosting" ]; then
+    elif [ -n "$dc" ] || [ -n "$host_hint" ] \
+         || { [ "$asn_kind" = "hosting" ] && [ -z "$name_only_host" ]; }; then
         type=hosting
     elif [ -n "$mob" ]; then
         type=mobile
@@ -2363,23 +2376,41 @@ ip_purity() {
     # 哪怕两家源早就恢复了。做法是给这类结果一个已经「快过期」的时间戳:
     # 读侧仍按 now-epoch < TTL 判,300 秒后自动重查,逻辑不用分叉。
     # 单源可达同理 —— 代理特征可能被漏判,不该把那次的分数当定论。
-    local cache_epoch="$now" lock="$BASE/.purity-cache.lock" got=0 i
+    local cache_epoch="$now" lock="$BASE/.purity-cache.lock" got=0 i owner tmp
     if [ -n "$degraded" ] || [ "$src_n" = "1" ]; then
         cache_epoch=$((now - PURITY_CACHE_TTL + 300))
     fi
     if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
         # 节点扫描会并发给多个 IP 打分,每个后台子 shell 都会落缓存;不锁的话
         # 两份 grep -v 会各自读同一份旧文件,后写的那份把先写的结果抹掉。
+        # 锁目录里记下创建时间:进程被 kill / 断电会留下一把空锁,之后 5 次 mkdir
+        # 全失败、缓存再也写不进去。本机实测 11-04 06:34 留下这样一把锁,之后
+        # 23 小时每次检查都重新打四个网络请求,分数随网络抖动上下飘 —— 这正是
+        # 「出口 IP 评分不对」的第二个来源。超过 60 秒的锁一律回收。
         for i in 1 2 3 4 5; do
-            mkdir "$lock" 2>/dev/null && { got=1; break; }
+            if mkdir "$lock" 2>/dev/null; then
+                printf '%s' "$now" > "$lock/owner" 2>/dev/null
+                got=1; break
+            fi
+            owner=$(cat "$lock/owner" 2>/dev/null)
+            case "$owner" in ''|*[!0-9]*) owner=0 ;; esac
+            if [ $((now - owner)) -gt 60 ]; then
+                rm -f "$lock/owner" 2>/dev/null
+                rmdir "$lock" 2>/dev/null
+            fi
             sleep 1
         done
+        # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
+        # 本次结果会让「五分钟重查」「24h 复用」整套口径全部失效。
+        tmp="$BASE/purity-cache.v3.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v3" 2>/dev/null
+          printf '%s|%s|%s|%s|%s|%s|%s\n' \
+              "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
+        } | tail -20 > "$tmp" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v3" 2>/dev/null \
+            || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
-            { grep -vF "$ip|" "$BASE/purity-cache.v3" 2>/dev/null
-              printf '%s|%s|%s|%s|%s|%s|%s\n' \
-                  "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
-            } | tail -20 > "$BASE/purity-cache.v3.tmp" 2>/dev/null \
-                && mv "$BASE/purity-cache.v3.tmp" "$BASE/purity-cache.v3" 2>/dev/null
+            rm -f "$lock/owner" 2>/dev/null
             rmdir "$lock" 2>/dev/null
         fi
     fi
@@ -3305,6 +3336,14 @@ scan_nodes() {
     local cur_score=0 cur_ip="" delta=0 candidates=0 unique=0 eligible_n=0 unknown_n=0
     local epoch line
     [ -n "$PROXY_GROUP" ] || { echo "FAIL:未配置代理组,无法扫描节点" >&2; return 1; }
+    # reject 策略下 UDP/3478 已在规则层 REJECT,节点支不支持 UDP 都不会泄漏。
+    # 这时还拿「UDP 未标注」当硬门槛,会把用户正在用的 HTTP 节点和所有 HTTP
+    # 候选一起排除 —— 与「一键修复」自动切 reject 的前提自相矛盾。
+    local wpolicy="proxy"
+    if [ -f "$BASE/webrtc-policy" ]; then
+        wpolicy=$(tr -d ' \t\r\n' < "$BASE/webrtc-policy" 2>/dev/null)
+        case "$wpolicy" in proxy|reject) ;; *) wpolicy=proxy ;; esac
+    fi
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/node-scan.XXXXXX") || return 1
     raw="$tmp/raw"
     if ! clash_rules node-scan >"$raw" 2>"$tmp/err"; then
@@ -3361,7 +3400,7 @@ scan_nodes() {
                 why="国家不符(${cc}≠${COUNTRY_TARGET})"; eligible=0
             fi
         fi
-        if [ "$eligible" = 1 ] && [ "$udp" = "0" ]; then
+        if [ "$eligible" = 1 ] && [ "$udp" = "0" ] && [ "$wpolicy" != "reject" ]; then
             why="UDP 未标注"; eligible=0
         fi
         [ "$eligible" = 1 ] && eligible_n=$((eligible_n + 1))
@@ -3474,7 +3513,9 @@ scan_nodes() {
         # 照样被硬门槛排除,49 分的机房反而可用 —— 用户看到的就是这个背离,
         # 所以区间和「先看哪一列」必须写在同一屏里。
         echo "口径:分数 = IP 信誉(90-100 优秀 · 75-89 良好 · 50-74 一般 · 30-49 偏差 · 0-29 差),不决定能不能用"
-        echo "读法:先看「可用/不可用」——由硬门槛决定(Tor/代理/VPN、机房转租段<30 分、信誉<50 分、国家不符、UDP 未标注);没命中硬门槛的,分数低也仍然可用"
+        local udp_gate_hint="、UDP 未标注"
+        [ "$wpolicy" = "reject" ] && udp_gate_hint=" · 当前 reject 策略已直接拒绝 UDP,不查节点 UDP 支持"
+        echo "读法:先看「可用/不可用」——由硬门槛决定(Tor/代理/VPN、机房转租段<30 分、信誉<50 分、国家不符${udp_gate_hint});没命中硬门槛的,分数低也仍然可用"
         # 全部候选,不是前 3 名。用户问「有没有具体内容」时,被排除的那些
         # 恰恰是最需要解释的:为什么 CDN 前置 / 国家不符 / UDP 没标注不能选。
         echo "--- 全部候选(可用优先,再按分数;含区间与排除原因) ---"
@@ -3734,6 +3775,8 @@ fix_flclash() {
 
 # 一键修复:按项自动修复,每步输出结果
 fix() {
+    # 只有真的重启过客户端才需要在收尾复测前等路由收敛,见 C 段。
+    local just_reloaded=0
     if [ "$PROXY_MODE" = "flclash" ]; then
         fix_flclash || return 1
     fi
@@ -3901,6 +3944,7 @@ ASEOF
                 echo "FIX:置顶规则 ✓ 规则已是最新,未重启客户端"
                 ;;
             *)
+                just_reloaded=1
                 quit_clash_verge
                 open -a "Clash Verge"
                 for i in $(seq 1 40); do tun_up && break; sleep 1; done
@@ -3940,10 +3984,25 @@ ASEOF
     # 注意这里必须是 `tun_up && break`。写成 `tun_up || break` 会把两件事**做反**:
     # TUN 起来的连打三枪、没起来的立刻放弃 —— 实测就是这个形状
     # (起着的 6.5 秒,没起的 0.17 秒),正好是我们要的反面。
-    local wrip="" trace="" rc=0
+    local wrip="" trace="" rc=0 settle
+    # 刚重启过客户端时,内核起来了、TUN 也在,但默认路由还要几秒才真正把流量
+    # 送出去 —— tun_up 为真并不等于出口能通。实测 1.8.2-dev 的 fix 在这个窗口
+    # 里拿到空 trace,于是收尾报「WebRTC ✗ 未获取有效 IPv4 出口 / 出口IP ✗ 无」
+    # 并 exit=1,可规则其实已经写入并验证加载了(随后单独跑 checkdetail 两项全绿)。
+    # 用户看到的就是「修复不成功」。只在这条确实重启过的路径上等;没改配置、
+    # 没重启时一次请求都不多发,原来的三枪逻辑原样保留。
+    if [ "$just_reloaded" -eq 1 ]; then
+        for i in 1 2 3 4; do
+            settle=$(curl -s --max-time 3 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+            if printf '%s' "$settle" | grep -q '^ip='; then trace="$settle"; break; fi
+            sleep 2
+        done
+    fi
     for i in 1 2 3; do
-        trace=$(curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-        rc=$?
+        if [ -z "$(printf '%s' "$trace" | grep '^ip=')" ]; then
+            trace=$(curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+            rc=$?
+        fi
         wrip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
         [ -n "$wrip" ] && break
         [ "$rc" -eq 28 ] && break

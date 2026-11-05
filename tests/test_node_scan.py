@@ -494,6 +494,20 @@ class PurityFailReasonTests(unittest.TestCase):
         self.assertIn("90-100 优秀", src)
         self.assertIn("读法:先看「可用/不可用」", src)
 
+    def test_udp_hard_gate_follows_the_webrtc_policy(self):
+        """reject 策略下 UDP/3478 已在规则层拒绝,不该再按节点 UDP 一票否决。
+
+        否则「一键修复」刚把用户切到 reject,扫描表就把他正在用的 HTTP 节点
+        标成「UDP 未标注 · 不可用」,两处结论互相打架。
+        """
+        src = SOURCE.read_text(encoding="utf-8")
+        self.assertIn('wpolicy=$(tr -d', src)
+        self.assertIn('if [ -f "$BASE/webrtc-policy" ]', src)
+        self.assertIn('[ "$udp" = "0" ] && [ "$wpolicy" != "reject" ]', src)
+        self.assertIn('[ "$wpolicy" = "reject" ] && udp_gate_hint=', src)
+        # proxy / 策略文件缺失时仍保持原来的保守门禁。
+        self.assertIn('local wpolicy="proxy"', src)
+
     def test_score_bands_answer_how_good_is_good(self):
         """用户原话:「这几个看不懂,多少是好,多少是不好」。
 

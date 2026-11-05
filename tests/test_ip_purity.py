@@ -76,6 +76,11 @@ TOR = _ipquery("Tor", "Tor Exit", city="Denver", is_tor=True)
 # org/isp 留空是刻意的:只要 ipquery 报了运营商名,ip_class 就会先把它归成机房,
 # PTR 那三条断言就测不到自己了。
 NEUTRAL = _ipquery("", "", timezone="America/Denver")
+# 真实故障样本:66.17.65.38 / AS3257 GTT。三家源一致说不是机房、没有代理特征、
+# risk_score=0,只因运营商名不在住宅白名单里就被 ip_class 默认判成机房。
+CARRIER_CLEAN = _ipquery("GTT Communications Inc.", "GTT Communications Inc.",
+                         city="Ashburn", timezone="America/New_York")
+IPINFO_CARRIER = _ipinfo("AS3257 GTT Communications Inc.", "Ashburn")
 
 IPINFO_RESID = _ipinfo("AS7922 Comcast Cable Communications, LLC", "Denver")
 IPINFO_HOSTING = _ipinfo("AS14956 RouterHosting LLC", "Ogden")
@@ -567,6 +572,70 @@ esac''')
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertNotIn("硬门槛:", detail)
+
+
+    def test_clean_carrier_is_not_labelled_hosting(self):
+        """两家风险源明确否定机房时,不能只凭「名字不在住宅白名单」报机房。
+
+        用户原话:「我们的出口ip评分也不对」。实测 66.17.65.38 的 ipquery
+        is_datacenter:false / risk_score:0、ip-api hosting:false、ipinfo 报
+        AS3257 GTT,界面却给「评分 60/100 · 机房 · 建议换住宅 IP」。
+        修法不授予住宅分(假绿更危险),只退回「类型不明」的 70 分基线。
+        """
+        self.write_env("America/New_York")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      IPINFO_CARRIER)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertEqual(self.score(detail), 70, detail)
+        self.assertIn("类型不明", detail)
+        self.assertNotIn("机房", detail)
+        self.assertNotIn("建议换住宅 IP", detail)
+
+    def test_explicit_datacenter_flag_still_wins_over_clean_org(self):
+        """有明确的 is_datacenter:true 时仍要判机房 —— 别把门禁一起放松。"""
+        flagged = _ipquery("GTT Communications Inc.", "GTT Communications Inc.",
+                           city="Ashburn", timezone="America/New_York",
+                           is_datacenter=True)
+        self.write_env("America/New_York")
+        self.stub_net(flagged, _ipapi("Ashburn", countryCode="US",
+                                     timezone="America/New_York"),
+                      IPINFO_CARRIER)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("机房", detail)
+
+    def test_stale_cache_lock_is_reclaimed(self):
+        """断电/被 kill 留下的空锁目录不能让此后所有评分都写不进缓存。
+
+        本机 11-04 06:34 留下 .purity-cache.lock 后,连续 23 小时缓存零写入,
+        每次检查都重新打四个网络请求,分数随网络抖动飘 —— 这是「评分不对」的
+        第二个独立来源。
+        """
+        base = self.home / ".claude-switcher"
+        lock = base / ".purity-cache.lock"
+        lock.mkdir()
+        self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
+        self.run_detail()
+        cache = base / "purity-cache.v3"
+        self.assertTrue(cache.exists(), "陈旧锁之后仍应写入缓存")
+        self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
+        self.assertFalse(lock.exists(), "陈旧锁应被回收")
+
+    def test_live_cache_lock_never_drops_the_result(self):
+        """别人正持锁时也不能静默丢掉本次评分:缓存可以少一行,不能一行不写。"""
+        import time
+        base = self.home / ".claude-switcher"
+        lock = base / ".purity-cache.lock"
+        lock.mkdir()
+        (lock / "owner").write_text(str(int(time.time())), encoding="utf-8")
+        self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
+        self.run_detail()
+        cache = base / "purity-cache.v3"
+        self.assertTrue(cache.exists(), "抢不到锁也要落盘,不能丢掉结果")
+        self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
+        self.assertTrue(lock.exists(), "活锁不该被别人抢走")
 
 
 if __name__ == "__main__":

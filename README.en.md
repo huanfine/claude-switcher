@@ -153,6 +153,31 @@ a "type estimate / reputation not measured" score, none of the risk sources
 answered: that number is a type-based baseline, not a measured reputation, and
 it is retried automatically after 5 minutes.
 
+## Exit IP score looks wrong
+
+Three known causes, all fixed: a `dig` timeout diagnostic line was once parsed
+as a PTR record and printed as the ISP name; a leftover `.purity-cache.lock`
+directory (from a killed process) silently blocked every cache write for hours,
+so each check re-queried four sources and the score drifted with the network;
+and operators outside the residential whitelist were always labelled
+"datacenter" even when all three sources said `is_datacenter:false`. Stale
+locks older than 60 seconds are now reclaimed, and an explicit "not a
+datacenter" verdict falls back to a neutral 70-point baseline (`warn`), never
+to a residential score.
+
+The score is IP reputation; whether the exit is usable for Claude is decided
+separately by hard gates, so the two can diverge. Under the `reject` policy UDP
+is rejected at the rule level, so node UDP support is no longer a hard gate.
+
+## Repair reports ✗ but a fresh check is green
+
+`fix` restarts the proxy client after writing the global script. Older builds
+probed the exit immediately — while TUN was up but the default route had not
+converged — got an empty trace and ended with `WebRTC ✗` / `Exit IP ✗` and
+`exit=1`, even though the rules were written and verified. The restart path now
+waits for egress before re-testing; when nothing changed and no restart happens,
+no extra request is made.
+
 ## Usage
 
 1. Open the desktop app and wait for the 16 checks.
