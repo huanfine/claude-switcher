@@ -1,11 +1,21 @@
 """IP 纯净度评级的口径回归。
 
-口径是「类型基线 − 扣分」,不是「100 减若干项」。基线对齐 ip.net.coffee 的实测落点
-(住宅 100 / 机房 51~58 / VPN 61~69 / Tor 43~50),这样两边的数字可以直接比;
+口径是「类型基线 − 扣分」,不是「100 减若干项」。基线取 ip.net.coffee 实测区间的
+中位数(住宅 100 / 机房 55 / VPN 65 / Tor 46),这样两边的数字可以直接比;
 判定阈值则比分数严 —— 分数是 IP 信誉的宽口径,判定回答的是「能不能拿它开 Claude」。
 
+2026-11-06 修订两处口径(起因:用户拿同一个 IP 和 ip.net.coffee 对,数字与结论都对不上):
+  1. **类型只能由正面证据决定。** 旧口径是「运营商名不在住宅白名单 = 机房」,
+     白名单又只收了 11 个国家几十家运营商,于是 GTT(AS3257)这种三家源都说
+     is_datacenter:false / hosting:false / risk_score:0 的干净出口,被我们报成
+     「疑似机房 · 建议换住宅节点」,而网站判它住宅 98。现在:命中住宅名单 → 住宅;
+     名字里有明确的机房/云/托管词 → 机房;两家源都否认证机房且低风险 → 住宅;
+     其余 → 类型不明。**「没收录」不再等于「是机房」。**
+  2. **地理维度只标记、不扣分。** 它和「时区」检查项说的是同一件事,扣分等于
+     重复计费,而网站那边不含这一维,多扣的几分让两边永远对不上。
+
 这一项的价值全在三件事上:
-1. **结论能解释** —— 分数低必须能指出是哪一项扣的(机房/代理/Tor/滥用/地理),否则
+1. **结论能解释** —— 分数低必须能指出是哪一项扣的(机房/代理/Tor/滥用),否则
    用户拿到一个 46 分不知道该改什么。
 2. **取不到数据敢说不知道** —— 数据源挂了必须报「未评级」,不能借 ok 混过去。
    一个安全工具最大的风险不是报错,是让用户以为「没告警 = 没问题」。
@@ -191,12 +201,22 @@ esac''')
     def test_datacenter_is_warn_not_fail(self):
         """机房要提示但不拦启动:大量用户就用机房节点,一票否决等于把门焊死。
 
-        分数落在 net.coffee 实测的机房带(51~58)里,两边数字可比。
+        基线 55 取自 net.coffee 实测的机房带(51~58)中位;这个样本 risk_score=20
+        再扣 7,所以落在 48 —— 分数低是风险分扣的,不是类型基线拍脑袋。
         """
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("机房", detail)
+        self.assertEqual(self.score(detail), 48, detail)
+
+    def test_clean_datacenter_lands_in_the_published_band(self):
+        """没有任何风险记录的机房,分数要落回网站实测的 51~58 —— 两边才能对比。"""
+        clean = _ipquery("RouterHosting LLC", "RouterHosting LLC", city="Ogden",
+                         risk_score=0, is_datacenter=True)
+        self.stub_net(clean, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
         self.assertIn(self.score(detail), range(51, 59), detail)
 
     def test_proxy_feature_is_fail(self):
@@ -255,17 +275,21 @@ esac''')
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("滥用记录", detail)
-        # 基线 60 − max(风险 12, 滥用 14) = 46;若相加会是 34。
-        self.assertEqual(self.score(detail), 46, detail)
+        # 基线 55 − max(风险 12, 滥用 14) = 41;若相加会是 29。
+        self.assertEqual(self.score(detail), 41, detail)
 
-    def test_timezone_mismatch_is_penalised_when_sources_agree(self):
-        """三源城市一致、只有时区对不上:这是真的画像矛盾,扣分但不 fail。"""
+    def test_timezone_mismatch_is_flagged_but_not_charged(self):
+        """三源城市一致、只有时区对不上:标出来,但不再二次扣分。
+
+        「系统时区与出口不一致」由「时区」那一项独立判定,这里再扣 6 分是重复计费;
+        而且 ip.net.coffee 的 Trust Score 不含地理维度,我们多扣的分数会让两边对不上。
+        """
         self.write_env("Asia/Tokyo")
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertIn("时区不符", detail)
-        # 基线 60 − 风险 7 − 时区 6 = 47
-        self.assertEqual(self.score(detail), 47, detail)
+        # 基线 55 − 风险 7 = 48(地理维度只标记,不进分数)
+        self.assertEqual(self.score(detail), 48, detail)
         self.assertEqual(state, "warn", detail)
 
     def test_geo_ambiguity_is_not_blamed_on_the_user(self):
@@ -282,7 +306,7 @@ esac''')
         state, detail, _ = self.run_detail()
         self.assertIn("地理模糊", detail)
         self.assertNotIn("时区不符", detail)
-        self.assertEqual(self.score(detail), 56, detail)  # 60 − 4
+        self.assertEqual(self.score(detail), 55, detail)  # 基线 55,地理维度不扣分
 
     def test_residential_is_never_geo_penalised(self):
         """家宽的注册地与接入地本来就会不同,那不是风险,也不该扣分。
@@ -365,7 +389,7 @@ esac''')
         """查不到就不写缓存 —— 否则一次网络抖动会把「未知」钉住一整天。"""
         self.stub_net("", "", "", "")
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v3"
+        cache = self.home / ".claude-switcher" / "purity-cache.v4"
         if cache.exists():
             self.assertNotIn("203.0.113.10", cache.read_text(encoding="utf-8"))
 
@@ -490,10 +514,10 @@ esac''')
         """
         self.stub_net(RESIDENTIAL, _ipapi("Denver", countryCode="US"), IPINFO_RESID)
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v3"
-        self.assertTrue(cache.exists(), "没写 v3 缓存")
+        cache = self.home / ".claude-switcher" / "purity-cache.v4"
+        self.assertTrue(cache.exists(), "没写 v4 缓存")
         fields = cache.read_text(encoding="utf-8").strip().split("|")
-        self.assertEqual(len(fields), 7, "v3 应是 7 列,实际 %d: %s" % (len(fields), fields))
+        self.assertEqual(len(fields), 7, "v4 应是 7 列,实际 %d: %s" % (len(fields), fields))
         self.assertEqual(fields[6], "US")
 
     def test_degraded_result_expires_quickly_instead_of_a_full_day(self):
@@ -507,7 +531,7 @@ esac''')
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("风险源不可达", detail)
-        cache = self.home / ".claude-switcher" / "purity-cache.v3"
+        cache = self.home / ".claude-switcher" / "purity-cache.v4"
         line = cache.read_text(encoding="utf-8").strip()
         fields = line.split("|")
         self.assertEqual(len(fields), 7, fields)
@@ -521,7 +545,7 @@ esac''')
         cache.unlink()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        fresh = (self.home / ".claude-switcher" / "purity-cache.v3").read_text(encoding="utf-8")
+        fresh = (self.home / ".claude-switcher" / "purity-cache.v4").read_text(encoding="utf-8")
         rows = [r for r in fresh.strip().splitlines() if r.startswith("203.0.113.10|")]
         self.assertEqual(len(rows), 1, "同一个 IP 不该留下两条缓存")
         remaining = 86400 - (int(time.time()) - int(rows[0].split("|")[1]))
@@ -567,31 +591,62 @@ esac''')
         self.assertEqual(state, "ok", detail)
         self.assertNotIn("硬门槛:", detail)
         # 两次跑的是同一个夹具 IP,不删缓存第二次会直接读到住宅那条结果。
-        (self.home / ".claude-switcher/purity-cache.v3").unlink(missing_ok=True)
+        (self.home / ".claude-switcher/purity-cache.v4").unlink(missing_ok=True)
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertNotIn("硬门槛:", detail)
 
 
-    def test_clean_carrier_is_not_labelled_hosting(self):
-        """两家风险源明确否定机房时,不能只凭「名字不在住宅白名单」报机房。
+    def test_clean_carrier_is_residential_like_the_reference_site(self):
+        """两家风险源都明确否认证机房时按住宅判 —— 与 ip.net.coffee 同口径。
 
-        用户原话:「我们的出口ip评分也不对」。实测 66.17.65.38 的 ipquery
-        is_datacenter:false / risk_score:0、ip-api hosting:false、ipinfo 报
-        AS3257 GTT,界面却给「评分 60/100 · 机房 · 建议换住宅 IP」。
-        修法不授予住宅分(假绿更危险),只退回「类型不明」的 70 分基线。
+        用户原话:「其他地方检查都是住宅 ip,我们却提示是机房 ip」。
+        实测 66.17.65.38:ipquery 报 is_datacenter:false / risk_score:0、
+        ip-api 报 hosting:false / proxy:false、ipinfo 报 AS3257 GTT;
+        ip.net.coffee 判它「住宅 98/100」,我们却给
+        「ASN 属性:疑似机房 · 建议换住宅节点」和「评分 70/100 · 类型不明」。
+
+        依据是**正面证据**:两家风险源都可达、标志全否、risk_score ≤10、无滥用记录、
+        运营商名里没有机房词。缺任何一条就退回类型不明(70 分 warn) —— 不是
+        「没查到就把人放行」。
         """
         self.write_env("America/New_York")
         self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
                                             timezone="America/New_York"),
                       IPINFO_CARRIER)
         state, detail, _ = self.run_detail()
-        self.assertEqual(state, "warn", detail)
-        self.assertEqual(self.score(detail), 70, detail)
-        self.assertIn("类型不明", detail)
+        self.assertEqual(state, "ok", detail)
+        self.assertEqual(self.score(detail), 100, detail)
+        self.assertIn("住宅宽带", detail)
         self.assertNotIn("机房", detail)
         self.assertNotIn("建议换住宅 IP", detail)
+
+    def test_single_risk_source_never_labels_hosting(self):
+        """只剩一家风险源时,未收录的运营商名不能变成「机房」。
+
+        ipquery 6 秒超时很常见(免费接口)。那时 src_n=1,旧逻辑会跳过「名字与
+        证据相反」的豁免,把任何不在白名单里的运营商直接判成机房 —— 白名单只覆盖
+        11 个国家的几十家运营商,等于让大部分地区的家宽用户都看到「疑似机房」。
+        """
+        self.write_env("America/New_York")
+        self.stub_net("", _ipapi("Ashburn", countryCode="US",
+                                 timezone="America/New_York"),
+                      IPINFO_CARRIER)
+        state, detail, _ = self.run_detail()
+        self.assertNotIn("机房", detail)
+        self.assertEqual(state, "warn", detail)
+
+    def test_static_ptr_alone_is_not_hosting(self):
+        """PTR 里只有 static 不算机房:家宽开静态 IP 的写法就是这样。
+
+        真正的机房主机名几乎都同时带 cloud/vps/server/dedicated(见
+        test_rdns_hosting_hostname_reveals_hosting 的 cloudzy 样本)。
+        """
+        self.set_ptr("static-1-2-3-4.example.net")
+        self.stub_net(NEUTRAL, _ipapi(), "")
+        _, detail, _ = self.run_detail()
+        self.assertNotIn("机房", detail)
 
     def test_explicit_datacenter_flag_still_wins_over_clean_org(self):
         """有明确的 is_datacenter:true 时仍要判机房 —— 别把门禁一起放松。"""
@@ -618,7 +673,7 @@ esac''')
         lock.mkdir()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v3"
+        cache = base / "purity-cache.v4"
         self.assertTrue(cache.exists(), "陈旧锁之后仍应写入缓存")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertFalse(lock.exists(), "陈旧锁应被回收")
@@ -632,7 +687,7 @@ esac''')
         (lock / "owner").write_text(str(int(time.time())), encoding="utf-8")
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v3"
+        cache = base / "purity-cache.v4"
         self.assertTrue(cache.exists(), "抢不到锁也要落盘,不能丢掉结果")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertTrue(lock.exists(), "活锁不该被别人抢走")

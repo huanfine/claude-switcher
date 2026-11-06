@@ -234,9 +234,13 @@ directory (from a killed process) silently blocked every cache write for hours,
 so each check re-queried four sources and the score drifted with the network;
 and operators outside the residential whitelist were always labelled
 "datacenter" even when all three sources said `is_datacenter:false`. Stale
-locks older than 60 seconds are now reclaimed, and an explicit "not a
-datacenter" verdict falls back to a neutral 70-point baseline (`warn`), never
-to a residential score.
+locks older than 60 seconds are now reclaimed. The type is now decided by
+evidence, not by name: a whitelist hit is residential, an explicit
+datacenter/cloud/backbone keyword in the operator name is datacenter, and
+when both risk sources deny hosting with a low risk score the exit is scored
+as residential — the same call ip.net.coffee makes. Only when the evidence is
+incomplete does it fall back to the neutral 70-point `warn` baseline. The
+geography dimension is flagged but no longer deducted from the score.
 
 The score is IP reputation; whether the exit is usable for Claude is decided
 separately by hard gates, so the two can diverge. Under the `reject` policy UDP

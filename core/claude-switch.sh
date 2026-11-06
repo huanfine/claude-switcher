@@ -2122,10 +2122,19 @@ ip_org() {
     printf '%s' "$IP_ORG"
 }
 
-# 出口类型:residential(运营商宽带) / hosting(机房) / unknown。
+# 出口类型:residential(运营商宽带) / hosting(机房) / unknown(未归类)。
 # 参考 net.coffee 的 Claude Code 指南第 2 条:家宽 IP 定期变动是正常网络行为,
 # 机房 IP 变动才是风控信号。所以「IP 变了」这件事不能一律同等对待 ——
 # 拿同一个阈值套两种出口,结果就是家宽用户天天看到假警报、机房用户没被提醒。
+#
+# **默认值必须是 unknown,不能是 hosting。** 以前这里是「不在住宅白名单就算机房」,
+# 代价在 2026-11-06 实测到了:66.17.65.38(AS3257 GTT)三家源一致说
+# is_datacenter:false / hosting:false / risk_score:0,ip.net.coffee 判它
+# 「住宅 98/100」,而我们的界面显示「ASN 属性:疑似机房 · 建议换住宅节点」。
+# 白名单只收录 11 个国家的几十家运营商,它永远覆盖不完 —— 拿「没收录」当
+# 「是机房」,等于把所有非主流运营商用户都误报一遍。
+# 现在的口径:白名单命中 → residential;名字里带明确的机房/云/托管/骨干词 →
+# hosting;其余 → unknown(由调用方按保守口径处理,不扣帽子)。
 ip_class() {
     local o
     # 先把 org 串归一:转小写、去掉空格和逗号。
@@ -2151,7 +2160,13 @@ ip_class() {
         *deutschetelekom*|*telefonicagermany*|*o2germany*|\
         *bellcanada*|*rogers*|*telus*|*shawcommunications*|\
         *telstra*|*optus*|*tpg*|*iinet*) printf 'residential' ;;
-        *) printf 'hosting' ;;
+        # 明确的机房/托管/云/骨干/IDC 关键词。这一条是「正面证据」,
+        # 也是原来那个 hosting 默认值的正确用法:命中才叫机房。
+        *hosting*|*datacenter*|*datacentre*|*colocation*|*colocrossing*|*server*|*vps*|\
+        *cloud*|*dedicated*|*backbone*|*transit*|*cdn*|*telehouse*|*equinix*|\
+        *digitalocean*|*linode*|*vultr*|*hetzner*|*ovh*|*leaseweb*|*racknerd*|\
+        *choopa*|*contabo*|*amazon*|*google*|*microsoft*|*alibaba*|*tencent*) printf 'hosting' ;;
+        *) printf 'unknown' ;;
     esac
 }
 
@@ -2238,7 +2253,10 @@ ip_purity() {
     # 查不到不写缓存,否则一次网络抖动会把「未知」钉住一整天。
     # 文件名带 v3:第 7 列是出口国家代码。v2 的 6 列没有它,混读会让 detail
     # 把「|US」吞进去,宁可让旧缓存作废(v3 同时清掉 v2 里被钉住 24h 的降级结果)。
-    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v3" ]; then
+    # v4:类型判定改成证据驱动(见 ip_class 与 clean_residential)。改判定的同时
+    # 不换文件名,升级后 24 小时内会继续读到「类型不明 / 机房」这种旧结论 ——
+    # 用户重装完还是老样子,只能以为我们又没修好。改口径必须让旧缓存失效。
+    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v4" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
@@ -2246,7 +2264,7 @@ ip_purity() {
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v3"
+        done < "$BASE/purity-cache.v4"
     fi
 
     local q1 q2 q3 q4 b1 b2 b3 b4 rdns=""
@@ -2348,19 +2366,31 @@ ip_purity() {
         *hsd*|*dynamic*|*dhcp*|*broadband*|*adsl*|*ppp*|*dial*|*dsl*|*fiber*|*cable*) resid_hint=1 ;;
     esac
     case "$rdns" in
-        *static*|*cloud*|*vps*|*dedicated*|*server*|*hosting*|*datacenter*|*colo*) host_hint=1 ;;
+        *cloud*|*vps*|*dedicated*|*server*|*hosting*|*datacenter*|*datacentre*|*colo*) host_hint=1 ;;
     esac
-    # 名字不在住宅白名单时 ip_class 一律回 hosting(保守默认:宁可少收录,
-    # 也不能把真机房洗成住宅)。但两家风险源都明确答「不是机房/不是托管」时,
-    # 再按默认把人钉成机房就是假阳性:实测 GTT(AS3257)的三份响应写着
-    # is_datacenter:false / hosting:false / risk_score:0,界面却报
-    # 「评分 60/100 · 机房 · 机房出口风险偏高,建议换住宅 IP」。
-    # 这里不授予住宅分(那才是危险的假绿),只退回「类型不明」的 70 分基线,
-    # 判定依旧是 warn —— 门槛一点没松,只是不再凭名字冤枉人。
+    # 单独一个 static 不再算机房特征。家宽开静态 IP 的 PTR 到处都是
+    # `static-1-2-3-4.isp.example.net` 这种写法,拿它判机房等于给静态家宽扣帽子;
+    # 真正的机房主机名几乎都同时带 cloud/vps/server/dedicated 这类词(见上一条)。
+    # 名字不在住宅白名单、但两家风险源都明确答「不是机房/不是托管」时,
+    # 不能按名字把人钉成机房:实测 GTT(AS3257)三份响应写着 is_datacenter:false /
+    # hosting:false / risk_score:0,界面却报「机房 · 建议换住宅 IP」。
+    # 这里先记一笔「名字说的和证据相反」,交给下面的类型判定去给 unknown。
     local name_only_host=""
     if [ -z "$dc" ] && [ -z "$host_hint" ] && [ "$asn_kind" = "hosting" ] \
        && [ "$src_n" -ge 2 ]; then
         name_only_host=1
+    fi
+    # 「民用宽带」也要正面证据,不能靠「没查到问题」默认放行:
+    #   两家风险源都答了(src_n>=2) + 有运营商名 + 所有风险标志全否
+    #   + risk_score 有值且 ≤10 + 无滥用记录 + 运营商名里没有机房词。
+    # 这几条同时成立时,判住宅是 ip.net.coffee 的同款口径(它对 GTT 这种干净骨干
+    # 也给「住宅 98」);任何一条缺失就退回 unknown(70 分 warn),不洗成满分。
+    local clean_residential="" ok_risk="" ok_abuse=""
+    if [ "$src_n" -ge 2 ] && [ -n "$asn_org" ] && [ "$asn_kind" != "hosting" ] \
+       && [ -z "$dc" ] && [ -z "$host_hint" ] && [ -z "$px" ] && [ -z "$tor" ] && [ -z "$mob" ]; then
+        case "${risk:-}" in ''|*[!0-9]*) ok_risk="" ;; *) [ "$risk" -le 10 ] && ok_risk=1 ;; esac
+        case "${abfreq:-}" in ''|*[!0-9]*|0) ok_abuse=1 ;; *) ok_abuse="" ;; esac
+        [ -n "$ok_risk" ] && [ -n "$ok_abuse" ] && clean_residential=1
     fi
     if [ -n "$tor" ]; then
         type=tor
@@ -2373,14 +2403,19 @@ ip_purity() {
         type=mobile
     elif [ -n "$resid_hint" ] || [ "$asn_kind" = "residential" ]; then
         type=residential
+    elif [ -n "$clean_residential" ]; then
+        type=residential
     fi
 
-    # 基线分:直接对齐 ip.net.coffee 的实测落点,让两边的数字可比。
+    # 基线分:取 ip.net.coffee 实测区间的中位数,让两边的数字能直接比。
+    # 上一版把 VPN/机房/Tor 的基线抬高了 5~14 分(75/60/50),理由是「别把门焊死」;
+    # 但判定本来就不看这几个数(代理和 Tor 直接 fail,机房固定 warn),抬基线只
+    # 有一个后果:同一个 IP 我们报 60 分、网站报 55 分,用户以为我们算错了。
     local base
     case "$type" in
-        tor)         base=50 ;;
-        vpn)         base=75 ;;
-        hosting)     base=60 ;;
+        tor)         base=46 ;;   # 网站实测 43~50
+        vpn)         base=65 ;;   # 61~69
+        hosting)     base=55 ;;   # 51~58
         mobile)      base=85 ;;
         residential) base=100 ;;
         # 类型不明不给满分,也不当机房:70 分落在「良好」档,提示但不拦。
@@ -2427,13 +2462,17 @@ ip_purity() {
     local c1 c2 c3 ncities
     c1=$(_ipfield "$b1" city); c2=$(_ipfield "$b2" city); c3=$(_ipfield "$b3" city)
     ncities=$(printf '%s\n%s\n%s\n' "$c1" "$c2" "$c3" | grep -v '^$' | sort -u | wc -l | tr -d ' ')
+    #    这一维只标不改分。原因是它和「时区」检查项、以及出口国家一致性都在说
+    #    同一件事,扣一次分等于重复计费(2026-11-06 用户原话:「评分和网站上的不一致」——
+    #    ip.net.coffee 的 Trust Score 不含地理维度,我们多扣 4~6 分,两边就没法比)。
+    #    标记保留:它是「这次的地理画像本身模糊」的证据,只是不再影响分数。
     case "$type" in
         residential|tor|vpn) ;;   # 这三类的城市不反映用户位置,整段跳过
         *)
             if [ "${ncities:-0}" -ge 2 ]; then
-                pen=$((pen+4)); flags="$flags ·地理模糊"
-            elif [ "${ncities:-0}" -lt 2 ] && [ -n "$tzip" ] && [ -n "${TZ_TARGET:-}" ] && [ "$tzip" != "$TZ_TARGET" ]; then
-                pen=$((pen+6)); flags="$flags ·时区不符"
+                flags="$flags ·地理模糊"
+            elif [ -n "$tzip" ] && [ -n "${TZ_TARGET:-}" ] && [ "$tzip" != "$TZ_TARGET" ]; then
+                flags="$flags ·时区不符"
             fi ;;
     esac
 
@@ -2546,12 +2585,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「五分钟重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v3.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v3" 2>/dev/null
+        tmp="$BASE/purity-cache.v4.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v4" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v3" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v4" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null
@@ -3293,7 +3332,14 @@ checkdetail() {
         case "$(ip_class "$org")" in
             residential) optional_result "ASN属性" ok "$org" ;;
             hosting)     optional_result "ASN属性" warn "疑似机房($org) · 建议换住宅节点" ;;
-            *)           optional_result "ASN属性" warn "未获取" ;;
+            # 名字不在名单里 ≠ 机房。以前这一支输出「未获取」,配合 ip_class 的
+            # hosting 默认值,把一个三家源都说干净的 GTT 出口报成机房。
+            # 现在只把「没归类」说清楚,结论交给下面那项按证据判的 IP 纯净度。
+            *) if [ -n "$org" ]; then
+                   optional_result "ASN属性" ok "$org · 运营商未归类(未命中机房名单)"
+               else
+                   optional_result "ASN属性" warn "未获取"
+               fi ;;
         esac
     fi
     # 14. IP 纯净度(出口类型 × 代理特征 × Tor × 地域一致,给一个能解释的 0-100)
