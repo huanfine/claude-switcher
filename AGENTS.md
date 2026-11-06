@@ -132,6 +132,8 @@
 - 升级走 `scripts/upgrade-core.sh`，唯一对外入口是 `bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)`：旧版 `self_update` 写死原上游 `YOURSJEYO/claude-switcher`，**不能**指望用户跑 `update` 自愈。脚本从本仓库 `main` 拉 `core/claude-switch.sh` + `SHA256SUMS`，校验哈希、`bash -n`、备份旧脚本、`_support env-migrate` 迁移环境配置、落盘后跑 `help` / `status` 自检；单一 `EXIT` trap + `DONE` 成功标记保证任一步失败都从备份回滚。别用 `ERR` trap —— `die` 走 `exit 1` 时它不触发。
 - **旧核心不能阻断切账号**：`optimizeNodeForSwitch` 里扫描失败仍 `done(true)`，只是把「核心脚本过旧，未扫描节点」写进回执。版本错配时把人卡在旧账号上，比跳过节点优化更糟。
 - `scripts/package-macos.sh` 必须把 `scripts/upgrade-core.sh` 和 `SHA256SUMS` 一起放进 installer-kit，并列入必备文件检查；只装过 app-only 的人也要有这条急救路径。改 kit 清单要同步改 `tests/test_upgrade_core.py` 的文档/命令契约断言。
+- **界面上的每一条结论都来自 `~/.local/bin/claude-switch.sh`，App 不内置任何判型。** 所以「App 里还显示机房 / 类型不明」这类反馈，第一步永远是 `shasum -a 256 ~/.local/bin/claude-switch.sh` 对一下 `SHA256SUMS`，而不是去改 App 或界面。2026-11-06 实测：同一台机器、同一个出口 `66.17.65.38`(AS3257)，旧核心报「疑似机房 · 70/100 类型不明」，仓库里的核心报「运营商未归类 · 100/100 住宅宽带」—— 同一次 `checkdetail`，只差脚本版本。桌面 App 停在 1.8.3-dev 而核心停在更早版本，是「改了没用」最常见的组合：App 只影响界面与交互，判据全在脚本里。
+- 别拿仓库里的新版核心往真实 `$HOME` 里跑来做「实机复核」：`check` / `checkdetail` 会写 `~/.claude-switcher/last-check.txt` 与 `iphistory.log`，把用户真实状态覆盖成一次测试的产物。要复核用临时 HOME（`HOME=/tmp/x bash core/claude-switch.sh checkdetail`，把 `env.json` 复制进去即可），跑完不留痕。
 
 ## WebRTC 策略自锁与 IP 评分的证据边界
 
@@ -198,7 +200,13 @@ IP 纯净度那侧是独立的证据 bug，别和上面混：
 5. **`TERM`/`INT` 的 trap 里必须 `exit`**。bash 的 trap 执行完会回到被中断的地方继续跑，只删 pidfile 不 `exit` 的话，App 的 `terminate()` 压根停不下看门狗——实测就是这样每重启一次 App 就多一个孤儿守护，各自拿一份基线判出口。`EXIT` 分支只做清理，不要 `exit`（会递归）。
 6. **定位看门狗只认 pidfile，不用 `pkill -f "claude-switch.sh watch"`**。`-f` 匹配整条命令行，任何命令行里含这串字的进程都会被误杀——包括用户自己的 `grep`、`tail`，以及诊断命令本身。实测踩到过，表现为「正在跑的 shell 突然收到 SIGTERM」。App 侧读 pidfile 后还要用 `ps -p <pid> -o command=` 确认一次，避免 pid 复用误杀无关进程。
 
-拦截后的提醒走三条路：窗口横幅、菜单栏图标（换成 `exclamationmark.shield.fill`）、系统通知。**通知不能省**——出问题时用户多半没开着窗口，前两条都看不见。通知走 `osascript display notification` 而不是 `UNUserNotificationCenter`：App 是 ad-hoc 签名，重签名后通知授权会失效。
+拦截后的提醒走三条路：窗口横幅、菜单栏图标、系统通知。**通知不能省**——出问题时用户多半没开着窗口，前两条都看不见。通知走 `osascript display notification` 而不是 `UNUserNotificationCenter`：App 是 ad-hoc 签名，重签名后通知授权会失效。
+
+**菜单栏图标是状态指示器，不是品牌装饰**（2026-11-06 更正：这段以前写的是「换成 `exclamationmark.shield.fill`」，早就不是了）。现在是 `MenuBarBrand` 自绘的 18pt 模板图：正常态「实心盾 + 挖空十二射线星芒」，拦截态「实心盾 + 挖空感叹号」。两条判据：
+
+- 看到菜单栏是**盾牌加感叹号**，不要当成「星芒没生效」的缺陷去查图标资源 —— 那是拦截态在如实工作。正确的下一步是 `~/.claude-switcher/incidents.log` 最后一条，那里写着被拦的真实原因。
+- 拦截态**故意**不画星芒：18pt 下星芒挖空前只剩 8pt，与正常态区分不出来，而状态图标的第一职责是「一眼看出出没出事」。试过保留星芒的四种画法（斜杠划过 / 右下警示点 / 只留上半圈射线 / 星芒+小徽章），四种在 18pt 下要么糊成一团，要么把盾牌边缘啃出缺口，都不如现状。要改先按这个尺寸渲染比对，别凭想象定稿。
+- 代价是它和系统 `exclamationmark.shield.fill` 同形，用户容易以为「图标还是旧的」。这属于状态语义与品牌识别的取舍，**不要靠改图形解决**；真要优化，方向是让「已拦截」这件事更早被用户读到（横幅文案、通知标题），而不是把星芒硬塞回去。
 
 7. **拦截必须留结构化记录**。`stop_claude_now` 末尾调 `watch_incident <原因> <类型>`，写 `incidents.log`：TAB 分隔「时间 / 类型 / 原因」三列，只留最近 50 条。界面的「拦截记录」卡片按 TAB 切列渲染，**列数或分隔符一改，界面就整条丢掉**。`watch.log` 是流水账（启动/复检/接管全在里面），别拿它当历史——用户想回看「上次为什么被停」时，从几百行里捞是灾难。空原因不写：一条只有时间的记录只会把真记录挤出 50 条窗口。
 

@@ -242,6 +242,18 @@ as residential — the same call ip.net.coffee makes. Only when the evidence is
 incomplete does it fall back to the neutral 70-point `warn` baseline. The
 geography dimension is flagged but no longer deducted from the score.
 
+If the app **still** says "datacenter / type unknown" after upgrading, check the
+core script, not the app: every verdict in the UI comes from
+`~/.local/bin/claude-switch.sh`, and the app implements none of the type logic
+itself. An `*-app-only.*` package replaces the app only. Compare
+`shasum -a 256 ~/.local/bin/claude-switch.sh` against `SHA256SUMS` and, if they
+differ, run
+`bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)`.
+Measured on one machine and one exit (`66.17.65.38`, AS3257): the old core
+reported "datacenter, 70/100, type unknown"; the current core reports "operator
+not classified, 100/100, residential broadband". Only the script version
+differed.
+
 The score is IP reputation; whether the exit is usable for Claude is decided
 separately by hard gates, so the two can diverge. Under the `reject` policy UDP
 is rejected at the rule level, so node UDP support is no longer a hard gate.
