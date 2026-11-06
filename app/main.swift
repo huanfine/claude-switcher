@@ -80,26 +80,20 @@ struct HealthSummary {
     let badge: String
     let headline: String
 
+    /// 结论色只回答「能不能启动」，不再按分数分档。
+    ///
+    /// 曾经有过一个 `scoreColor`（≥85 绿 / 60–84 琥珀 / <60 红），本意是让高分
+    /// 不套警告色。但它把两件事绑死在了一起：IP 纯净度低一点，分数掉到 80，
+    /// 环就变琥珀 —— 而徽章明明写着「可以启动」。用户读到的只有颜色，
+    /// 于是「能启动」被显示成「快出事了」。
+    /// 2026-11-06 用户原话：「不要用分数让别人误会，IP 非常不干净按道理还是能启动」。
+    /// 分数仍在 `HealthSummary.score` 里保留（诊断和排序要用），但不再进主视觉。
     var color: Color {
         switch level {
         case .ok: return ClaudeTheme.success
         case .notice: return ClaudeTheme.warning
         case .cannotStart: return ClaudeTheme.error
         }
-    }
-
-    /// 圆环的颜色只由**分数**决定，不由「能不能启动」决定。
-    ///
-    /// 之前 ring 是「全对 → 品牌陶土橙，否则 → 状态色」，而 88 分带两条提示走的是
-    /// `notice` 档 —— 于是 88 分套了一圈**警告色**。百分制里 88 是高分，
-    /// 高分配警告色，颜色语义就反了：用户看到橙色环，读到的却是「快出事了」。
-    ///
-    /// 现在按分档：≥85 绿、60–84 琥珀、<60 红。能不能启动由徽章和结论那句话负责，
-    /// 两件事各说各的，不再共用一个颜色。
-    var scoreColor: Color {
-        if score >= 85 { return ClaudeTheme.success }
-        if score >= 60 { return ClaudeTheme.warning }
-        return ClaudeTheme.error
     }
 
     /// 提示项的轻重顺序。分数对每个警告一视同仁(各扣 6),但「一句话结论」不能一视同仁 ——
@@ -272,7 +266,11 @@ struct HealthSummary {
                 : soft.filter { $0.state == .warn }
             if let worst = pool.min(by: { severity($0) < severity($1) }) {
                 var title = worst.name
-                if let score = shortScore(worst.detail) { title += " \(score) 分" }
+                // 写成「49/100」而不是「49 分」：这是 IP 纯净度的百分制参照分
+                // （对标 ip.net.coffee 的 Trust Score），不是整机健康分。
+                // 裸写「49 分」会被读成「这台机器 49 分」，而同一屏的环里
+                // 已经没有分数了，两个「分」不是一回事。
+                if let score = shortScore(worst.detail) { title += " \(score)/100" }
                 let tail = notices > 1 ? " · 另有 \(notices - 1) 项提示" : ""
                 // 「不影响启动」而不是「不影响使用」:不拦启动是事实,
                 // 但「机房出口对账号没影响」不是我们能替他打的包票。
@@ -2124,7 +2122,7 @@ enum ClaudeTheme {
 // 整屏比原生窗口「胖」一圈 —— 这就是「文字大小和系统不一致」的来源。
 enum Type {
     // 字号（需要参与布局计算的地方用它，别的地方直接用下面的 Font）
-    static let scoreSize: CGFloat = 26
+    static let heroNumberSize: CGFloat = 26
     static let metricSize: CGFloat = 22
     static let titleSize: CGFloat = 17
     static let bodySize: CGFloat = 13
@@ -2135,7 +2133,7 @@ enum Type {
     static let microLineGap: CGFloat = 3   // 12pt 注释
 
     // 显示级（唯一用 SF Rounded 的两处）
-    static let scoreFont = Font.system(size: scoreSize, weight: .semibold, design: .rounded)
+    static let heroNumberFont = Font.system(size: heroNumberSize, weight: .semibold, design: .rounded)
     static let metricFont = Font.system(size: metricSize, weight: .semibold, design: .rounded)
     static let slotLetterFont = Font.system(size: titleSize, weight: .semibold, design: .rounded)
 
@@ -2983,20 +2981,33 @@ struct ContentView: View {
         }
     }
 
-    private var healthScore: Int { healthSummary.score }
+    private var passedCount: Int {
+        vm.rows.filter { $0.state == .ok }.count
+    }
 
     private var healthRingProgress: CGFloat {
         if vm.rows.contains(where: { $0.state == .pending }) && vm.phase == .checking { return 0 }
-        return CGFloat(healthScore) / 100
+        guard !vm.rows.isEmpty else { return 0 }
+        return CGFloat(passedCount) / CGFloat(vm.rows.count)
     }
 
     private var healthRingColor: Color {
-        // 只按分数分档（见 HealthSummary.scoreColor）。原来「全对 → 陶土橙」
-        // 那一档是罪魁：88 分带两条提示落到 notice 分支，整个环套的是警告色。
-        healthSummary.scoreColor
+        // 颜色只回答「能不能启动」。以前按分数分档（≥85 绿 / 60–84 琥珀 / <60 红），
+        // 于是「IP 纯净度偏低、分数掉到 80、徽章明明写着可以启动」这一屏里，
+        // 环套的是琥珀色 —— 两句话互相打架，用户只会记住「环是橙的，不行了」。
+        // 2026-11-06 用户原话：「不要用分数让别人误会，IP 非常不干净按道理还是能启动」。
+        // 分数是 IP 信誉的宽口径度量，和「能否启动」本来就会背离（README 里写着
+        // 65 分的代理会被硬门槛排除、49 分的机房反而可用），不该拿它当红绿灯。
+        healthSummary.color
     }
 
-    /// 圆环 + 分数。比一个大图标更能一眼看出「离满分还差多少」。
+    /// 圆环 + 通过项数。这里**不显示分数**。
+    ///
+    /// 分数是一个「软信号加权」的合成分，而这一屏真正要回答的只有一件事：
+    /// 现在能不能启动 Claude。把两者塞进同一个 80pt 的数字里，必然误导 ——
+    /// 实测场景：IP 纯净度 49 分（转租机房），徽章写「可以启动」，
+    /// 环里却是「80 分」配一圈琥珀色，用户只会得出「不能用了」。
+    /// 现在环里是「15/16 项」，环的颜色只跟能不能启动走。
     private var healthRing: some View {
         ZStack {
             Circle()
@@ -3010,19 +3021,19 @@ struct ContentView: View {
                 ProgressView().scaleEffect(0.6)
             } else {
                 VStack(spacing: -2) {
-                    Text("\(healthScore)")
-                        .font(Type.scoreFont)
+                    Text("\(passedCount)")
+                        .font(Type.heroNumberFont)
                         .monospacedDigit()
                         .foregroundColor(ClaudeTheme.ink)
                         .contentTransition(.numericText())
-                    Text("分")
+                    Text("/\(vm.rows.count) 项")
                         .font(Type.microLabelFont)
                         .foregroundColor(ClaudeTheme.faint)
                 }
             }
         }
         .frame(width: 80, height: 80)
-        .accessibilityLabel("健康分 \(healthScore) 分，\(heroVerdict.text)")
+        .accessibilityLabel("\(vm.rows.count) 项中 \(passedCount) 项通过，\(heroVerdict.text)")
     }
 
     /// 状态徽章:标题右边的小标签。
@@ -3067,8 +3078,6 @@ struct ContentView: View {
     private var exitRegion: String { exitParts.region }
 
     private var heroMetaRow: some View {
-        let ok = vm.rows.filter { $0.state == .ok }.count
-        let showCount = !heroBusy && !vm.intercepted
         let showRegion = !exitIP.isEmpty && !heroBusy && !exitRegion.isEmpty
         return HStack(spacing: 10) {
             if !exitIP.isEmpty && !heroBusy {
@@ -3105,16 +3114,9 @@ struct ContentView: View {
                     .lineSpacing(Type.microLineGap)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            // 通过数跟着元信息走,不甩到卡片最右边 —— 隔着一整个屏宽,
-            // 读者要横跨半个窗口才能把它和 IP 关联起来。
-            if showCount {
-                if !heroDetail.isEmpty || showRegion { separatorDot }
-                Text("\(ok)/\(vm.rows.count) 项通过")
-                    .font(Type.microFont)
-                    .monospacedDigit()
-                    .foregroundColor(ClaudeTheme.faint)
-                    .fixedSize()
-            }
+            // 这里以前还有一句「13/15 项通过」。现在圆环里就是「13 / /15 项」，
+            // 同一屏两个一模一样的数字，读者会以为它们不是一回事（一个讲分值、
+            // 一个讲项数）。通过数只留圆环那一处。
             Spacer(minLength: 0)
         }
     }
