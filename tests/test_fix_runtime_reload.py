@@ -27,6 +27,10 @@ just_reloaded=0
 CALLS="$1"
 VERIFY_MODE="$2"
 WRITE_MODE="$3"
+CLASH_DIR="$(dirname "$CALLS")/clash"
+mkdir -p "$CLASH_DIR/profiles"
+printf 'function main(config) { return config; }\n// claude-switcher managed rules\n' > "$CLASH_DIR/profiles/Script.js"
+printf 'items:\n- uid: ABC\n' > "$CLASH_DIR/profiles.yaml"
 : > "$CALLS"
 rm -f "$CALLS.restarted"
 
@@ -137,6 +141,74 @@ class RuntimeReloadTests(unittest.TestCase):
         tail = tail[:tail.index("    # D.")]
         self.assertIn("*规则没置顶*|*内核缺少*", tail)
         self.assertIn("全局扩展脚本已启用", tail)
+
+
+class RegisterScriptTests(unittest.TestCase):
+    """Clash Verge 只认 profiles.yaml 里注册过的 Script.js。
+
+    文件写了但没有 `uid: Script` 条目时,重启客户端也不会加载它 —— 这正是
+    「配置没变但内核未加载」重启后仍然失败的那一层。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sh = CORE.read_text(encoding="utf-8")
+
+    def run_register(self, clash):
+        base = clash.parent / "base"
+        base.mkdir(exist_ok=True)
+        return subprocess.run(
+            ["/bin/bash", str(CORE), "clash-rules", "register-script",
+             str(clash), str(base), ""],
+            text=True, capture_output=True, timeout=20,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                 "HOME": str(clash.parent)})
+
+    def make_profiles(self, tmp):
+        clash = Path(tmp) / "clash"
+        (clash / "profiles").mkdir(parents=True)
+        (clash / "profiles.yaml").write_text(
+            "# Profiles Config for Clash Verge\n\ncurrent: ABC\nitems:\n"
+            "- uid: ABC\n  type: remote\n  name: test\n  file: ABC.yaml\n",
+            encoding="utf-8")
+        return clash
+
+    def test_registers_missing_global_script_item(self):
+        with tempfile.TemporaryDirectory(prefix="reg-script-") as tmp:
+            clash = self.make_profiles(tmp)
+            run = self.run_register(clash)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            text = (clash / "profiles.yaml").read_text(encoding="utf-8")
+            self.assertIn("- uid: Script", text)
+            self.assertIn("  type: script", text)
+            self.assertIn("  file: Script.js", text)
+            self.assertLess(text.index("- uid: Script"), text.index("- uid: ABC"),
+                            "补注册项要在 items 里,且不能打乱原有条目")
+
+    def test_is_idempotent(self):
+        with tempfile.TemporaryDirectory(prefix="reg-script-") as tmp:
+            clash = self.make_profiles(tmp)
+            self.run_register(clash)
+            run = self.run_register(clash)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertIn("已注册", run.stdout)
+            text = (clash / "profiles.yaml").read_text(encoding="utf-8")
+            self.assertEqual(text.count("uid: Script"), 1)
+
+    def test_restart_block_registers_after_quit_before_open(self):
+        """必须等客户端退出后再改 profiles.yaml,否则会被它退出时写回覆盖。"""
+        fix = self.sh.split("\nfix() {", 1)[1].split("\n}\n", 1)[0]
+        register_at = fix.index("clash_rules register-script")
+        quit_at = fix.rindex("quit_clash_verge", 0, register_at)
+        open_at = fix.index('open -a "Clash Verge"', register_at)
+        self.assertLess(quit_at, register_at)
+        self.assertLess(register_at, open_at)
+
+    def test_failure_dumps_why_instead_of_only_asking_user_to_check(self):
+        fix = self.sh.split("\nfix() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("FIX:诊断:Script.js", fix)
+        self.assertIn("FIX:诊断:profiles.yaml", fix)
+        self.assertIn("FIX:诊断:Clash Verge 版本", fix)
 
 
 if __name__ == "__main__":

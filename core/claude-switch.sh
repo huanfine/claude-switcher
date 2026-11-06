@@ -1056,6 +1056,25 @@ def norm(value):
     return re.sub(r"[\s()_-]+", "", str(value).upper()).replace("&&", ",")
 
 
+def rule_brief(rule):
+    if not isinstance(rule, dict):
+        return "非对象"
+    return "%s|%s|%s" % (rule.get("type", "?"), rule.get("payload", "?"),
+                         rule.get("proxy", "?"))
+
+
+def actual_hint(rules):
+    """失败时把内核首条规则原样带出来。
+
+    「没置顶」有两种完全不同的原因:规则压根没加载(首条是别的),或者加载了但
+    顺序/目标不对。只报一句「没置顶」时,这两种在日志里长得一模一样,只能再让
+    用户跑一轮诊断。这里直接把首条摆出来,一眼就能分开。
+    """
+    if not isinstance(rules, list) or not rules:
+        return "(内核规则为空)"
+    return "(内核首条: " + rule_brief(rules[0]) + ")"
+
+
 def expected_rules():
     rules = [("port", p) for p in PORTS]
     rules.extend(("domain", d) for d in DOMAINS)
@@ -1089,7 +1108,7 @@ def verify_runtime(clash_dir, group, policy):
                     or payload != "NETWORK,UDP,DSTPORT," + str(value)
                     or rule.get("proxy") != target
                     or (rule.get("extra") or {}).get("disabled") is True):
-                fail("运行规则未按策略置顶:UDP/" + str(value))
+                fail("运行规则未按策略置顶:UDP/" + str(value) + actual_hint(rules))
         elif kind == "ip":
             rule = rules[index]
             # mihomo 把 IP-CIDR 和 IP-CIDR6 都报成 IPCIDR,只能靠 payload 里的冒号区分。
@@ -1425,6 +1444,33 @@ def node_select(clash_dir, group, selector, leaf):
     print("OK:已切换到 " + leaf)
 
 
+def register_script(clash_dir):
+    """确保 Clash Verge 把 profiles/Script.js 当作全局脚本加载。
+
+    只写文件是不够的:Clash Verge Rev 以 profiles.yaml 的 item 为索引,没有
+    `uid: Script` / `file: Script.js` 这一项时,那个文件根本不会被读取 ——
+    重启多少次内核里都没有置顶规则,verify 永远报「运行规则未按策略置顶」。
+    只补缺失项,不重排、不删改其它条目。
+    """
+    path = clash_dir / "profiles.yaml"
+    if not path.exists():
+        fail("profiles.yaml 不存在,无法注册全局脚本")
+    text = read_text(path)
+    if re.search(r"(?m)^\s*-\s*uid:\s*Script\s*$", text):
+        print("OK:全局脚本已注册")
+        return 0
+    match = re.search(r"(?m)^items:\s*$", text)
+    if not match:
+        fail("profiles.yaml 缺少 items: 段")
+    block = ("- uid: Script\n  type: script\n  name: null\n"
+             "  file: Script.js\n  updated: %d\n" % int(time.time()))
+    rest = text[match.end():]
+    new = text[:match.end()] + "\n" + block + rest.lstrip("\n")
+    write_changes({path: new})
+    print("OK:已补注册全局脚本(Script.js)")
+    return 0
+
+
 def main():
     if len(sys.argv) < 5:
         fail("内部参数不足")
@@ -1451,6 +1497,10 @@ def main():
         return 0
     if action == "node-select" and len(sys.argv) == 8:
         node_select(clash_dir, group, sys.argv[6], sys.argv[7])
+        return 0
+    # 注册全局脚本不需要代理组,放在 group 校验之前。
+    if action == "register-script":
+        register_script(clash_dir)
         return 0
     if not group or any(char in group for char in ",\r\n"):
         fail("代理组名为空或包含规则分隔符")
@@ -4058,6 +4108,10 @@ ASEOF
         if [ "$need_reload" -eq 1 ]; then
             just_reloaded=1
             quit_clash_verge
+            # 客户端退出后再补注册:运行中改 profiles.yaml 会被它退出时写回覆盖。
+            # Clash Verge 以 profiles.yaml 的 item 为索引,缺 `uid: Script` 时
+            # Script.js 写了也不会被加载 —— 重启多少次内核里都没有置顶规则。
+            clash_rules register-script >/dev/null 2>&1 || true
             open -a "Clash Verge"
             for i in $(seq 1 40); do tun_up && break; sleep 1; done
             local loaded=0
@@ -4069,6 +4123,20 @@ ASEOF
             done
             if [ "$loaded" -ne 1 ]; then
                 echo "FIX:置顶规则 ✗ 未验证内核加载:$rules_result"
+                # 失败原因直接写进日志:下次导出诊断就能定位,不用再让用户跑命令。
+                local sjs="$CLASH_DIR/profiles/Script.js" managed=0
+                [ -f "$sjs" ] && managed=$(grep -c 'claude-switcher managed rules' "$sjs" 2>/dev/null) || managed=0
+                if [ -f "$sjs" ]; then
+                    echo "FIX:诊断:Script.js $(wc -c < "$sjs" | tr -d ' ') 字节,管理块 ${managed:-0} 处"
+                else
+                    echo "FIX:诊断:Script.js 不存在"
+                fi
+                if [ -f "$CLASH_DIR/profiles.yaml" ] && grep -qE '^[[:space:]]*-[[:space:]]*uid:[[:space:]]*Script[[:space:]]*$' "$CLASH_DIR/profiles.yaml"; then
+                    echo "FIX:诊断:profiles.yaml 已注册 uid:Script"
+                else
+                    echo "FIX:诊断:profiles.yaml 未注册 uid:Script —— Clash Verge 不会加载 Script.js"
+                fi
+                echo "FIX:诊断:Clash Verge 版本 $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "/Applications/Clash Verge.app/Contents/Info.plist" 2>/dev/null || echo 未知)"
                 echo "FIX:请检查全局扩展脚本是否启用、代理组是否存在，以及节点 UDP 支持"
                 return 1
             fi
