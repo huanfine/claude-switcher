@@ -9,7 +9,10 @@
   <meta name="theme-color" content="#0B0D14">
   <meta name="description" content="Claude 环境检查器 Web 版环境检测：出口 IP、地区一致性、WebRTC、IPv6、DNS 近似与浏览器指纹，手机浏览器打开即测，零安装。">
   <title>Claude 环境检测 · Web 版</title>
-  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <!-- ?v= 是给浏览器看的：favicon 一旦被抓进图标缓存就很难再刷新，
+       换掉 URL 是唯一可靠的办法（GitHub Pages 的缓存头不在我们手里）。
+       改了 favicon.svg 的内容就顺手把版本号加一。 -->
+  <link rel="icon" href="./favicon.svg?v=2" type="image/svg+xml">
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -19,9 +22,21 @@
     <header class="hero">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none">
-            <path d="M12 2.5 20 5.6v5.3c0 4.9-3.2 8.9-8 10.6-4.8-1.7-8-5.7-8-10.6V5.6L12 2.5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
-            <path d="m8.6 11.8 2.3 2.3 4.6-4.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2.5 20 5.6v5.3c0 4.9-3.2 8.9-8 10.6-4.8-1.7-8-5.7-8-10.6V5.6L12 2.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+    <circle cx="12.00" cy="12.00" r="1.51"/>
+    <polygon points="12.50,12.84 13.01,16.27 12.81,16.32 12.48,16.33 12.28,16.38 11.77,12.95"/>
+    <polygon points="12.99,12.35 15.32,15.10 15.08,15.27 14.74,15.61 14.51,15.79 12.18,13.04"/>
+    <polygon points="12.96,11.83 16.36,12.44 16.35,12.63 16.26,12.93 16.24,13.11 12.83,12.50"/>
+    <polygon points="12.81,11.46 16.27,10.66 16.29,10.85 16.41,11.14 16.43,11.33 12.96,12.13"/>
+    <polygon points="12.49,11.19 15.11,8.72 15.22,8.82 15.35,9.00 15.46,9.10 12.84,11.56"/>
+    <polygon points="12.14,11.02 13.91,8.05 14.08,8.17 14.39,8.32 14.56,8.44 12.79,11.41"/>
+    <polygon points="11.63,11.12 11.33,7.53 11.49,7.49 11.76,7.52 11.92,7.48 12.22,11.07"/>
+    <polygon points="11.24,11.41 9.24,8.44 9.39,8.37 9.59,8.18 9.73,8.11 11.74,11.08"/>
+    <polygon points="11.05,11.79 8.16,9.94 8.25,9.77 8.44,9.53 8.53,9.36 11.42,11.22"/>
+    <polygon points="11.10,12.29 7.41,12.40 7.42,12.26 7.38,12.03 7.39,11.88 11.08,11.77"/>
+    <polygon points="11.47,12.85 8.33,14.91 8.19,14.73 8.02,14.38 7.87,14.20 11.01,12.15"/>
+    <polygon points="12.01,13.03 10.17,16.65 9.94,16.52 9.54,16.35 9.32,16.22 11.16,12.59"/>
           </svg>
         </div>
         <div class="brand-text">

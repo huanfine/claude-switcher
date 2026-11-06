@@ -144,5 +144,68 @@ class ReadmeIconTests(unittest.TestCase):
 
 
 
+class WebBrandMarkTests(unittest.TestCase):
+    """官网那一对品牌位（标签页图标 / 页内标）也必须用同一枚星芒。
+
+    App 图标、菜单栏、窗口标题三处 11-03 就换成了星芒，网页这边却一直停在
+    「盾牌 + 对号」——用户打开官网看到对号、回到 App 看到星芒，同一家公司两枚标。
+    现在两边用**逐字节相同的多边形坐标**（同一张射线表算出来的），这里把它们抠出来比。
+    """
+
+    FAVICON = ROOT / "docs/favicon.svg"
+    PAGE = ROOT / "docs/index.html"
+    POLY = re.compile(r'<polygon points="([^"]+)"')
+
+    def points(self, path):
+        return self.POLY.findall(path.read_text(encoding="utf-8"))
+
+    def test_both_web_marks_draw_twelve_rays(self):
+        for path in (self.FAVICON, self.PAGE):
+            got = self.points(path)
+            self.assertEqual(len(got), 12, f"{path.name} 里读到 {len(got)} 根射线")
+
+    def test_web_rays_are_the_same_polygons(self):
+        self.assertEqual(self.points(self.FAVICON), self.points(self.PAGE),
+                         "favicon.svg 与 index.html 的星芒坐标不一致 —— "
+                         "两处都是手写 SVG，漂移了没人看得出来")
+
+    def test_checkmark_is_gone(self):
+        # 旧的对号路径（页内标与 favicon 各一份），改成星芒后不该再回来。
+        for path in (self.FAVICON, self.PAGE):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("m8.6 11.8", text, f"{path.name} 又画回对号了")
+            self.assertNotIn("m24 32", text, f"{path.name} 又画回对号了")
+
+    def test_page_still_links_the_favicon(self):
+        text = self.PAGE.read_text(encoding="utf-8")
+        self.assertIn('rel="icon"', text, "index.html 丢了 favicon 链接")
+        self.assertIn("favicon.svg", text)
+
+    def test_rays_carry_their_own_fill(self):
+        """射线必须自己带填充色 —— 空手画完就上线踩过一次。
+
+        `fill` 是可继承属性，而这枚标是「盾牌描边 + 星芒实心」的混合体：
+        - favicon 的根 `<svg>` 没写 fill（默认黑），十二根射线于是全黑，
+          压在紫色圆角块上，远看是一团脏点；
+        - 页内标照抄旧代码把根写成 `fill="none"`，射线直接继承成透明 ——
+          页面上只剩一个盾牌轮廓，看着就像「图标根本没换」。
+        两处都得让射线拿到显式的填充色，不能再依赖根节点或 `style="color:…"`。
+        """
+        favicon = self.FAVICON.read_text(encoding="utf-8")
+        self.assertRegex(favicon, r'<g fill="#[0-9A-Fa-f]{3,8}"',
+                         "favicon.svg 的星芒没有显式 fill（写成 style=\"color:…\" 也不会生效）")
+
+        page = self.PAGE.read_text(encoding="utf-8")
+        brand_svg = page[page.index('class="brand-mark"'):]
+        root = re.search(r"<svg[^>]*>", brand_svg)
+        self.assertIsNotNone(root, "index.html 里找不到页内标的 <svg>")
+        self.assertNotIn(
+            'fill="none"', root.group(0),
+            "页内标把根节点的 fill 写成 none，十二根射线会继承成透明",
+        )
+        self.assertIn("currentColor", root.group(0),
+                      "页内标的射线需要 currentColor 才能跟着 .brand-mark 的文字色走")
+
+
 if __name__ == "__main__":
     unittest.main()
