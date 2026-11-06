@@ -123,16 +123,17 @@ tag triggers the release workflow to rebuild and publish every package.
 > may look garbled after unzipping. There too, **use only the top-level
 > `INSTALL.command`** and ignore anything garbled under `installer/`.
 
-### Upgrading an existing install to 1.8.7-dev
+### Upgrading an existing install
 
-The "Repair appears to do nothing" fix in `1.8.7-dev` changed **both** the menu-bar
-app binary **and** `~/.local/bin/claude-switch.sh`. Running
-`scripts/upgrade-core.sh` alone, or installing `*-app-only.*` alone, upgrades only
-half of it and Repair behaves exactly as before.
+Which half changed matters. The "Repair appears to do nothing" fix in `1.8.7-dev`
+changed **both** the menu-bar app binary **and** `~/.local/bin/claude-switch.sh`,
+so running `scripts/upgrade-core.sh` alone (or installing `*-app-only.*` alone)
+upgrades only half of it. Releases that change only the core script (such as
+`1.8.8-dev`) need just the core upgrade.
 
-The simplest path is to re-run the full bundle:
+When in doubt, re-run the full bundle — it is the least error-prone path:
 
-1. Download `*-macos-arm64-full.zip` (currently `1.8.7-dev`) from the
+1. Download `*-macos-arm64-full.zip` from the
    [latest release](https://github.com/huanfine/claude-switcher/releases/latest).
 2. Unzip it and double-click the top-level `INSTALL.command`; enter your login
    password once. The installer overwrites the desktop app, the core script and the
@@ -142,10 +143,12 @@ The simplest path is to re-run the full bundle:
 ```bash
 plutil -extract CFBundleShortVersionString raw "$HOME/Desktop/Claude 环境检查器.app/Contents/Info.plist"
 shasum -a 256 "$HOME/.local/bin/claude-switch.sh"
+curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/SHA256SUMS | grep 'core/claude-switch.sh'
 ```
 
-Expect `1.8.7-dev` and
-`5af135b397e82e7f777f87e386efd72028a09c76848257f3c23197ef8b021ea2`.
+The app version should match the release page, and the core hash should match the
+`SHA256SUMS` line. **Do not copy a hash hardcoded in docs** — the core script
+changes with every fix.
 
 Then click Repair again. The new UI separates "the script never started", "some
 items were fixed but the final re-check failed", and "this item cannot be fixed by
@@ -302,9 +305,9 @@ a node without UDP, non-rule mode, a wrong proxy group — are reported directly
 instead of making you wait through a TUN rebuild. The final line no longer points
 back at the same button.
 
-> This fix is in the core script only; the app binary is unchanged. Machines
-> already running the new UI do **not** need the full bundle again — upgrade the
-> core in place:
+> `1.8.8-dev` changed only the core script; the app binary is unchanged.
+> **Only machines already on 1.8.7-dev** can skip the full bundle and upgrade the
+> core in place. If the UI is older, re-run the full bundle as described above:
 >
 > ```bash
 > bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)

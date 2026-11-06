@@ -104,22 +104,23 @@ shasum -a 256 -c SHA256SUMS-release.txt
 
 > `*-installer-kit.zip` 里仍有 `installer/安装.command` 一类中文名文件，解压后可能显示成乱码；kit 同样**只认根目录的 `INSTALL.command`**，别去点 `installer/` 下的乱码文件。
 
-### 已装过旧版：升级到 1.8.7-dev
+### 已装过旧版：怎么升级
 
-`1.8.7-dev` 修「点了一键修复却没修好」时，**同时改了菜单栏 App 的二进制和 `~/.local/bin/claude-switch.sh` 核心脚本**。所以只跑 `scripts/upgrade-core.sh`、或只装 `*-app-only.*`，都只修到一半，点了修复还是老样子。
+要看这一版改了哪一半。`1.8.7-dev` 修「点了一键修复却没修好」时，**同时改了菜单栏 App 的二进制和 `~/.local/bin/claude-switch.sh` 核心脚本**，那种情况下只跑 `scripts/upgrade-core.sh`、或只装 `*-app-only.*`，都只修到一半；而只改核心脚本的版本（如 `1.8.8-dev`）升核心即可。
 
-最省事的做法是重跑一次一体化包：
+不确定时一律重跑一体化包，最省事也最不容易漏：
 
-1. 从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-arm64-full.zip`（现在就是 `1.8.7-dev`）。
+1. 从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-arm64-full.zip`。
 2. 解压后双击根目录的 `INSTALL.command`，按提示输入一次开机密码。安装器会覆盖桌面 App、核心脚本与守护进程，**不会删除账号槽位数据、快照或代理配置**。
 3. 完全退出菜单栏的旧 App 再重新打开，确认两处版本：
 
 ```bash
 plutil -extract CFBundleShortVersionString raw "$HOME/Desktop/Claude 环境检查器.app/Contents/Info.plist"
 shasum -a 256 "$HOME/.local/bin/claude-switch.sh"
+curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/SHA256SUMS | grep 'core/claude-switch.sh'
 ```
 
-应分别看到 `1.8.7-dev` 和 `5af135b397e82e7f777f87e386efd72028a09c76848257f3c23197ef8b021ea2`。
+App 版本号应与 Release 页面一致，核心脚本哈希应与 `SHA256SUMS` 那一行一致。**别照抄文档里写死的哈希**——核心脚本每次修复都会变。
 
 装好后再点一次「一键修复」。新界面会把「脚本压根没跑起来 / 修好了几项但收尾复测没过 / 这一项脚本本来就修不了」分开写清楚，不再一律显示「脚本执行失败」。若仍不行，在解压目录跑 `bash scripts/diagnose-fix.sh`，把桌面生成的 `claude-fix-diagnosis.txt` 发回来，里面有逐步 `FIX:` 输出和真实退出码。
 
@@ -217,7 +218,7 @@ FIX:WebRTC ✗ UDP 3478 规则没置顶 · 点「一键修复」
 
 现在「无变化」分支会先问一次内核：两边都认了才省下重启；只有「运行规则未按策略置顶」这类**重启真能解决**的失败才重启客户端并等 `verify` 通过；节点不支持 UDP、不在规则模式、代理组不对等重启也没用的原因会直接说明，不白等一次 TUN 重建。收尾也不再叫你点同一个按钮。
 
-> 这次修复只在核心脚本里，界面 App 没有改动。已装新版界面的机器**不必重下整包**，跑一次核心升级即可：
+> 这一版（`1.8.8-dev`）只在核心脚本里改，界面 App 没有改动。**仅限已经装了 1.8.7-dev 的机器**不必重下整包，跑一次核心升级即可；界面版本落后更多时仍按上一节重跑 full 包：
 >
 > ```bash
 > bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
