@@ -2985,11 +2985,9 @@ struct ContentView: View {
         vm.rows.filter { $0.state == .ok }.count
     }
 
-    // 这里原本还有两个辅助属性：healthRingProgress（满环比例）与 healthRingColor
-    // （整圈一个颜色，按 HealthSummary.Level 取）。改成一段一项之后它们都没有引用者了：
-    // 进度不再是「一圈走多少」，而是 16 段各自的颜色；环的颜色也不再是一个值。
-    // healthRingColor 存在的唯一理由是「别按分数染色」，而现在连这个自由度都没了 ——
-    // 每一段的颜色只由那一项自己的状态决定，分数根本进不来。
+    // 环色只有一处来源：`healthSummary.color`（ok / notice / cannotStart）。
+    // 曾经有过 scoreColor（≥85 绿 / 60–84 琥珀 / <60 红），结果「分数 80、徽章写
+    // 可以启动」这一屏里整圈是琥珀色 —— 见 HealthSummary.color 上的注释。
 
     /// 圆环 + 通过项数。这里**不显示分数**。
     ///
@@ -2998,69 +2996,65 @@ struct ContentView: View {
     /// 实测场景：IP 纯净度 49 分（转租机房），徽章写「可以启动」，
     /// 环里却是「80 分」配一圈琥珀色，用户只会得出「不能用了」。
     ///
-    /// 画法是**一段一项**：16 段弧，段间留 2.5° 缝，每段的颜色取该项自己的状态。
-    /// 为什么不画一条连续的进度弧 —— 「X of N」是离散计数，连续弧在 15/16 时
-    /// 只差 6%，眼睛根本看不出少了一项，等于把「哪一项没过」这个信息扔掉；
-    /// 分段则是把「N 项」这个分母直接画出来。这也是同类组件的通行做法
-    /// （Mantine 的 RingProgress 就是 sections + sectionGap，按段着色）。
-    ///
-    /// 数字排版按 KPI 卡的通行比例：值与分母约 2:1，分母同色但降饱和。
-    /// 旧版是「16」+「/16 项」两行，两个 16 挨着、斜杠贴着分母往下沉，
-    /// 读起来得先解析一次才知道哪个是通过数。
+    /// 环本身的排布（2026-11-06 用户：「圆形没问题，是你之前排布太丑」）：
+    ///   · 环径 92、描边 3 —— 原来是 80 / 5，粗环配大字像仪表盘；细环才像工具；
+    ///   · 弧是**连续**的，不是分段。试过 16 段（一段一项）：段长只比缝宽一点，
+    ///     整体读起来是「加载中的虚线 spinner」，比原来更廉价，已否决；
+    ///   · 环内**一行**「16/16」+ 一行「项通过」。原来两行是「16」和「/16 项」，
+    ///     两个 16 挨着、斜杠贴着分母往下沉，得先解析一次才知道哪个是通过数；
+    ///     现在分母跟主数字同基线、斜杠两侧留 3pt，「16/16」是一个整体；
+    ///   · 值与分母约 2:1，分母用中间那档灰（8.8:1）而不是最浅的 faint（4.6:1）——
+    ///     12pt 下 faint 太浅，扫一眼会读成「16」而不是「16/16」。
+    ///   · 单位（项通过）留在环内：挪到环外会把整个左块顶高，卡片看着左高右低。
     private var healthRing: some View {
-        let total = CGFloat(max(vm.rows.count, 1))
-        return ZStack {
-            ForEach(vm.rows.indices, id: \.self) { i in
-                Circle()
-                    .trim(from: CGFloat(i) / total + Self.ringGap,
-                          to: CGFloat(i + 1) / total - Self.ringGap)
-                    .stroke(ringStateColor(vm.rows[i].state),
-                            style: StrokeStyle(lineWidth: 5.5, lineCap: .butt))
-                    .rotationEffect(.degrees(-90))
-                    .animation(.easeInOut(duration: Motion.emphasis), value: vm.rows[i].state)
-            }
+        ZStack {
+            Circle()
+                .stroke(ClaudeTheme.hairline, lineWidth: Self.ringStroke)
+            Circle()
+                .trim(from: 0, to: ringProgress)
+                .stroke(healthSummary.color,
+                        style: StrokeStyle(lineWidth: Self.ringStroke, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .animation(.easeInOut(duration: Motion.emphasis), value: ringProgress)
             if heroBusy {
                 ProgressView().scaleEffect(0.6)
             } else {
-                VStack(spacing: 0) {
-                    HStack(alignment: .firstTextBaseline, spacing: 1.5) {
+                VStack(spacing: 3) {
+                    // 分子分母拼进**同一个 Text**，而不是 HStack 两段。
+                    // HStack 靠 firstTextBaseline 对基线，斜杠那一段的字体度量
+                    // 会让它看起来「浮」在数字上方；拼成一串就没有这个问题，
+                    // 字距和基线都由排版引擎自己算，「16/16」是一个整体。
+                    (
                         Text("\(passedCount)")
-                            .font(.system(size: 24, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
+                            .font(.system(size: 26, weight: .semibold))
                             .foregroundColor(ClaudeTheme.ink)
-                            .contentTransition(.numericText())
-                        Text("/\(vm.rows.count)")
-                            .font(.system(size: 12.5, weight: .medium, design: .rounded))
-                            .monospacedDigit()
-                            // 分母用中间那一档灰（8.8:1），不用最浅的 faint（4.6:1）：
-                            // 12.5pt 下 faint 太浅，扫一眼会读成「16」而不是「16/16」。
+                        + Text("/\(vm.rows.count)")
+                            .font(.system(size: 13.5, weight: .regular))
                             .foregroundColor(ClaudeTheme.muted)
-                    }
+                    )
+                    .monospacedDigit()
+                    .tracking(-0.4)
+                    .contentTransition(.numericText())
                     Text("项通过")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: 10.5, weight: .regular))
                         .tracking(0.8)
                         .foregroundColor(ClaudeTheme.faint)
-                        .padding(.top, 2)
                 }
             }
         }
-        .frame(width: 88, height: 88)
+        .frame(width: Self.ringSize, height: Self.ringSize)
         .accessibilityLabel("\(vm.rows.count) 项中 \(passedCount) 项通过，\(heroVerdict.text)")
     }
 
-    /// 段间缝隙占整圈的比例：2.5° ≈ 0.00694。
-    /// 试过 4°/3°/2.5°：4° 起就散成虚线（读着像「加载中」），2.5° 还能看出分段又不散。
-    private static let ringGap: CGFloat = 2.5 / 360
+    /// 环径与描边。92 / 3 是「环是边框、数字是主体」的那一档；
+    /// 再粗就会盖过环里的字，再细在小尺寸下会断续。
+    private static let ringSize: CGFloat = 92
+    private static let ringStroke: CGFloat = 3
 
-    /// 一段的颜色 = 这一项自己的状态，和分数无关。
-    /// 过=绿、提示=琥珀、不合格=红、跳过/未跑=浅灰（留着位置，说明「有这一项」）。
-    private func ringStateColor(_ state: RowState) -> Color {
-        switch state {
-        case .ok: return ClaudeTheme.ok
-        case .warn: return ClaudeTheme.warn
-        case .fail, .config: return ClaudeTheme.bad
-        case .skip, .pending: return ClaudeTheme.hairline
-        }
+    /// 走多少圈。仍是「通过项数 / 总项数」，不是分数。
+    private var ringProgress: CGFloat {
+        guard !vm.rows.isEmpty else { return 0 }
+        return CGFloat(passedCount) / CGFloat(vm.rows.count)
     }
 
     /// 状态徽章:标题右边的小标签。
