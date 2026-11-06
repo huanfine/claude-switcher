@@ -532,7 +532,12 @@ struct MenuBarModelTests {
                 try expect(three.score == 70, "纯净度 49 → 身份 30 分，应为 70，实际 \(three.score)")
                 try expect(three.headline.contains("IP 纯净度") || three.headline.contains("IP纯净度"),
                            "结论要点纯净度，实际 \(three.headline)")
-                try expect(three.headline.contains("49 分"), "量级要带出来，实际 \(three.headline)")
+                // 2026-11-06:这里改成「49/100」而不是「49 分」。首页的环里已经
+                // 不再有任何分数,这句话如果再裸写「49 分」,读者会把它当成
+                // 「这台机器 49 分」—— 又回到「分数让人误会」那个坑里。
+                // 量级仍然必须带出来,只是要标明它是百分制参照分。
+                try expect(three.headline.contains("49/100"),
+                           "量级要带出来，且标明是百分制参照分，实际 \(three.headline)")
                 try expect(three.headline.contains("另有 2 项提示"), "另外两项一句话带过，实际 \(three.headline)")
 
                 // 权重的三条性质,分开钉住 —— 以后谁调权重,这几条会立刻告诉他
