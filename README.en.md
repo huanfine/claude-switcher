@@ -279,6 +279,40 @@ bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/mai
 It runs `fix` once for real (an admin password prompt may appear) and records
 every step, the exit code and a follow-up check.
 
+## "Rules already up to date" and "UDP 3478 rule not pinned" together
+
+This contradiction in `last-fix.log` is easy to miss:
+
+```text
+FIX:置顶规则 ✓ 规则已是最新,未重启客户端
+FIX:WebRTC ✗ UDP 3478 规则没置顶 · 点「一键修复」
+```
+
+`write_merge_rules` only compares `Script.js` / `Merge.yaml` on disk and reports
+"no change"; `clash_rules verify` reads `/rules` from the **running kernel**. After
+a cold client start, a TUN rebuild, or the global extension script being disabled,
+the files are correct but the kernel never loaded them. The old logic saw "no
+change", skipped the restart, and the final re-test failed every single time —
+while telling you to "click Repair", i.e. the button you had just clicked.
+
+The "no change" branch now asks the kernel first: only when both agree is the
+restart skipped. A `rules not pinned` failure (which a restart can actually fix)
+restarts the client and waits for `verify` to pass. Causes a restart cannot fix —
+a node without UDP, non-rule mode, a wrong proxy group — are reported directly
+instead of making you wait through a TUN rebuild. The final line no longer points
+back at the same button.
+
+> This fix is in the core script only; the app binary is unchanged. Machines
+> already running the new UI do **not** need the full bundle again — upgrade the
+> core in place:
+>
+> ```bash
+> bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
+> ```
+>
+> Verify afterwards with `shasum -a 256 ~/.local/bin/claude-switch.sh` against the
+> repository `SHA256SUMS`.
+
 ## Usage
 
 1. Open the desktop app and wait for the 16 checks.

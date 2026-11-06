@@ -300,6 +300,24 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 - **非零退出抹掉回执**：`fix()` 收尾 `WebRTC ✗` 会 `return 1`，而 App 旧代码对任何非零退出都 `fixStates = [:]` + `phase = .failed`，把「已修好 8 项」显示成「脚本执行失败（退出码 1）」。判定依据只能是完整输出里有没有**唯一**的 `FIX:修复流程结束`：有 = 流程跑完，保留回执、点名剩余项并复查；没有 = 启动阶段就退出，才显示原始错误 + 可操作提示。流式 `onLine` 跑在后台队列，必须回主线程改 `@Published`，并在 `done` 里用完整输出幂等重放一次。
 - **诊断包看不到失败点**：`export-diagnostics` 的 `client.log` 白名单只留 `command=... exit=... duration_ms=...`，`recent-status.json` 只有状态摘要，两者都定位不了 `fix` 卡在哪一行。App 现在把 `fix` 原始输出写到 `~/Library/Logs/claude-switcher/last-fix.log`（0600），导出时经 `safe_fix_log()` 白名单 + IP/IPv6/本机路径/URL/凭据脱敏后作为 `last-fix.log` 入包。**新增任何输出文件都要先过这道脱敏，别整份塞进 zip。** 文件不存在（旧版 App / 还没点过修复）要静默跳过。
 
+## 第四层根因：「规则已是最新」≠ 内核已加载（1.8.7-dev 之后）
+
+`last-fix.log` 里同时出现 `FIX:置顶规则 ✓ 规则已是最新,未重启客户端` 与
+`FIX:WebRTC ✗ UDP 3478 规则没置顶 · 点「一键修复」` 时，别再回头查 python3 / 回执 / 诊断导出
+——那三层已经修好了。这是 `write_merge_rules`（只比较磁盘上的 `Script.js` / `Merge.yaml`，
+返回「无变化」）与 `clash_rules verify`（读运行中内核的 `/rules`）判的不是同一个东西：
+客户端冷启动、TUN 重建、全局扩展脚本被临时关掉时，文件对而内核没加载。
+
+- `fix()` B2 的 `*无变化*` 分支**必须先跑一次 `clash_rules verify`**，只有内核也认了才允许跳过重启。
+- 只有 `*未按策略置顶*` 这类重启能解决的失败才设 `need_reload=1`；节点不支持 UDP、非 rule 模式、
+  代理组不存在、控制接口读不到时重启也修不好，直接说明原因，别让用户白等一次 TUN 重建。
+- `just_reloaded=1` 必须紧贴 `quit_clash_verge`（`test_fix_waits_for_egress_only_after_a_real_restart`
+  按 60 字符窗口断言），且只在真重启过时置位，C 段的路由收敛等待才不会拖慢省钱路径。
+- 收尾 `FIX:WebRTC ✗` 不能再照抄 `rule_fix_hint` 的「点「一键修复」」——那是刚刚点过的同一个按钮，
+  会构成无限循环；`*规则没置顶*|*内核缺少*` 要改指「确认全局扩展脚本已启用」。
+- 回归见 `tests/test_fix_runtime_reload.py`：直接抽 core 里真实的 B2 段用桩执行，别抄一份脚本。
+- 这类修复只动核心脚本时，**不要让用户重下整包**：界面 App 没变，`upgrade-core.sh` 升核心即可。
+
 ## 维护者本机纪律（Agent 必须遵守）
 
 **除非维护者在当次对话中明确要求，否则不得更新/部署维护者本机的已安装版本。** 具体包括：

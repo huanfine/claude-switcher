@@ -4025,41 +4025,55 @@ ASEOF
         echo "FIX:全局模式,置顶规则不适用(全部流量已走代理) ✓"
     elif [ "$PROXY_MODE" = "clash-verge" ]; then
         echo "FIX:写入全局扩展脚本(保留已有 main 与无关配置)..."
-        local rules_result
+        local rules_result verify_err need_reload=0
         if ! rules_result=$(write_merge_rules 2>&1); then
             echo "FIX:置顶规则 ✗ $rules_result"
             return 1
         fi
         case "$rules_result" in
             *无变化*)
-                # 规则本来就是最新的 —— **不重启客户端**。
-                #
-                # 重启不是免费的:内核要重起、TUN 要重建,那十几秒里所有走 TUN 的
-                # 请求全部失败。而 fix 后面紧跟着就用 curl 验 WebRTC 和出口,
-                # 于是刚重启完必然连着两条 ✗。用户点一次「修复」,看到的是
-                # 「WebRTC 未修复 + 出口无/未知」—— 比修之前还糟,自然会再来点一次。
-                echo "FIX:置顶规则 ✓ 规则已是最新,未重启客户端"
-                ;;
-            *)
-                just_reloaded=1
-                quit_clash_verge
-                open -a "Clash Verge"
-                for i in $(seq 1 40); do tun_up && break; sleep 1; done
-                local loaded=0
-                # 15 次 × 1 秒:内核起来 + 加载全局脚本 + 建 TUN,实测最慢要 8~10 秒。
-                # 原来只等 5 次,冷启动时必红 —— 而那正是用户最想让它成功的时候。
-                for i in $(seq 1 15); do
-                    if rules_result=$(clash_rules verify 2>&1); then loaded=1; break; fi
-                    sleep 1
-                done
-                if [ "$loaded" -ne 1 ]; then
-                    echo "FIX:置顶规则 ✗ 未验证内核加载:$rules_result"
-                    echo "FIX:请检查全局扩展脚本是否启用、代理组是否存在，以及节点 UDP 支持"
-                    return 1
-                fi
-                echo "FIX:置顶规则 ✓ 已验证内核实际加载"
-                ;;
+                # 「配置文件没变」≠「运行中的内核已经加载了它」。客户端冷启动、
+                # TUN 重建、Merge/Script 被临时关掉时,文件是对的而 /rules 里
+                # UDP 3478 规则没置顶。旧逻辑在这里直接打勾跳过重启,收尾
+                # webrtc_status 的 verify 又必然失败,于是「规则已是最新 ✓」和
+                # 「UDP 3478 规则没置顶 ✗ · 点「一键修复」」永远同时出现,
+                # 用户再点几次都停在原地。先问一次内核,只有它也认了才省下重启。
+                if verify_err=$(clash_rules verify 2>&1); then
+                    # 重启不是免费的:内核重起、TUN 重建那十几秒里所有走 TUN 的
+                    # 请求都会失败,而 fix 后面紧跟着就用 curl 验 WebRTC 和出口。
+                    echo "FIX:置顶规则 ✓ 规则与内核都已就绪,未重启客户端"
+                else
+                    case "$verify_err" in
+                        *未按策略置顶*)
+                            echo "FIX:配置没变但内核未加载规则,正在重启客户端..."
+                            need_reload=1 ;;
+                        *)
+                            # 节点不支持 UDP / 不在 rule 模式 / 代理组不对 / 控制接口
+                            # 读不到:这些重启也解决不了,别让用户白等一次 TUN 重建。
+                            echo "FIX:置顶规则 ⚠ 内核校验未通过且重启无法解决:$verify_err" ;;
+                    esac
+                fi ;;
+            *) need_reload=1 ;;
         esac
+        if [ "$need_reload" -eq 1 ]; then
+            just_reloaded=1
+            quit_clash_verge
+            open -a "Clash Verge"
+            for i in $(seq 1 40); do tun_up && break; sleep 1; done
+            local loaded=0
+            # 15 次 × 1 秒:内核起来 + 加载全局脚本 + 建 TUN,实测最慢要 8~10 秒。
+            # 原来只等 5 次,冷启动时必红 —— 而那正是用户最想让它成功的时候。
+            for i in $(seq 1 15); do
+                if rules_result=$(clash_rules verify 2>&1); then loaded=1; break; fi
+                sleep 1
+            done
+            if [ "$loaded" -ne 1 ]; then
+                echo "FIX:置顶规则 ✗ 未验证内核加载:$rules_result"
+                echo "FIX:请检查全局扩展脚本是否启用、代理组是否存在，以及节点 UDP 支持"
+                return 1
+            fi
+            echo "FIX:置顶规则 ✓ 已验证内核实际加载"
+        fi
     elif [ "$PROXY_MODE" != "flclash" ] && ! route_ok; then
         echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
     fi
@@ -4113,7 +4127,14 @@ ASEOF
         # (STUN 探针只回 IPv4,而这条线路是 v6 出口)。用 ✗ 会让界面把它
         # 打成红色「需手动」,而用户根本没有任何手动动作可做。
         warn:*) echo "FIX:WebRTC ⚠ ${wr#warn:}" ;;
-        *)      echo "FIX:WebRTC ✗ ${wr#fail:}"; fix_failed=1 ;;
+        *)      local hint="${wr#fail:}"
+                case "$hint" in
+                    *规则没置顶*|*内核缺少*)
+                        # 这行是刚刚那次「一键修复」的收尾;再叫用户点一次同一个
+                        # 按钮,等于把「修不好」做成一个无限循环。指向真能动手的地方。
+                        hint="${hint% · 点「一键修复」*} · 请在 $(proxy_name) 里确认全局扩展脚本已启用" ;;
+                esac
+                echo "FIX:WebRTC ✗ $hint"; fix_failed=1 ;;
     esac
 
     # D. 出口IP最终验证 —— 优先用刚刚那一枪的 trace,不再重打一次。

@@ -204,6 +204,27 @@ bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/mai
 
 它会原样跑一次 `fix`（可能弹一次管理员密码框），记录每一步、退出码和复查结果。
 
+## 「规则已是最新」和「UDP 3478 规则没置顶」同时出现
+
+这是 `last-fix.log` 里最容易被忽略的一种自相矛盾：
+
+```text
+FIX:置顶规则 ✓ 规则已是最新,未重启客户端
+FIX:WebRTC ✗ UDP 3478 规则没置顶 · 点「一键修复」
+```
+
+`write_merge_rules` 只比较磁盘上的 `Script.js` / `Merge.yaml`，内容没变就回报「无变化」；`clash_rules verify` 读的却是**运行中内核**的 `/rules`。客户端冷启动、TUN 重建、或全局扩展脚本被临时关掉时，文件是对的、内核里却没那条置顶规则。旧逻辑一见「无变化」就打勾跳过重启，收尾复测必然再次失败，还叫你「点「一键修复」」——点多少次都停在原地。
+
+现在「无变化」分支会先问一次内核：两边都认了才省下重启；只有「运行规则未按策略置顶」这类**重启真能解决**的失败才重启客户端并等 `verify` 通过；节点不支持 UDP、不在规则模式、代理组不对等重启也没用的原因会直接说明，不白等一次 TUN 重建。收尾也不再叫你点同一个按钮。
+
+> 这次修复只在核心脚本里，界面 App 没有改动。已装新版界面的机器**不必重下整包**，跑一次核心升级即可：
+>
+> ```bash
+> bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)
+> ```
+>
+> 升级后用 `shasum -a 256 ~/.local/bin/claude-switch.sh` 与仓库 `SHA256SUMS` 核对。
+
 ## 日常使用
 
 1. 双击桌面应用图标 → 等 16 项检查；硬性项全绿再选账号启动，红项用「一键修复」。
