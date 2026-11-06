@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -161,8 +162,14 @@ class UpgradeDocsContractTests(unittest.TestCase):
         packer = (PROJECT / "scripts/package-macos.sh").read_text(encoding="utf-8")
         self.assertIn('cp "$ROOT/scripts/upgrade-core.sh"', packer)
         self.assertIn('cp "$ROOT/SHA256SUMS"', packer)
-        self.assertIn("scripts/upgrade-core.sh; do", packer,
-                      "kit 必备文件检查要覆盖升级脚本")
+        # 以前钉死 `"scripts/upgrade-core.sh; do"` 这个结尾,往必备清单里加第二个
+        # 脚本就会假失败。改成解析整个 `for ITEM in \ ... ; do` 块再逐项断言。
+        kit_loop = re.search(r"for ITEM in \\\n(.*?); do", packer, re.S)
+        self.assertIsNotNone(kit_loop, "找不到 kit 必备文件检查循环")
+        required = kit_loop.group(1)
+        for item in ("scripts/upgrade-core.sh", "scripts/diagnose-fix.sh"):
+            with self.subTest(item=item):
+                self.assertIn(item, required, f"kit 必备文件检查要覆盖 {item}")
 
     def test_upgrade_script_fetches_from_this_fork(self):
         text = SCRIPT.read_text(encoding="utf-8")
