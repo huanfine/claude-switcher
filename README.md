@@ -102,6 +102,27 @@ shasum -a 256 -c SHA256SUMS-release.txt
 | `scripts/upgrade-core.sh` | 旧机器只升级核心，不碰账号数据 |
 | `*-windows.zip` / `*-linux.tar.gz` | Windows / Linux Beta |
 
+> `*-installer-kit.zip` 里仍有 `installer/安装.command` 一类中文名文件，解压后可能显示成乱码；kit 同样**只认根目录的 `INSTALL.command`**，别去点 `installer/` 下的乱码文件。
+
+### 已装过旧版：升级到 1.8.7-dev
+
+`1.8.7-dev` 修「点了一键修复却没修好」时，**同时改了菜单栏 App 的二进制和 `~/.local/bin/claude-switch.sh` 核心脚本**。所以只跑 `scripts/upgrade-core.sh`、或只装 `*-app-only.*`，都只修到一半，点了修复还是老样子。
+
+最省事的做法是重跑一次一体化包：
+
+1. 从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-arm64-full.zip`（现在就是 `1.8.7-dev`）。
+2. 解压后双击根目录的 `INSTALL.command`，按提示输入一次开机密码。安装器会覆盖桌面 App、核心脚本与守护进程，**不会删除账号槽位数据、快照或代理配置**。
+3. 完全退出菜单栏的旧 App 再重新打开，确认两处版本：
+
+```bash
+plutil -extract CFBundleShortVersionString raw "$HOME/Desktop/Claude 环境检查器.app/Contents/Info.plist"
+shasum -a 256 "$HOME/.local/bin/claude-switch.sh"
+```
+
+应分别看到 `1.8.7-dev` 和 `5af135b397e82e7f777f87e386efd72028a09c76848257f3c23197ef8b021ea2`。
+
+装好后再点一次「一键修复」。新界面会把「脚本压根没跑起来 / 修好了几项但收尾复测没过 / 这一项脚本本来就修不了」分开写清楚，不再一律显示「脚本执行失败」。若仍不行，在解压目录跑 `bash scripts/diagnose-fix.sh`，把桌面生成的 `claude-fix-diagnosis.txt` 发回来，里面有逐步 `FIX:` 输出和真实退出码。
+
 ### 从源码安装
 
 **系统要求**：macOS 13+ · Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3 · 出口国家不能是 CN。

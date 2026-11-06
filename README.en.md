@@ -119,6 +119,41 @@ build from source), `*-app-only.dmg` (UI only), `scripts/upgrade-core.sh` (upgra
 a stale core in place), `*-windows.zip` / `*-linux.tar.gz` (Beta). Pushing a `v*`
 tag triggers the release workflow to rebuild and publish every package.
 
+> The kit still contains Chinese-named files such as `installer/安装.command`, which
+> may look garbled after unzipping. There too, **use only the top-level
+> `INSTALL.command`** and ignore anything garbled under `installer/`.
+
+### Upgrading an existing install to 1.8.7-dev
+
+The "Repair appears to do nothing" fix in `1.8.7-dev` changed **both** the menu-bar
+app binary **and** `~/.local/bin/claude-switch.sh`. Running
+`scripts/upgrade-core.sh` alone, or installing `*-app-only.*` alone, upgrades only
+half of it and Repair behaves exactly as before.
+
+The simplest path is to re-run the full bundle:
+
+1. Download `*-macos-arm64-full.zip` (currently `1.8.7-dev`) from the
+   [latest release](https://github.com/huanfine/claude-switcher/releases/latest).
+2. Unzip it and double-click the top-level `INSTALL.command`; enter your login
+   password once. The installer overwrites the desktop app, the core script and the
+   daemons, and **does not delete account slots, snapshots, or proxy settings**.
+3. Fully quit the old menu-bar app, reopen it, and verify both halves:
+
+```bash
+plutil -extract CFBundleShortVersionString raw "$HOME/Desktop/Claude 环境检查器.app/Contents/Info.plist"
+shasum -a 256 "$HOME/.local/bin/claude-switch.sh"
+```
+
+Expect `1.8.7-dev` and
+`5af135b397e82e7f777f87e386efd72028a09c76848257f3c23197ef8b021ea2`.
+
+Then click Repair again. The new UI separates "the script never started", "some
+items were fixed but the final re-check failed", and "this item cannot be fixed by
+script" instead of showing one generic "script failed". If it still does not work,
+run `bash scripts/diagnose-fix.sh` from the unzipped folder and send back
+`claude-fix-diagnosis.txt` from the Desktop; it contains every `FIX:` line and the
+real exit code.
+
 ### From source
 
 Requirements: macOS 13 or later, a proxy client with TUN support (Clash Verge,
