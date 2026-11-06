@@ -65,7 +65,9 @@ repository, command-line script, and build artifact name.
 - **IP purity score** — an explainable 0–100 score from four independent data
   sources plus local PTR, with degraded verdicts when sources are unreachable.
   A low score is a soft signal: it never decides whether Claude can start, so
-  the home screen shows passed-check counts instead of an overall score.
+  the home screen shows passed-check counts instead of an overall score — one
+  arc segment per check, colored by that check's own state, so a single failed
+  item is visible at a glance instead of costing 6% of a continuous ring.
 - **Node scan and gated apply** — read-only ranking of the current Selector's
   candidate nodes; applying the best node requires a fresh real-time gate,
   re-checks the exit country, and rolls back on any failed step.

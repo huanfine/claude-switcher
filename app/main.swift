@@ -2985,55 +2985,82 @@ struct ContentView: View {
         vm.rows.filter { $0.state == .ok }.count
     }
 
-    private var healthRingProgress: CGFloat {
-        if vm.rows.contains(where: { $0.state == .pending }) && vm.phase == .checking { return 0 }
-        guard !vm.rows.isEmpty else { return 0 }
-        return CGFloat(passedCount) / CGFloat(vm.rows.count)
-    }
-
-    private var healthRingColor: Color {
-        // 颜色只回答「能不能启动」。以前按分数分档（≥85 绿 / 60–84 琥珀 / <60 红），
-        // 于是「IP 纯净度偏低、分数掉到 80、徽章明明写着可以启动」这一屏里，
-        // 环套的是琥珀色 —— 两句话互相打架，用户只会记住「环是橙的，不行了」。
-        // 2026-11-06 用户原话：「不要用分数让别人误会，IP 非常不干净按道理还是能启动」。
-        // 分数是 IP 信誉的宽口径度量，和「能否启动」本来就会背离（README 里写着
-        // 65 分的代理会被硬门槛排除、49 分的机房反而可用），不该拿它当红绿灯。
-        healthSummary.color
-    }
+    // 这里原本还有两个辅助属性：healthRingProgress（满环比例）与 healthRingColor
+    // （整圈一个颜色，按 HealthSummary.Level 取）。改成一段一项之后它们都没有引用者了：
+    // 进度不再是「一圈走多少」，而是 16 段各自的颜色；环的颜色也不再是一个值。
+    // healthRingColor 存在的唯一理由是「别按分数染色」，而现在连这个自由度都没了 ——
+    // 每一段的颜色只由那一项自己的状态决定，分数根本进不来。
 
     /// 圆环 + 通过项数。这里**不显示分数**。
     ///
     /// 分数是一个「软信号加权」的合成分，而这一屏真正要回答的只有一件事：
-    /// 现在能不能启动 Claude。把两者塞进同一个 80pt 的数字里，必然误导 ——
+    /// 现在能不能启动 Claude。把两者塞进同一个数字里必然误导 ——
     /// 实测场景：IP 纯净度 49 分（转租机房），徽章写「可以启动」，
     /// 环里却是「80 分」配一圈琥珀色，用户只会得出「不能用了」。
-    /// 现在环里是「15/16 项」，环的颜色只跟能不能启动走。
+    ///
+    /// 画法是**一段一项**：16 段弧，段间留 2.5° 缝，每段的颜色取该项自己的状态。
+    /// 为什么不画一条连续的进度弧 —— 「X of N」是离散计数，连续弧在 15/16 时
+    /// 只差 6%，眼睛根本看不出少了一项，等于把「哪一项没过」这个信息扔掉；
+    /// 分段则是把「N 项」这个分母直接画出来。这也是同类组件的通行做法
+    /// （Mantine 的 RingProgress 就是 sections + sectionGap，按段着色）。
+    ///
+    /// 数字排版按 KPI 卡的通行比例：值与分母约 2:1，分母同色但降饱和。
+    /// 旧版是「16」+「/16 项」两行，两个 16 挨着、斜杠贴着分母往下沉，
+    /// 读起来得先解析一次才知道哪个是通过数。
     private var healthRing: some View {
-        ZStack {
-            Circle()
-                .stroke(ClaudeTheme.hairline, lineWidth: 5)
-            Circle()
-                .trim(from: 0, to: healthRingProgress)
-                .stroke(healthRingColor, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: Motion.emphasis), value: healthRingProgress)
+        let total = CGFloat(max(vm.rows.count, 1))
+        return ZStack {
+            ForEach(vm.rows.indices, id: \.self) { i in
+                Circle()
+                    .trim(from: CGFloat(i) / total + Self.ringGap,
+                          to: CGFloat(i + 1) / total - Self.ringGap)
+                    .stroke(ringStateColor(vm.rows[i].state),
+                            style: StrokeStyle(lineWidth: 5.5, lineCap: .butt))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeInOut(duration: Motion.emphasis), value: vm.rows[i].state)
+            }
             if heroBusy {
                 ProgressView().scaleEffect(0.6)
             } else {
-                VStack(spacing: -2) {
-                    Text("\(passedCount)")
-                        .font(Type.heroNumberFont)
-                        .monospacedDigit()
-                        .foregroundColor(ClaudeTheme.ink)
-                        .contentTransition(.numericText())
-                    Text("/\(vm.rows.count) 项")
-                        .font(Type.microLabelFont)
+                VStack(spacing: 0) {
+                    HStack(alignment: .firstTextBaseline, spacing: 1.5) {
+                        Text("\(passedCount)")
+                            .font(.system(size: 24, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundColor(ClaudeTheme.ink)
+                            .contentTransition(.numericText())
+                        Text("/\(vm.rows.count)")
+                            .font(.system(size: 12.5, weight: .medium, design: .rounded))
+                            .monospacedDigit()
+                            // 分母用中间那一档灰（8.8:1），不用最浅的 faint（4.6:1）：
+                            // 12.5pt 下 faint 太浅，扫一眼会读成「16」而不是「16/16」。
+                            .foregroundColor(ClaudeTheme.muted)
+                    }
+                    Text("项通过")
+                        .font(.system(size: 10, weight: .medium))
+                        .tracking(0.8)
                         .foregroundColor(ClaudeTheme.faint)
+                        .padding(.top, 2)
                 }
             }
         }
-        .frame(width: 80, height: 80)
+        .frame(width: 88, height: 88)
         .accessibilityLabel("\(vm.rows.count) 项中 \(passedCount) 项通过，\(heroVerdict.text)")
+    }
+
+    /// 段间缝隙占整圈的比例：2.5° ≈ 0.00694。
+    /// 试过 4°/3°/2.5°：4° 起就散成虚线（读着像「加载中」），2.5° 还能看出分段又不散。
+    private static let ringGap: CGFloat = 2.5 / 360
+
+    /// 一段的颜色 = 这一项自己的状态，和分数无关。
+    /// 过=绿、提示=琥珀、不合格=红、跳过/未跑=浅灰（留着位置，说明「有这一项」）。
+    private func ringStateColor(_ state: RowState) -> Color {
+        switch state {
+        case .ok: return ClaudeTheme.ok
+        case .warn: return ClaudeTheme.warn
+        case .fail, .config: return ClaudeTheme.bad
+        case .skip, .pending: return ClaudeTheme.hairline
+        }
     }
 
     /// 状态徽章:标题右边的小标签。
