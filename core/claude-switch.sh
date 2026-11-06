@@ -1166,7 +1166,12 @@ def script_text(path, group, policy):
         pattern = re.compile(re.escape(SCRIPT_BEGIN) + r".*?" + re.escape(SCRIPT_END), re.S)
         if old.index(SCRIPT_END) < old.index(SCRIPT_BEGIN):
             fail("Script.js 中的管理块顺序无效")
-        return pattern.sub(lambda _: block, old, count=1)
+        # 删掉旧块,再把新块追加到**文件末尾**。原地替换有个隐蔽的坏后果:
+        # 用户在管理块之后又写了 main 或规则逻辑时,我们的 IIFE 会先执行,
+        # 随后被后定义的 main 覆盖 —— 文件看着完全正确,内核里却没有置顶规则。
+        # 实测:Script.js 5023 字节(我们那份约 2400),内核首条是用户自己的
+        # ipinfo.io 规则;而脚本每次 write 都报「无变化」,因为块内容确实没变。
+        old = pattern.sub("", old, count=1).rstrip() + "\n"
     if SCRIPT_END in old:
         fail("Script.js 中存在孤立的 claude-switcher 管理块")
     if not old.strip():

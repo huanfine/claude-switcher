@@ -72,9 +72,19 @@ if [ -n "$CLASH_DIR" ]; then
     if [ -f "$CLASH_DIR/profiles/Script.js" ]; then
         say "script_js=$(wc -c < "$CLASH_DIR/profiles/Script.js" | tr -d ' ')bytes"
         say "managed_block=$(count "$CLASH_DIR/profiles/Script.js" 'claude-switcher managed rules')"
+        # 关键:管理块必须在最后一个 main 定义之后。块在前、用户在块后又写了
+        # main 时,我们的 IIFE 会被覆盖,内核里就没有置顶规则。
+        say "script_structure:"
+        grep -nE 'function[[:space:]]+main|claude-switcher managed rules|result\.rules[[:space:]]*=' \
+            "$CLASH_DIR/profiles/Script.js" 2>/dev/null | head -12
     else
         say "script_js=缺失"
         say "managed_block=0"
+    fi
+    if [ -f "$CLASH_DIR/profiles/Merge.yaml" ]; then
+        say "merge_prepend_rules=$(count "$CLASH_DIR/profiles/Merge.yaml" 'prepend-rules')"
+    else
+        say "merge_prepend_rules=0"
     fi
     say "clash_verge_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "/Applications/Clash Verge.app/Contents/Info.plist" 2>/dev/null || echo 未知)"
 else

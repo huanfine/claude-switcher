@@ -143,6 +143,28 @@ class RuntimeReloadTests(unittest.TestCase):
         self.assertIn("全局扩展脚本已启用", tail)
 
 
+class ScriptBlockPlacementTests(unittest.TestCase):
+    """管理块必须在文件末尾执行,否则会被用户在块后写的 main 覆盖。
+
+    实测:用户的 Script.js 5023 字节(我们那份约 2400),块后面还有他自己的
+    逻辑;块原地替换时 IIFE 先跑、随后被覆盖,内核首条成了 ipinfo.io,
+    而 write 每次都报「无变化」—— 文件看上去完全正确。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sh = CORE.read_text(encoding="utf-8")
+        cls.body = cls.sh.split("def script_text(", 1)[1].split("\ndef ", 1)[0]
+
+    def test_old_block_is_removed_then_appended_at_the_end(self):
+        self.assertIn('pattern.sub("", old, count=1)', self.body)
+        self.assertNotIn("pattern.sub(lambda _: block", self.body)
+        self.assertIn('rstrip() + "\\n"', self.body)
+
+    def test_no_early_return_that_keeps_the_block_in_place(self):
+        self.assertNotIn("return pattern.sub(", self.body)
+
+
 class RegisterScriptTests(unittest.TestCase):
     """Clash Verge 只认 profiles.yaml 里注册过的 Script.js。
 
