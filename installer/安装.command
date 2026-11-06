@@ -2,6 +2,13 @@
 # Claude 切换器 - 通用安装程序 (macOS)
 cd "$(dirname "$0")"
 REPO="$(cd .. && pwd)"
+# 版本号只从包里的 VERSION 文件读(打包脚本写入)。以前这里把 1.0 写死在
+# Info.plist 里,于是「现场编译」那条路径装出来的界面全都显示 1.0 —— 排查时
+# 分不清用户装的到底是哪一版,连自检输出都失去意义。
+APP_VERSION="$(head -1 "$REPO/VERSION" 2>/dev/null | tr -d '[:space:]')"
+case "$APP_VERSION" in
+    ''|*[!0-9A-Za-z._-]*) APP_VERSION="0.0.0-dev" ;;
+esac
 H="$HOME"
 # 一体化安装包(*-full.zip)把编译好的 App 一起带上了。检测到就直接复制，
 # 不再要求目标机装 Xcode / swiftc——SwiftUI 宏在部分系统上是装不上的重灾区。
@@ -331,6 +338,7 @@ sed "s|__HOME__|$H|g" "$REPO/daemons/local.claude-update.plist" > "$H/.local/bin
 echo "✓ 核心文件已安装"
 
 # ---- 4. 安装 App 到桌面:一体化包复制随包成品,源码包才现场编译 ----
+APP_VERSION="${APP_VERSION:-0.0.0-dev}"
 APP="$H/Desktop/Claude 环境检查器.app"
 mkdir -p "$H/Desktop"
 pkill -x ClaudeSwitcher 2>/dev/null
@@ -347,7 +355,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 if swiftc -O -parse-as-library -Xfrontend -disable-sandbox -target "$(uname -m)-apple-macos13.0" \
     "$REPO/app/main.swift" -o "$APP/Contents/MacOS/ClaudeSwitcher" \
     -framework SwiftUI -framework AppKit; then
-    echo "✓ App 编译完成"
+    echo "✓ App 编译完成($APP_VERSION)"
 else
     echo "✗ App 编译失败。若日志提示 SwiftUIMacros/插件缺失(macOS 26/27 常见),"
     echo "  请安装完整 Xcode 后执行: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
@@ -375,8 +383,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<key>CFBundleName</key><string>Claude 环境检查器</string>
 	<key>CFBundleDisplayName</key><string>Claude 环境检查器</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0</string>
-	<key>CFBundleVersion</key><string>1</string>
+	<key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
+	<key>CFBundleVersion</key><string>$APP_VERSION</string>
 	<key>LSMinimumSystemVersion</key><string>13.0</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>NSHighResolutionCapable</key><true/>
@@ -385,6 +393,14 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
+fi
+# Finder 的图标缓存按「路径 + inode」记。这里先 rm -rf 再重建同名 bundle,
+# 缓存经常不失效 —— 用户看到的是空白图标,于是以为「图标没打进去」。
+# touch 一下再向 LaunchServices 重新登记,让它丢掉旧记录。
+touch "$APP" 2>/dev/null || true
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
 fi
 echo "✓ App 已放到桌面"
 

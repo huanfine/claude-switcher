@@ -157,6 +157,35 @@ bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/mai
 
 > 账号切换在旧核心下仍可正常使用，只是节点扫描会跳过——不会因此把人卡在旧账号上。
 
+### 升级核心后必须再跑一次 `fix`
+
+`upgrade-core.sh` 只替换脚本，**不碰** Clash Verge 的全局脚本，也不重启客户端。置顶规则写在 `profiles/Script.js` 里，所以升级完要再跑一次：
+
+```bash
+~/.local/bin/claude-switch.sh fix
+```
+
+只升级不跑 `fix`，「规则置顶」会一直红，看起来像「升级完全没用」。若 `fix` 报「无变化」但内核首条仍不是 UDP 规则，说明 Script.js 里还有一段在你管理块之后定义的 `main`，把我们的注入覆盖了——1.8.9 起管理块固定追加到文件末尾，重跑 `fix` 即可修正。判断依据看自检输出的 `script_structure` 段：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/diagnose-install.sh)
+```
+
+自检里的 `expect_sha256` 从发布清单实时取，取不到会写 `unknown` —— 它不再写死某个哈希值，所以「版本不符」这句话本身是可信的。
+
+### 菜单栏看不到图标 / 桌面 App 没有图标
+
+App 是 `LSUIElement`，**设计上就不常驻程序坞**，唯一常驻入口是菜单栏那一项。菜单栏塞满时 macOS 会静默折叠多余的项，于是看起来像「双击了但什么都没发生」。两条退路：
+
+- **双击桌面上的「Claude 环境检查器」** → 直接打开主窗口（不会另起一个进程）。
+- 想在程序坞也留一个入口：菜单里勾「在程序坞显示图标」，或执行
+
+```bash
+defaults write local.claude-switcher showInDock -bool true
+```
+
+桌面上的 App 图标显示成空白，通常是 Finder 图标缓存没跟上（安装器会 `rm -rf` 再同名重建）。1.8.9 起安装器会 `touch` 并重新向 LaunchServices 登记；更早的版本可以手动 `killall Finder`。图标文件本身没坏：`AppIcon.icns` 有 10 个尺寸、约 677 KB，自检的 `icns_bytes` 会打出来。
+
 ## 当前节点不支持 UDP（WebRTC 与「规则置顶」一起红）
 
 HTTP / 部分不支持 UDP 的节点在运行时内核里是 `udp:false`。`proxy` 策略要求节点能承载 UDP（否则 STUN 流量可能直连泄漏），所以 `WebRTC` 和「规则置顶」会一起判 fail，文案也一样——后者其实没在测规则，是被同一道前置校验连坐。

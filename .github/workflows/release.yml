@@ -48,6 +48,12 @@ jobs:
           test "$(plutil -extract CFBundleShortVersionString raw "$PLIST")" = "$VERSION"
           test "$(plutil -extract CFBundleVersion raw "$PLIST")" = "$VERSION"
 
+      # 发布门禁:包里的核心脚本必须等于本次提交的核心脚本。
+      # 1.8.8-dev 就是漏了这一步 —— 包在 02:25 打好,02:59 和 03:16 又合进两个修复,
+      # Latest 上挂的还是旧包,用户下载装完症状一模一样。
+      - name: Release gate
+        run: bash scripts/release-check.sh "$VERSION"
+
       - name: Package Windows and Linux scripts
         run: |
           set -euo pipefail

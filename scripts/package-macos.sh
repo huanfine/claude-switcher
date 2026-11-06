@@ -134,6 +134,11 @@ cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
 cp "$ROOT/scripts/upgrade-core.sh" "$KIT_ROOT/scripts/"
 # 「点了修复没反应」的一键诊断。随包带上,目标机没网也能跑(另可从 main raw 获取)。
 cp "$ROOT/scripts/diagnose-fix.sh" "$KIT_ROOT/scripts/"
+# 只读自检:版本 / App bundle / 图标 / 脚本注册 / 内核首条规则。随包带一份,
+# 用户不必联网也能拿到与包内代码同版本的诊断脚本。
+cp "$ROOT/scripts/diagnose-install.sh" "$KIT_ROOT/scripts/"
+# 安装器从这里读版本号写进 Info.plist。少了它,现场编译出来的界面只能标 0.0.0-dev。
+printf '%s\n' "$VERSION" > "$KIT_ROOT/VERSION"
 cp "$ROOT/SHA256SUMS" "$KIT_ROOT/SHA256SUMS"
 # zip 里的中文名在 macOS「归档实用工具」下会变成乱码(连 zip 写了 UTF-8 标记
 # 也一样)。所以安装入口用纯 ASCII,一体化包更是不留任何中文文件名。
@@ -168,17 +173,28 @@ Needs macOS 13+, Apple Silicon, python3, a running proxy client, Claude desktop.
 装好后若「一键修复」看起来没生效,进入本目录在终端跑一次:
   bash scripts/diagnose-fix.sh
 它会原样执行一次修复并记录每一步,把桌面的 claude-fix-diagnosis.txt 发回即可。
+
+只升级了核心脚本(upgrade-core.sh)的人注意:升级完必须再跑一次
+  ~/.local/bin/claude-switch.sh fix
+因为置顶规则写在 Clash Verge 的全局脚本里,升级本身不会重写它,也不会重启客户端。
+
+只想看状态、不改任何东西,跑这个:
+  bash scripts/diagnose-install.sh
+它会打印核心脚本 sha256 与发布清单里的期望值、App 版本、图标资源、内核首条规则。
+菜单栏看不到图标时也先跑它:App 是 LSUIElement(本来就没有程序坞图标),
+唯一常驻入口是菜单栏;双击桌面 App 会重新打开窗口。
 ASCII_EOF
 chmod +x "$KIT_ROOT/INSTALL.command" "$KIT_ROOT/installer/install.command" \
          "$KIT_ROOT/installer/uninstall.command" \
          "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command" \
-         "$KIT_ROOT/scripts/upgrade-core.sh" "$KIT_ROOT/scripts/diagnose-fix.sh"
+         "$KIT_ROOT/scripts/upgrade-core.sh" "$KIT_ROOT/scripts/diagnose-fix.sh" \
+         "$KIT_ROOT/scripts/diagnose-install.sh"
 for ITEM in \
-    README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS \
+    README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS VERSION \
     INSTALL.command README-INSTALL.txt installer/install.command \
     core/claude-switch.sh daemons/claude-bodyguard.sh installer/安装.command \
     app/main.swift assets/icon-2048.png docs/screenshot.png \
-    scripts/upgrade-core.sh scripts/diagnose-fix.sh; do
+    scripts/upgrade-core.sh scripts/diagnose-fix.sh scripts/diagnose-install.sh; do
     if [ ! -e "$KIT_ROOT/$ITEM" ]; then
         echo "✗ installer kit 缺少 $ITEM" >&2
         exit 1
@@ -221,13 +237,15 @@ PY
     || { echo "✗ 一体化包内 SHA256SUMS 校验失败" >&2; exit 1; }
 chmod +x "$FULL_ROOT/INSTALL.command" \
          "$FULL_ROOT/installer/install.command" "$FULL_ROOT/installer/uninstall.command" \
-         "$FULL_ROOT/scripts/upgrade-core.sh" "$FULL_ROOT/scripts/diagnose-fix.sh"
+         "$FULL_ROOT/scripts/upgrade-core.sh" "$FULL_ROOT/scripts/diagnose-fix.sh" \
+         "$FULL_ROOT/scripts/diagnose-install.sh"
 for ITEM in "INSTALL.command" "README-INSTALL.txt" \
             "ClaudeSwitcher.app/Contents/MacOS/ClaudeSwitcher" \
             "core/claude-switch.sh" "core/stun-probe.py" \
             "daemons/claude-bodyguard.sh" "installer/install.command" \
             "installer/uninstall.command" "scripts/upgrade-core.sh" \
-            "scripts/diagnose-fix.sh" "SHA256SUMS"; do
+            "scripts/diagnose-fix.sh" "scripts/diagnose-install.sh" \
+            "VERSION" "SHA256SUMS"; do
     if [ ! -e "$FULL_ROOT/$ITEM" ]; then
         echo "✗ 一体化安装包缺少 $ITEM" >&2
         exit 1
@@ -235,7 +253,7 @@ for ITEM in "INSTALL.command" "README-INSTALL.txt" \
 done
 for ITEM in "INSTALL.command" "installer/install.command" \
             "installer/uninstall.command" "scripts/upgrade-core.sh" \
-            "scripts/diagnose-fix.sh"; do
+            "scripts/diagnose-fix.sh" "scripts/diagnose-install.sh"; do
     [ -x "$FULL_ROOT/$ITEM" ] || { echo "✗ $ITEM 不可执行" >&2; exit 1; }
 done
 # 构建期硬门禁:一体化包里只要还有一个非 ASCII 文件名,就直接打包失败。

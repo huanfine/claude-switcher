@@ -5117,6 +5117,28 @@ private struct RTTChart: View {
 
 // MARK: - App
 
+// MARK: - 程序坞兜底
+
+/// LSUIElement 的 App 不常驻程序坞,唯一常驻入口就是菜单栏那一项。菜单栏塞满时
+/// macOS 会静默折叠多余的项(没有提示),用户看到的就是「双击了、进程在跑、
+/// 哪里都没有图标」。这里给一个用户能自己扳回来的开关,并持久化到 UserDefaults,
+/// 这样即使菜单栏项已经看不见,也能用一条 defaults write 救回来。
+enum DockPreference {
+    static let key = "showInDock"
+
+    static var enabled: Bool { UserDefaults.standard.bool(forKey: key) }
+
+    static func setEnabled(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: key)
+        apply()
+    }
+
+    /// 启动时和切换开关时都要走这里,避免两处各写一遍激活策略。
+    static func apply() {
+        NSApplication.shared.setActivationPolicy(enabled ? .regular : .accessory)
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let vm: VM
     private(set) var mainWindow: NSWindow?
@@ -5138,7 +5160,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApplication.shared.setActivationPolicy(.accessory)
+        DockPreference.apply()
         vm.onSwitchCompleted = { [weak self] in self?.mainWindow?.orderOut(nil) }
         showMainWindow()
         vm.start()
@@ -5290,6 +5312,13 @@ struct MenuBarContent: View {
             showWindow()
             vm.showSettingsSheet = true
         }
+        // 菜单栏项被系统折叠后,这是唯一还能把入口找回来的办法 ——
+        // 前提是用户还能看见这个菜单,所以同时提供 defaults write 的救急路径。
+        Toggle("在程序坞显示图标", isOn: Binding(
+            get: { DockPreference.enabled },
+            set: { DockPreference.setEnabled($0) }
+        ))
+        .disabled(vm.isBusy)
         Button("导出诊断日志") { vm.exportDiagnostics() }
             .disabled(vm.settingsBusy)
         Divider()
