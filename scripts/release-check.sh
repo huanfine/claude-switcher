@@ -28,7 +28,8 @@ if [ -z "$VERSION" ]; then
     VERSION=$(basename "$LATEST" | sed -E 's/^ClaudeSwitcher-(.+)-macos-[^-]+-full\.zip$/\1/')
 fi
 
-ARCH_LABEL="$(uname -m)"
+# 打包脚本现在产出 universal;旧构建目录没有 ARCH_LABEL 文件时才回退到 uname。
+ARCH_LABEL="$(cat build/ARCH_LABEL 2>/dev/null || uname -m)"
 FULL="build/ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-full.zip"
 KIT="build/ClaudeSwitcher-$VERSION-installer-kit.zip"
 APP_BUNDLE="build/Claude 环境检查器.app"

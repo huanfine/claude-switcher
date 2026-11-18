@@ -1,5 +1,6 @@
 ﻿# Claude 账号切换器 - Windows 核心脚本
 # 用法: powershell -NoProfile -File claude-switch.ps1 check|checkdetail|status|switch A|B|C|D|fix|set-region|set-client|check-update|update-now
+# 报告: checkdetail --json | report [报告]
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
@@ -1036,6 +1037,135 @@ function Add-IpHistory([string]$Ip) {
     [System.IO.File]::WriteAllLines($tmp, $recent, [System.Text.Encoding]::ASCII)
     Move-Item -LiteralPath $tmp -Destination $history -Force
     return $unique.Count
+}
+
+# 报告 v2:Windows 原生离线转换。16 个稳定 ID 与 macOS 契约一致;
+# 本版没有 IP纯净度/更优节点 时如实放进 summary.missing,不伪造通过。
+$script:ReportSpecs = @(
+    [pscustomobject]@{ id = 'proxy_core'; name = '代理内核'; critical = $true },
+    [pscustomobject]@{ id = 'tun'; name = 'TUN网卡'; critical = $true },
+    [pscustomobject]@{ id = 'egress_ip'; name = '出口IP'; critical = $true },
+    [pscustomobject]@{ id = 'ip_stability'; name = 'IP一致'; critical = $false },
+    [pscustomobject]@{ id = 'timezone'; name = '时区'; critical = $true },
+    [pscustomobject]@{ id = 'locale'; name = '地区'; critical = $true },
+    [pscustomobject]@{ id = 'ipv6'; name = 'IPv6'; critical = $true },
+    [pscustomobject]@{ id = 'dns'; name = 'DNS'; critical = $false },
+    [pscustomobject]@{ id = 'webrtc'; name = 'WebRTC'; critical = $false },
+    [pscustomobject]@{ id = 'bodyguard'; name = '保镖'; critical = $true },
+    [pscustomobject]@{ id = 'rules'; name = '规则置顶'; critical = $true },
+    [pscustomobject]@{ id = 'client_language'; name = '客户端语言'; critical = $false },
+    [pscustomobject]@{ id = 'asn'; name = 'ASN属性'; critical = $false },
+    [pscustomobject]@{ id = 'ip_purity'; name = 'IP纯净度'; critical = $false },
+    [pscustomobject]@{ id = 'ecosystem'; name = '生态可达性'; critical = $false },
+    [pscustomobject]@{ id = 'better_node'; name = '更优节点'; critical = $false }
+)
+
+function Get-TextSha256([string]$Text) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text))
+        return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally { $sha.Dispose() }
+}
+
+function Get-CheckReport([string]$Path, [string]$CorePath) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { throw '找不到检查报告' }
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    $now = [DateTimeOffset]::Now
+    $started = $now
+    $first = @($text -split "`r?`n")[0]
+    if ($first -match '^# (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
+        try {
+            $parsed = [DateTime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+            $started = [DateTimeOffset]$parsed
+        } catch {}
+    }
+    $checkedAt = $started.ToString('yyyy-MM-ddTHH:mm:sszzz')
+
+    $observed = [ordered]@{}
+    $order = @()
+    $duplicates = @()
+    foreach ($line in ($text -split "`r?`n")) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#') -or $line -notmatch '^(?<name>[^=]+)=(?<state>ok|warn|fail|skip|config)(?::(?<detail>.*))?$') { continue }
+        $name = $Matches['name'].Trim()
+        if (-not $name) { continue }
+        if ($observed.Contains($name)) {
+            if ($duplicates -notcontains $name) { $duplicates += $name }
+            continue
+        }
+        $observed[$name] = [pscustomobject]@{ state = $Matches['state']; detail = [string]$Matches['detail'] }
+        $order += $name
+    }
+
+    $known = @{}
+    foreach ($spec in $script:ReportSpecs) { $known[$spec.name] = $spec }
+    $checks = New-Object System.Collections.Generic.List[object]
+    foreach ($spec in $script:ReportSpecs) {
+        if (-not $observed.Contains($spec.name)) { continue }
+        $item = $observed[$spec.name]
+        $checks.Add([pscustomobject][ordered]@{
+            id = $spec.id; name = $spec.name; critical = [bool]$spec.critical
+            state = $item.state; evidence = $item.detail; remedy = ''
+            detail = $item.detail; checked_at = $checkedAt; known = $true
+        })
+    }
+    foreach ($name in $order) {
+        if ($known.ContainsKey($name)) { continue }
+        $item = $observed[$name]
+        $checks.Add([pscustomobject][ordered]@{
+            id = 'unknown-' + (Get-TextSha256 $name).Substring(0, 12)
+            name = $name; critical = $false; state = $item.state
+            evidence = $item.detail; remedy = ''; detail = $item.detail
+            checked_at = $checkedAt; known = $false
+        })
+    }
+
+    $missing = @($script:ReportSpecs | Where-Object { -not $observed.Contains($_.name) } | ForEach-Object { $_.name })
+    $missingCritical = @($script:ReportSpecs | Where-Object { $_.critical -and -not $observed.Contains($_.name) } | ForEach-Object { $_.name })
+    $blockers = @($checks | Where-Object { $_.state -eq 'fail' -or $_.state -eq 'config' } | ForEach-Object { $_.name })
+    $criticalBlockers = @($checks | Where-Object { $_.critical -and ($_.state -eq 'fail' -or $_.state -eq 'config') } | ForEach-Object { $_.name })
+    $advisories = @($checks | Where-Object { $_.state -eq 'warn' } | ForEach-Object { $_.name })
+    $skipped = @($checks | Where-Object { $_.state -eq 'skip' } | ForEach-Object { $_.name })
+    $evidenceMissing = @($checks | Where-Object { $_.critical -and $_.state -eq 'ok' -and [string]::IsNullOrWhiteSpace($_.evidence) } | ForEach-Object { $_.name })
+    $verified = @($checks | Where-Object { $_.state -eq 'ok' -or $_.state -eq 'warn' })
+    $verdict = 'established'
+    if ($duplicates.Count -gt 0 -or $blockers.Count -gt 0) { $verdict = 'violated' } elseif ($verified.Count -eq 0 -or $missingCritical.Count -gt 0) { $verdict = 'incomplete' }
+
+    $coreSha = ''
+    if ($CorePath -and (Test-Path -LiteralPath $CorePath)) {
+        try { $coreSha = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch {}
+    }
+    $environment = [ordered]@{
+        proxy_mode = $PROXY_MODE; proxy_group = $PROXY_GROUP; country = $COUNTRY_TARGET
+        timezone = $TZ_TARGET; locale = $LOCALE_TARGET
+    }
+    try { $checksConfig = Get-CheckConfig } catch { $checksConfig = @{ disabled = @(); allowOptionalFailures = $false } }
+    $material = [ordered]@{ platform = 'Windows'; environment = $environment
+        checks = [ordered]@{ disabled = @($checksConfig.disabled); allowOptionalFailures = [bool]$checksConfig.allowOptionalFailures }
+        core_sha256 = $coreSha } | ConvertTo-Json -Depth 6 -Compress
+    $reportId = [guid]::NewGuid().ToString('N')
+    return [pscustomobject][ordered]@{
+        schema = 'claude-switcher-report/2'; protocol = 2
+        report_id = $reportId; run_id = $reportId
+        created_at = $now.ToString('yyyy-MM-ddTHH:mm:sszzz')
+        expires_at = $now.AddMinutes(30).ToString('yyyy-MM-ddTHH:mm:sszzz')
+        config_fingerprint = (Get-TextSha256 $material); core_sha256 = $coreSha
+        core_version = (Get-AppVersion); host = [Environment]::MachineName
+        platform = 'Windows'; verdict = $verdict; environment = $environment
+        checks = $checks.ToArray()
+        summary = [ordered]@{
+            expected = $script:ReportSpecs.Count; total = $checks.Count
+            passed = @($checks | Where-Object { $_.state -eq 'ok' }).Count
+            warning = $advisories.Count; failed = @($checks | Where-Object { $_.state -eq 'fail' }).Count
+            config = @($checks | Where-Object { $_.state -eq 'config' }).Count
+            skipped = $skipped.Count; blockers = $blockers
+            critical_blockers = $criticalBlockers; advisories = $advisories
+            skipped_names = $skipped; missing = $missing
+            missing_critical = $missingCritical; evidence_missing = $evidenceMissing
+            duplicates = $duplicates
+            unknown = @($checks | Where-Object { -not $_.known } | ForEach-Object { $_.name })
+        }
+    }
 }
 
 function Invoke-CheckDetail {
@@ -2479,11 +2609,30 @@ try {
     switch ($command) {
         'checkdetail' {
             $r = @(Invoke-CheckDetail)
-            $r | Out-File -Encoding utf8 "$BASE\last-check.txt"
+            $jsonMode = $args.Count -gt 1 -and [string]$args[1] -eq '--json'
+            if ($jsonMode) {
+                $started = Get-Date
+                $textLines = @("# $($started.ToString('yyyy-MM-dd HH:mm:ss')) pid=$PID 开始") + $r + @('# 结束')
+                $textLines | Out-File -Encoding utf8 "$BASE\last-check.txt"
+                try {
+                    $report = Get-CheckReport "$BASE\last-check.txt" $PSCommandPath
+                    $report | ConvertTo-Json -Depth 8 -Compress | Out-File -Encoding utf8 "$BASE\last-report.json"
+                    Get-Content -LiteralPath "$BASE\last-report.json" -Raw
+                } catch {
+                    $exitCode = 1
+                    '{"schema":"claude-switcher-report/2","protocol":2,"verdict":"incomplete","error":"report generation failed"}'
+                }
+            } else {
+                $r | Out-File -Encoding utf8 "$BASE\last-check.txt"
+                $r
+            }
             $summary = (($r | ForEach-Object {
                 if ($_ -match '^([^=]+)=(ok|warn|fail|skip)(?::.*)?$') { "$($Matches[1])=$($Matches[2])" }
             }) -join ' ')
-            $r
+        }
+        'report' {
+            $reportPath = if ($args.Count -gt 1 -and $args[1]) { [string]$args[1] } else { Join-Path $BASE 'last-check.txt' }
+            Get-CheckReport $reportPath $PSCommandPath | ConvertTo-Json -Depth 8 -Compress
         }
         'check'        { Invoke-Check }
         'status'       { Invoke-Status }
@@ -2519,7 +2668,7 @@ try {
         'export-diagnostics' { Export-Diagnostics $args[1] }
         default        {
             $exitCode = 1
-            "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now|rules-status|get-check-config|set-check-config|export-diagnostics|fingerprint|cli-info|open-safe|diagnose-proxy"
+            "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now|rules-status|get-check-config|set-check-config|export-diagnostics|fingerprint|cli-info|open-safe|diagnose-proxy|report [报告]|checkdetail --json"
         }
     }
 } catch {

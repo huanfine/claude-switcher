@@ -77,14 +77,23 @@ jobs:
             "$GITHUB_WORKSPACE/build/ClaudeSwitcher-${VERSION}-linux.tar.gz" \
             "ClaudeSwitcher-${VERSION}-linux"
 
+      # 两个包此前只被生成、从不检查内容。这里强制包内脚本等于当前仓库,
+      # 并确认 report / checkdetail --json 真的进了产物。
+      - name: Verify Windows and Linux packages
+        run: bash scripts/release-check-platforms.sh "$VERSION"
+
       - name: Generate release checksums
         run: |
           set -euo pipefail
           cd build
+          # 产物名由 package-macos.sh 写入 build/ARCH_LABEL。
+          # 现在是 universal,不再随构建机架构变化。
+          ARCH_LABEL="$(cat build/ARCH_LABEL)"
+          test -n "$ARCH_LABEL"
           shasum -a 256 \
-            "ClaudeSwitcher-${VERSION}-macos-arm64-full.zip" \
-            "ClaudeSwitcher-${VERSION}-macos-arm64-app-only.zip" \
-            "ClaudeSwitcher-${VERSION}-macos-arm64-app-only.dmg" \
+            "ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-full.zip" \
+            "ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-app-only.zip" \
+            "ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-app-only.dmg" \
             "ClaudeSwitcher-${VERSION}-installer-kit.zip" \
             "ClaudeSwitcher-${VERSION}-windows.zip" \
             "ClaudeSwitcher-${VERSION}-linux.tar.gz" \
@@ -95,10 +104,11 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+          ARCH_LABEL="$(cat build/ARCH_LABEL)"
           ASSETS=(
-            "build/ClaudeSwitcher-${VERSION}-macos-arm64-full.zip"
-            "build/ClaudeSwitcher-${VERSION}-macos-arm64-app-only.zip"
-            "build/ClaudeSwitcher-${VERSION}-macos-arm64-app-only.dmg"
+            "build/ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-full.zip"
+            "build/ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-app-only.zip"
+            "build/ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-app-only.dmg"
             "build/ClaudeSwitcher-${VERSION}-installer-kit.zip"
             "build/ClaudeSwitcher-${VERSION}-windows.zip"
             "build/ClaudeSwitcher-${VERSION}-linux.tar.gz"

@@ -195,6 +195,7 @@ class FullPackageTests(unittest.TestCase):
         script = PACKAGER.read_text()
         for needle in (
             "FULL_ZIP=", "FULL_NAME=", "INSTALL.command", "README-INSTALL.txt",
+            'ARCH_LABEL="universal"', "lipo -create", '"$BUILD/ARCH_LABEL"',
             "installer/install.command", "installer/uninstall.command",
             "ClaudeSwitcher.app/Contents/MacOS/ClaudeSwitcher",
             "scripts/make-zip.py", 'ditto "$APP" "$FULL_ROOT/ClaudeSwitcher.app"',
@@ -242,8 +243,11 @@ class FullPackageTests(unittest.TestCase):
 
     def test_release_workflow_publishes_full_zip(self):
         workflow = WORKFLOW.read_text()
-        self.assertIn('"ClaudeSwitcher-${VERSION}-macos-arm64-full.zip" \\', workflow)
-        self.assertIn('"build/ClaudeSwitcher-${VERSION}-macos-arm64-full.zip"', workflow)
+        # 资产名跟 package-macos.sh 写入的 ARCH_LABEL 走。现在是 universal,
+        # 同一份包必须同时能在 Apple Silicon 与 Intel 上启动。
+        self.assertIn('"ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-full.zip" \\', workflow)
+        self.assertIn('"build/ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-full.zip"', workflow)
+        self.assertIn('ARCH_LABEL="$(cat build/ARCH_LABEL)"', workflow)
 
     def test_readme_leads_with_single_package(self):
         readme = README.read_text()

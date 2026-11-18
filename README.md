@@ -77,9 +77,9 @@
 
 ### 装到另一台机器：一个包搞定（推荐）
 
-从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-arm64-full.zip`，解压后**双击 `INSTALL.command`**，按提示确认代理组 / 地区、输入一次开机密码，桌面就出现「Claude 环境检查器」。
+从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-universal-full.zip`，解压后**双击 `INSTALL.command`**，按提示确认代理组 / 地区、输入一次开机密码，桌面就出现「Claude 环境检查器」。
 
-这一个包里已经带上编译好的 App、核心脚本、守护进程与安装器：**不用装 Xcode、不用挑包、不用再跑升级命令**。目标机只需 macOS 13+ / Apple Silicon / python3 / 一个正在运行的代理客户端 / Claude 桌面版。App 是 ad-hoc 签名、未公证，首次被系统拦下时右键点 `INSTALL.command` →「打开」即可（它会顺手清掉下载带来的隔离属性）。
+这一个包里已经带上编译好的 App、核心脚本、守护进程与安装器：**不用装 Xcode、不用挑包、不用再跑升级命令**。目标机只需 macOS 13+ / Apple Silicon 或 Intel（通用二进制） / python3 / 一个正在运行的代理客户端 / Claude 桌面版。App 是 ad-hoc 签名、未公证，首次被系统拦下时右键点 `INSTALL.command` →「打开」即可（它会顺手清掉下载带来的隔离属性）。
 
 > **只认 `INSTALL.command` 这一个入口。** 新版一体化包内所有文件名都是纯 ASCII，解压后根目录只有这一个 `.command`，不会出现乱码。macOS 自带的「归档实用工具」会把旧包里的中文名解成 `ä¸é®åè£.command` 之类，即使 zip 写了 UTF-8 标记也一样——那个文件点不开，也不是入口，**别双击、别在终端里粘贴它**。已经解压了带 `INSTALL.command` 的包无需重下，在该目录执行 `./INSTALL.command` 即可。详见包内 `README-INSTALL.txt`。
 
@@ -97,7 +97,7 @@ shasum -a 256 -c SHA256SUMS-release.txt
 
 | 文件 | 什么时候用 |
 | --- | --- |
-| `*-installer-kit.zip` | Intel Mac，或想从源码自己编译（需 Xcode 命令行工具） |
+| `*-installer-kit.zip` | 想从源码自己编译（需 Xcode 命令行工具） |
 | `*-app-only.dmg` / `.zip` | 只想换界面，核心脚本已经是新版 |
 | `scripts/upgrade-core.sh` | 旧机器只升级核心，不碰账号数据 |
 | `*-windows.zip` / `*-linux.tar.gz` | Windows / Linux Beta |
@@ -110,7 +110,7 @@ shasum -a 256 -c SHA256SUMS-release.txt
 
 不确定时一律重跑一体化包，最省事也最不容易漏：
 
-1. 从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-arm64-full.zip`。
+1. 从 [最新版 Release](https://github.com/huanfine/claude-switcher/releases/latest) 下载 `*-macos-universal-full.zip`。
 2. 解压后双击根目录的 `INSTALL.command`，按提示输入一次开机密码。安装器会覆盖桌面 App、核心脚本与守护进程，**不会删除账号槽位数据、快照或代理配置**。
 3. 完全退出菜单栏的旧 App 再重新打开，确认两处版本：
 
@@ -272,7 +272,9 @@ FIX:WebRTC ✗ UDP 3478 规则没置顶 · 点「一键修复」
 
 | 场景 | 命令 |
 |---|---|
-| 逐项检查 / 静默总检 | `checkdetail` / `check` |
+| 逐项检查 / 静默总检 | `checkdetail` / `check` / `checkdetail --json` |
+| 报告契约 | `report [报告]`（稳定 ID / 证据 / 配置指纹，不重新探测） |
+| 启动租约 | `lease` / `lease-check`（120 秒；绑定报告、环境指纹与核心脚本） |
 | 一键修复 | `fix` |
 | 切账号 / 状态 | `switch A\|B\|C\|D` / `status` |
 | 运行期看门狗 | `watch [间隔] [整轮周期]` |
@@ -284,6 +286,14 @@ FIX:WebRTC ✗ UDP 3478 规则没置顶 · 点「一键修复」
 | 只读体检 | `fingerprint` / `cli-info` / `diagnose-proxy --proxy URL` / `open-safe <url>` |
 | 检查开关 | `get-check-config` / `set-check-config <json>` |
 | 快照 / 诊断 / 更新 | `snapshot-export` · `snapshot-import` / `export-diagnostics <file>` / `update [--check\|--auto]` |
+
+快照导出优先使用加密 DMG；当系统磁盘映像服务不可用时，会自动改写为同样受密码保护的兼容归档，`snapshot-import` 两种格式都能识别。
+
+### 版本化检查报告
+
+`checkdetail --json` 在完成同一轮检查后输出 `claude-switcher-report/2`，并写 `~/.claude-switcher/last-report.json`；`report [报告]` 只把已有文本报告转成同一格式，不重新探测。报告包含 16 个稳定检查 ID、关键性、逐项证据/建议、配置指纹、核心脚本哈希和 30 分钟有效期。旧的文本 `checkdetail`、`verdict` 与 `evidence` 行为不变。App 已优先调用 `checkdetail --json`，按稳定 ID 填行；旧核心忽略参数时复用同一份文本输出，退出码 2 拒绝时才补跑一次文本命令。报告只是检查快照；启动授权走 `lease`，默认 120 秒，并绑定 `report_id` / 配置指纹 / 核心脚本。`switch` 在 `open -a Claude` 前校验租约，拉起后立即撤销；环境、检查开关、节点、槽位或账号变化也会撤销。
+
+报告里的 `probes` 是可选扩展，不参与 `config_fingerprint`，旧报告没有该字段时仍按原语义解析和签发租约。`probes.proxy` 记录正常代理链路的连通性/延迟（`status` / `http_code` / `latency_ms`）；`probes.direct` 在 TUN 开启时固定为 `unknown`，`reason=not_measured_while_tun_up`，不把“没测”写成 0；`probes.drill` 记录最近一次演练的 `tcp` / `dns` / `webrtc` 计数，每项都有 `status`、`success`、`failure`、`elapsed_ms`，探针或命令不可用时这三个数值为 `null`。
 
 排障手册、架构纪律与验收标准见 [AGENTS.md](AGENTS.md)。
 

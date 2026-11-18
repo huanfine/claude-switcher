@@ -134,6 +134,15 @@ claude-switch.ps1 set-check-config '{"disabled":["DNS"],"allowOptionalFailures":
 
 跨身份保留默认关闭。在 `%USERPROFILE%\.claude-switcher\keep-in-workspace.txt` 中每行写一个相对当前 Claude 数据目录的路径（如 `settings.json`、`skills/`），切换时先暂存，再合并到目标账号。绝对路径、盘符路径、`..` 越界和重解析点会跳过；暂存或还原失败会阻止启动，已有 `keep-stage` 不会被覆盖。只共享通用配置，不要放登录态、Cookie、缓存或账号专属数据。
 
+## 报告 v2
+
+```powershell
+claude-switch.ps1 checkdetail --json   # 同一轮检查 + last-report.json
+claude-switch.ps1 report [报告]        # 离线转换,不重新探测
+```
+
+报告使用与 macOS 相同的 `claude-switcher-report/2` 契约和 16 个稳定 ID。Windows 版目前只有 14 项，缺少的 `IP纯净度` / `更优节点` 会明确写进 `summary.missing`，不会伪造 `ok`。报告只做检查快照，不代替 macOS 的启动租约。
+
 ## 维护工具
 
 主窗口「工具」提供以下入口，长任务在后台执行：

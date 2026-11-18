@@ -27,6 +27,7 @@ FUNCTIONS = (
     "cli_slot_has_payload",
     "archive_cli",
     "restore_cli",
+    "require_lease_for_launch",
     "switch_to",
 )
 

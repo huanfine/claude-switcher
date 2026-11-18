@@ -292,6 +292,45 @@ struct CoreResult {
     let succeeded: Bool
 }
 
+/// 核心脚本的 `claude-switcher-report/2`。App 只认稳定 ID，不拿中文显示名做匹配。
+/// 可选字段按旧核心/降级报告处理：缺 summary 时不能因此崩，也不能假装验证过。
+struct CheckReport: Decodable {
+    struct Item: Decodable {
+        let id: String
+        let name: String?
+        let state: String
+        let detail: String?
+        let evidence: String?
+        let known: Bool?
+    }
+
+    struct Summary: Decodable {
+        let missing: [String]?
+        let missingCritical: [String]?
+        let duplicates: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case missing
+            case missingCritical = "missing_critical"
+            case duplicates
+        }
+    }
+
+    let schema: String
+    let protocolVersion: Int
+    let verdict: String
+    let checks: [Item]
+    let summary: Summary?
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case protocolVersion = "protocol"
+        case verdict
+        case checks
+        case summary
+    }
+}
+
 struct AccountStamp: Equatable {
     let size: String
     let date: String
@@ -669,6 +708,40 @@ final class VM: ObservableObject {
         "生态可达性": "生态可达性", "更优节点": "更优节点",
     ]
 
+    /// 稳定 ID → 界面行。ID 是 JSON 契约，显示名只是文案；
+    /// 以后改中文文案不该让 App 丢行。
+    static let reportRowMap: [String: String] = [
+        "proxy_core": "代理内核", "tun": "TUN 网卡", "egress_ip": "出口 IP",
+        "ip_stability": "IP 与上次一致", "timezone": "时区", "locale": "地区",
+        "ipv6": "IPv6 关闭", "dns": "DNS 走隧道", "webrtc": "WebRTC",
+        "bodyguard": "保镖在线", "rules": "规则置顶",
+        "client_language": "客户端语言", "asn": "ASN 属性",
+        "ip_purity": "IP 纯净度", "ecosystem": "生态可达性", "better_node": "更优节点",
+    ]
+
+    private static func state(from raw: String) -> RowState {
+        switch raw {
+        case "ok": return .ok
+        case "warn": return .warn
+        case "skip": return .skip
+        case "config": return .config
+        default: return .fail
+        }
+    }
+
+    /// `checkdetail --json` 在 stderr 上可能先带一行环境警告；
+    /// 只取最后一行以 `{` 开头的文本，避免把警告当成 JSON 整体解码失败。
+    static func parseCheckReport(_ output: String) -> CheckReport? {
+        guard let line = output.split(separator: "\n").last(where: {
+            $0.trimmingCharacters(in: .whitespaces).hasPrefix("{")
+        }) else { return nil }
+        guard let data = String(line).data(using: .utf8),
+              let report = try? JSONDecoder().decode(CheckReport.self, from: data),
+              report.schema == "claude-switcher-report/2",
+              report.protocolVersion == 2 else { return nil }
+        return report
+    }
+
     /// 单行预览:只改观感,不参与判定。最终结果由 done 里的全量解析覆盖。
     private func preview(_ line: String) {
         let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
@@ -1028,89 +1101,198 @@ final class VM: ObservableObject {
         // 保留上一轮结果,只标记「这一轮还没回来」。清空的话,16 行会先集体
         // 变灰、行高骤降、窗口跟着抽一下,再一行行长回来 —— 这就是「不直觉」。
         rechecking = Set(rows.map(\.name))
-        run(["checkdetail"], timeout: checkTimeout, onLine: { [weak self] line in
+        // 新核心优先给 JSON;旧核心要么忽略参数继续吐文本,要么以退出码 2
+        // 甩 usage。前者直接复用同一份输出，后者才补跑一次文本命令。
+        run(["checkdetail", "--json"], timeout: checkTimeout, onLine: { [weak self] line in
             self?.preview(line)
         }) { result in
-            var allOk = result.succeeded
-            var matched = Set<Int>()
-            var duplicated = false
-            // 「没配好」和「不安全」要分开说:两者都拦启动(没验证过不能当验证通过),
-            // 但用户该做的事完全不同 —— 前者去补配置,后者去修环境。
-            var configRows: [String] = []
-            var failedRows: [String] = []
-            let keyMap = Self.rowNameMap
-            for line in result.output.split(separator: "\n") {
-                let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
-                guard parts.count == 2, let rowName = keyMap[parts[0]],
-                      let idx = self.rows.firstIndex(where: { $0.name == rowName }) else { continue }
-                // 重复行不能补齐缺失项，也不能用后来的 ok 覆盖先前的 fail。
-                guard matched.insert(idx).inserted else { allOk = false; duplicated = true; continue }
-                let status = parts[1].split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
-                switch status.first ?? "" {
-                case "ok": self.rows[idx].state = .ok
-                case "warn": self.rows[idx].state = .warn
-                case "skip": self.rows[idx].state = .skip
-                case "config":
-                    // 环境层没配好。仍然算未通过,但归到「待配置」而不是「不安全」。
-                    self.rows[idx].state = .config
-                    allOk = false
-                    configRows.append(self.rows[idx].name)
-                default:
-                    self.rows[idx].state = .fail
-                    allOk = false
-                    failedRows.append(self.rows[idx].name)
-                }
-                self.rows[idx].detail = status.count > 1 ? status[1] : ""
+            if result.succeeded, let report = Self.parseCheckReport(result.output) {
+                self.apply(report: report, done: done)
+                return
             }
-            if !result.succeeded {
-                self.banner = result.output.isEmpty ? "核心脚本执行失败" : result.output
-                // 脚本整体失败时每一行都没有可信结论。这时候还留着上一轮的绿勾
-                // 就是在骗人 —— 对一个门禁工具,「不知道」必须显示成「不知道」。
-                for i in self.rows.indices {
-                    self.rows[i].state = .fail
-                    self.rows[i].detail = "核心脚本执行失败"
+            if !result.succeeded, Self.isStaleCheckDetail(result.output) {
+                self.run(["checkdetail"], timeout: self.checkTimeout, onLine: { line in
+                    self.preview(line)
+                }) { fallback in
+                    self.finishTextCheck(fallback, done: done)
                 }
-            } else if duplicated {
-                self.banner = "检测输出存在重复项，请重新检查"
-            } else if matched.count != self.rows.count {
-                self.banner = "检测输出不完整(\(matched.count)/\(self.rows.count))，请点重新检查"
-            } else if !failedRows.isEmpty {
-                // 真正的安全项不达标:说清是哪几项,再给唯一的下一步。
-                self.banner = "未通过：\(failedRows.joined(separator: "、"))。按行内提示处理后重试"
-            } else if !configRows.isEmpty {
-                // 配置没就绪:不要说成「不安全」,否则用户会去修环境而不是补配置。
-                self.banner = "环境没配好：\(configRows.joined(separator: "、"))。点「一键修复」补齐后重新检查"
+                return
             }
-            let passed = allOk && matched.count == self.rows.count
-            // 通过之后才开守护;不通过时把旧的撤掉,免得它拿旧结论继续放行。
-            if passed { self.startWatch() } else { self.stopWatch() }
-            self.lastCheckSummary = passed
-                ? (self.rows.contains { $0.state == .warn }
-                    ? "有警告"
-                    : (self.rows.contains { $0.state == .skip } ? "通过（含跳过）" : "通过"))
-                : (failedRows.isEmpty && !configRows.isEmpty ? "待配置" : "失败")
-            self.run(["get-client"], timeout: self.checkTimeout) { clientResult in
-                self.updateClient(clientResult)
-                self.run(["status"], timeout: self.checkTimeout) { status in
-                    let statusOK = self.updateStatus(status)
-                    if !statusOK {
-                        // 只在还没有失败原因时才用「读不到账号状态」兜底。
-                        // 检查超时/脚本失败已经把真正的原因写进 banner,
-                        // 用这条盖掉会让用户看到与事实无关的提示。
-                        if self.banner.isEmpty {
-                            self.banner = "无法读取账号状态，请重新检查"
-                        }
-                        self.lastCheckSummary = "失败"
+            // 旧核心忽略 --json 时输出仍是文本；JSON 解析失败不等于检查失败，
+            // 真正失败由 result.succeeded 和逐行状态决定。
+            self.finishTextCheck(result, done: done)
+        }
+    }
+
+    private static func isStaleCheckDetail(_ output: String) -> Bool {
+        output.contains("退出码 2")
+            && (output.contains("用法:") || output.contains("未知命令"))
+    }
+
+    /// JSON 报告路径。只按稳定 ID 匹配；未知项忽略，缺项/重复/verdict 不成立
+    /// 都拦启动。尤其是全部 skip 时，verdict 是 incomplete —— 「没有失败」
+    /// 不等于「验过了」，不能因为 matched 16/16 就放行。
+    private func apply(report: CheckReport, done: @escaping (Bool) -> Void) {
+        var allOk = report.verdict == "established"
+        var matched = Set<Int>()
+        var configRows: [String] = []
+        var failedRows: [String] = []
+        for item in report.checks where item.known != false {
+            guard let rowName = Self.reportRowMap[item.id],
+                  let idx = rows.firstIndex(where: { $0.name == rowName }) else { continue }
+            guard matched.insert(idx).inserted else {
+                allOk = false
+                continue
+            }
+            let state = Self.state(from: item.state)
+            rows[idx].state = state
+            let detail = item.detail.flatMap { $0.isEmpty ? nil : $0 } ?? item.evidence ?? ""
+            rows[idx].detail = detail
+            switch state {
+            case .config:
+                allOk = false
+                configRows.append(rows[idx].name)
+            case .fail:
+                allOk = false
+                failedRows.append(rows[idx].name)
+            default:
+                break
+            }
+        }
+        // 报告缺项时上一轮的绿勾不能继续挂着。这里直接标 fail，
+        // 和文本路径“输出不完整”一样 fail-closed。
+        for i in rows.indices where !matched.contains(i) {
+            rows[i].state = .fail
+            rows[i].detail = "检查报告缺少这一项"
+            allOk = false
+        }
+        let summary = report.summary
+        let duplicates = summary?.duplicates ?? []
+        let missing = summary?.missing ?? []
+        let missingCritical = summary?.missingCritical ?? []
+        if !duplicates.isEmpty {
+            banner = "检测报告存在重复项，请重新检查"
+        } else if !missing.isEmpty || !missingCritical.isEmpty || matched.count != rows.count {
+            banner = "检测报告不完整(\(matched.count)/\(rows.count))，请点重新检查"
+        } else if !failedRows.isEmpty {
+            banner = "未通过：\(failedRows.joined(separator: "、"))。按行内提示处理后重试"
+        } else if !configRows.isEmpty {
+            banner = "环境没配好：\(configRows.joined(separator: "、"))。点「一键修复」补齐后重新检查"
+        } else if report.verdict != "established" {
+            banner = "检查结论未建立：没有任何项目被真正验证。请重新检查"
+        }
+        let passed = allOk && matched.count == rows.count && report.verdict == "established"
+        finishCheck(passed: passed, configRows: configRows, failedRows: failedRows,
+                    reportBacked: true, done: done)
+    }
+
+    /// 文本兼容路径。旧核心忽略 --json 时也走这里，所以不能把文本解析删掉。
+    private func finishTextCheck(_ result: CoreResult, done: @escaping (Bool) -> Void) {
+        var allOk = result.succeeded
+        var matched = Set<Int>()
+        var duplicated = false
+        // 「没配好」和「不安全」要分开说:两者都拦启动(没验证过不能当验证通过),
+        // 但用户该做的事完全不同 —— 前者去补配置,后者去修环境。
+        var configRows: [String] = []
+        var failedRows: [String] = []
+        let keyMap = Self.rowNameMap
+        for line in result.output.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 2, let rowName = keyMap[parts[0]],
+                  let idx = rows.firstIndex(where: { $0.name == rowName }) else { continue }
+            // 重复行不能补齐缺失项，也不能用后来的 ok 覆盖先前的 fail。
+            guard matched.insert(idx).inserted else { allOk = false; duplicated = true; continue }
+            let status = parts[1].split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            switch status.first ?? "" {
+            case "ok": rows[idx].state = .ok
+            case "warn": rows[idx].state = .warn
+            case "skip": rows[idx].state = .skip
+            case "config":
+                // 环境层没配好。仍然算未通过,但归到「待配置」而不是「不安全」。
+                rows[idx].state = .config
+                allOk = false
+                configRows.append(rows[idx].name)
+            default:
+                rows[idx].state = .fail
+                allOk = false
+                failedRows.append(rows[idx].name)
+            }
+            rows[idx].detail = status.count > 1 ? status[1] : ""
+        }
+        if !result.succeeded {
+            banner = result.output.isEmpty ? "核心脚本执行失败" : result.output
+            // 脚本整体失败时每一行都没有可信结论。这时候还留着上一轮的绿勾
+            // 就是在骗人 —— 对一个门禁工具,「不知道」必须显示成「不知道」。
+            for i in rows.indices {
+                rows[i].state = .fail
+                rows[i].detail = "核心脚本执行失败"
+            }
+        } else if duplicated {
+            banner = "检测输出存在重复项，请重新检查"
+        } else if matched.count != rows.count {
+            banner = "检测输出不完整(\(matched.count)/\(rows.count))，请点重新检查"
+        } else if !failedRows.isEmpty {
+            // 真正的安全项不达标:说清是哪几项,再给唯一的下一步。
+            banner = "未通过：\(failedRows.joined(separator: "、"))。按行内提示处理后重试"
+        } else if !configRows.isEmpty {
+            // 配置没就绪:不要说成「不安全」,否则用户会去修环境而不是补配置。
+            banner = "环境没配好：\(configRows.joined(separator: "、"))。点「一键修复」补齐后重新检查"
+        }
+        let passed = allOk && matched.count == rows.count
+        finishCheck(passed: passed, configRows: configRows, failedRows: failedRows,
+                    reportBacked: false, done: done)
+    }
+
+    /// 两条解析路径汇合后的共用收尾:看门狗、摘要、账号状态。
+    private func finishCheck(passed: Bool, configRows: [String], failedRows: [String],
+                             reportBacked: Bool, done: @escaping (Bool) -> Void) {
+        // 通过之后才开守护;不通过时把旧的撤掉,免得它拿旧结论继续放行。
+        if passed { startWatch() } else { stopWatch() }
+        lastCheckSummary = passed
+            ? (rows.contains { $0.state == .warn }
+                ? "有警告"
+                : (rows.contains { $0.state == .skip } ? "通过（含跳过）" : "通过"))
+            : (failedRows.isEmpty && !configRows.isEmpty ? "待配置" : "失败")
+        run(["get-client"], timeout: checkTimeout) { clientResult in
+            self.updateClient(clientResult)
+            self.run(["status"], timeout: self.checkTimeout) { status in
+                let statusOK = self.updateStatus(status)
+                if !statusOK {
+                    // 只在还没有失败原因时才用「读不到账号状态」兜底。
+                    // 检查超时/脚本失败已经把真正的原因写进 banner,
+                    // 用这条盖掉会让用户看到与事实无关的提示。
+                    if self.banner.isEmpty {
+                        self.banner = "无法读取账号状态，请重新检查"
                     }
-                    self.phase = passed && statusOK ? .ready : .failed
-                    // 收尾时兜底清空:输出缺行时那些项会一直挂着转圈,
-                    // 界面看起来像永远没查完。
-                    self.rechecking = []
-                    // 这一轮刚往 rtt.log 追加了一条采样,顺手读回来 ——
-                    // 不读的话洞察窗要等下次刷新才看到新点。
-                    self.loadRTT()
-                    done(passed && statusOK)
+                    self.lastCheckSummary = "失败"
                 }
+                // 只有 JSON 报告能签发租约；旧核心的文本回退没有 last-report.json，
+                // 不能强行卡住它。租约失败就是启动失败，不能把“检查通过”留在屏上。
+                if passed && statusOK && reportBacked {
+                    self.run(["lease"], timeout: 5) { lease in
+                        if lease.succeeded {
+                            self.phase = .ready
+                            self.rechecking = []
+                            self.loadRTT()
+                            done(true)
+                        } else {
+                            self.phase = .failed
+                            self.lastCheckSummary = "失败"
+                            self.banner = "启动租约签发失败：\(Self.failureLine(lease.output))"
+                            self.rechecking = []
+                            done(false)
+                        }
+                    }
+                    return
+                }
+                self.phase = passed && statusOK ? .ready : .failed
+                // 收尾时兜底清空:输出缺行时那些项会一直挂着转圈,
+                // 界面看起来像永远没查完。
+                self.rechecking = []
+                // 这一轮刚往 rtt.log 追加了一条采样,顺手读回来 ——
+                // 不读的话洞察窗要等下次刷新才看到新点。
+                self.loadRTT()
+                done(passed && statusOK)
             }
         }
     }

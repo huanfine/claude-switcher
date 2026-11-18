@@ -55,13 +55,16 @@ if [ "${1:-}" = "_support" ]; then
     shift
     exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_SUPPORT'
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 
 
@@ -73,9 +76,38 @@ ALL_CHECKS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "�
 DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True}
 LOG_LIMIT = 512 * 1024
 
+# 检查报告契约。文本行仍然是人读的兼容层,JSON 才是机器契约:
+# 显示名可以改,ID 不能改;未知项保留而不是丢掉,方便新核心 + 旧 App 共存。
+REPORT_SCHEMA = "claude-switcher-report/2"
+REPORT_PROTOCOL = 2
+REPORT_TTL_SECONDS = 30 * 60
+LEASE_SCHEMA = "claude-switcher-lease/1"
+LEASE_TTL_SECONDS = 120
+PROBES_SCHEMA = "claude-switcher-probes/1"
+DRILL_SCHEMA = "claude-switcher-drill/1"
+CHECK_SPECS = (
+    ("proxy_core", "代理内核", True),
+    ("tun", "TUN网卡", True),
+    ("egress_ip", "出口IP", True),
+    ("ip_stability", "IP一致", False),
+    ("timezone", "时区", True),
+    ("locale", "地区", True),
+    ("ipv6", "IPv6", True),
+    ("dns", "DNS", False),
+    ("webrtc", "WebRTC", False),
+    ("bodyguard", "保镖", True),
+    ("rules", "规则置顶", True),
+    ("client_language", "客户端语言", False),
+    ("asn", "ASN属性", False),
+    ("ip_purity", "IP纯净度", False),
+    ("ecosystem", "生态可达性", False),
+    ("better_node", "更优节点", False),
+)
+CHECK_SPEC_BY_NAME = {name: (cid, critical) for cid, name, critical in CHECK_SPECS}
 
-def fail():
-    print("配置或诊断参数无效", file=sys.stderr)
+
+def fail(message=""):
+    print(message or "配置或诊断参数无效", file=sys.stderr)
     raise SystemExit(2)
 
 
@@ -139,6 +171,7 @@ def env_write(values):
             handle.write("\n")
         os.chmod(temporary, 0o600)
         os.replace(temporary, base / "env.json")
+        revoke_lease()
     except OSError:
         raise ValueError("env")
     return merged
@@ -202,6 +235,368 @@ def app_version():
     except OSError:
         value = ""
     return value if re.fullmatch(r"[A-Za-z0-9._-]{1,40}", value) else "unknown"
+
+
+def report_started_at(text):
+    """从 checkdetail 的 `# 时间 pid=… 开始` 头取检查时间。"""
+    lines = text.splitlines()
+    if not lines:
+        return None
+    match = re.match(r"^# (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", lines[0])
+    if not match:
+        return None
+    try:
+        return datetime.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").astimezone()
+    except ValueError:
+        return None
+
+
+def iso_time(value):
+    return value.astimezone().isoformat(timespec="seconds")
+
+
+def report_config():
+    """报告生成不能因为 checks.json 坏了就整份失败;坏配置本身会在文本行里体现。"""
+    try:
+        return load_config()
+    except SystemExit:
+        return dict(DEFAULTS)
+
+
+def parse_report_checks(text):
+    """把文本行解析成带稳定 ID 的检查项。重复项保留第一条并单独记账。"""
+    started = report_started_at(text)
+    checked_at = iso_time(started) if started else iso_time(datetime.datetime.now().astimezone())
+    order, observed, duplicates = [], {}, []
+    for line in text.splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, rest = line.partition("=")
+        state, _, detail = rest.partition(":")
+        name, state, detail = name.strip(), state.strip(), detail.strip()
+        if not name or state not in ("ok", "warn", "fail", "skip", "config"):
+            continue
+        if name in observed:
+            if name not in duplicates:
+                duplicates.append(name)
+            continue
+        if state == "skip":
+            evidence, remedy = detail, ""
+        else:
+            evidence, separator, remedy = detail.partition(" · ")
+            evidence, remedy = evidence.strip(), remedy.strip() if separator else ""
+        observed[name] = (state, detail, evidence, remedy)
+        order.append(name)
+
+    checks = []
+    for cid, name, critical in CHECK_SPECS:
+        if name not in observed:
+            continue
+        state, detail, evidence, remedy = observed[name]
+        checks.append({"id": cid, "name": name, "critical": critical, "state": state,
+                       "evidence": evidence, "remedy": remedy, "detail": detail,
+                       "checked_at": checked_at, "known": True})
+    present = {item["name"] for item in checks}
+    for name in order:
+        if name in present:
+            continue
+        state, detail, evidence, remedy = observed[name]
+        checks.append({
+            "id": "unknown-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12],
+            "name": name, "critical": False, "state": state,
+            "evidence": evidence, "remedy": remedy, "detail": detail,
+            "checked_at": checked_at, "known": False})
+    return checks, duplicates
+
+
+def report_fingerprint(environment, config, core_path):
+    """报告绑定的不是时间,而是「当前环境值 + 检查开关 + 核心脚本」这三件事。"""
+    core_sha = ""
+    if core_path:
+        try:
+            core_sha = hashlib.sha256(Path(core_path).read_bytes()).hexdigest()
+        except OSError:
+            core_sha = ""
+    payload = {
+        "env": {key: environment.get(key, "") for key in ENV_KEYS},
+        "checks": {
+            "disabled": list(config.get("disabled", [])),
+            "allowOptionalFailures": bool(config.get("allowOptionalFailures", False)),
+        },
+        "core_sha256": core_sha,
+    }
+    digest = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")).hexdigest()
+    return digest, core_sha
+
+
+def parse_timestamp(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError("timestamp")
+    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.astimezone()
+
+
+def report_started_marker(text):
+    """报告头里的原始开始时间；用于把 sidecar 绑定到同一次 checkdetail。"""
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    match = re.match(r"^# (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", lines[0])
+    return match.group(1) if match else ""
+
+
+def optional_json(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def probe_document(started_at):
+    """代理链路的连通性/延迟。直连在 TUN 开启时测不出来，明确标 unknown。"""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", started_at or ""):
+        fail("探测时间格式无效")
+    now = datetime.datetime.now().astimezone()
+    proxy = {"status": "unknown", "target": "https://claude.ai/",
+             "http_code": None, "latency_ms": None,
+             "checked_at": iso_time(now)}
+    try:
+        run = subprocess.run(
+            ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
+             "--max-time", "6", "https://claude.ai/"],
+            capture_output=True, text=True, timeout=8)
+        parts = run.stdout.strip().split()
+        if len(parts) == 2 and parts[0].isdigit():
+            code = int(parts[0])
+            try:
+                latency = int(float(parts[1]) * 1000)
+            except ValueError:
+                latency = None
+            proxy["http_code"] = code
+            proxy["latency_ms"] = latency if code > 0 else None
+            proxy["status"] = "ok" if code > 0 else "fail"
+        elif run.returncode != 0:
+            proxy["status"] = "fail"
+    except (OSError, subprocess.SubprocessError):
+        proxy["status"] = "unknown"
+    direct = {"status": "unknown", "source": "drill",
+              "reason": "not_measured_while_tun_up", "checked_at": iso_time(now)}
+    return {"schema": PROBES_SCHEMA, "started_at": started_at,
+            "created_at": iso_time(now), "proxy": proxy, "direct": direct}
+
+
+def write_drill_counters(args):
+    if len(args) != 14:
+        fail("drill 计数器参数不完整")
+    checked_at, result = args[0], args[1]
+    def pair(name, status, ok, bad, elapsed):
+        if status not in ("ok", "fail", "unknown"):
+            fail("drill %s 状态无效" % name)
+        try:
+            values = [int(ok), int(bad), int(elapsed)]
+        except ValueError:
+            fail("drill %s 计数无效" % name)
+        if status == "unknown":
+            values = [None, None, None]
+        return {"status": status, "success": values[0], "failure": values[1],
+                "elapsed_ms": values[2]}
+    document = {
+        "schema": DRILL_SCHEMA,
+        "checked_at": checked_at,
+        "result": result,
+        "tcp": pair("tcp", *args[2:6]),
+        "dns": pair("dns", *args[6:10]),
+        "webrtc": pair("webrtc", *args[10:14]),
+    }
+    base, _ = paths()
+    write_json_private(base / "drill-counters.json", document)
+    return document
+
+
+def lease_path():
+    return paths()[0] / "lease.json"
+
+
+def revoke_lease():
+    """配置/节点/客户端一变化，旧租约就不能再代表当前环境。"""
+    try:
+        lease_path().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        fail("租约撤销失败")
+
+
+def lease_document(report, core_path, now=None):
+    """租约只从已建立的报告签发，且不能超过报告自身的有效期。"""
+    if not isinstance(report, dict):
+        fail("报告格式无效")
+    if report.get("schema") != REPORT_SCHEMA or report.get("protocol") != REPORT_PROTOCOL:
+        fail("报告不是 claude-switcher-report/2")
+    summary = report.get("summary") or {}
+    if report.get("verdict") != "established":
+        fail("报告结论不是 established，不能签发租约")
+    if summary.get("missing_critical") or summary.get("critical_blockers") \
+            or summary.get("duplicates"):
+        fail("报告缺少关键项或存在阻断项，不能签发租约")
+    now = now or datetime.datetime.now().astimezone()
+    try:
+        report_expires = parse_timestamp(report.get("expires_at"))
+    except ValueError:
+        fail("报告有效期格式无效")
+    if report_expires <= now:
+        fail("报告已过期，请重新检查")
+    try:
+        environment = env_read()
+    except ValueError:
+        environment = {}
+    fingerprint, core_sha = report_fingerprint(environment, report_config(), core_path)
+    if report.get("config_fingerprint") != fingerprint:
+        fail("报告与当前环境/核心不一致，请重新检查")
+    report_id = report.get("report_id")
+    if not isinstance(report_id, str) or not report_id:
+        fail("报告缺少 report_id")
+    expires = min(now + datetime.timedelta(seconds=LEASE_TTL_SECONDS), report_expires)
+    return {
+        "schema": LEASE_SCHEMA,
+        "lease_id": uuid.uuid4().hex,
+        "report_id": report_id,
+        "run_id": report.get("run_id", ""),
+        "config_fingerprint": fingerprint,
+        "core_sha256": core_sha,
+        "verdict": report["verdict"],
+        "issued_at": iso_time(now),
+        "expires_at": iso_time(expires),
+        "report_expires_at": iso_time(report_expires),
+    }
+
+
+def write_json_private(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".lease-", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except OSError:
+        fail("租约写入失败")
+
+
+def lease_check(core_path, now=None):
+    lease = paths()[0] / "lease.json"
+    try:
+        document = json.loads(lease.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        fail("租约不存在或无法解析")
+    if not isinstance(document, dict) or document.get("schema") != LEASE_SCHEMA:
+        fail("租约格式无效")
+    now = now or datetime.datetime.now().astimezone()
+    try:
+        expires = parse_timestamp(document.get("expires_at"))
+    except ValueError:
+        fail("租约有效期格式无效")
+    if expires <= now:
+        fail("租约已过期")
+    base, _ = paths()
+    try:
+        report = json.loads((base / "last-report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        fail("找不到租约对应的检查报告")
+    expected = lease_document(report, core_path, now)
+    for key in ("report_id", "config_fingerprint", "core_sha256"):
+        if document.get(key) != expected.get(key):
+            fail("租约已失效（" + key + " 不匹配）")
+    try:
+        if parse_timestamp(document.get("expires_at")) > parse_timestamp(expected["expires_at"]):
+            fail("租约有效期超过报告有效期")
+    except ValueError:
+        fail("租约有效期格式无效")
+    print("OK:租约有效至 " + document["expires_at"])
+
+
+def build_report(text, core_path=""):
+    """构造 claude-switcher-report/2。判定口径与 verdict/evidence 保持一致。"""
+    now = datetime.datetime.now().astimezone()
+    started = report_started_at(text) or now
+    checks, duplicates = parse_report_checks(text)
+    expected = [name for _, name, _ in CHECK_SPECS]
+    present = {item["name"] for item in checks}
+    missing = [name for name in expected if name not in present]
+    missing_critical = [name for _, name, critical in CHECK_SPECS
+                        if critical and name not in present]
+    blockers = [item["name"] for item in checks if item["state"] in ("fail", "config")]
+    critical_blockers = [item["name"] for item in checks
+                         if item["critical"] and item["state"] in ("fail", "config")]
+    advisories = [item["name"] for item in checks if item["state"] == "warn"]
+    skipped = [item["name"] for item in checks if item["state"] == "skip"]
+    evidence_missing = [item["name"] for item in checks
+                        if item["critical"] and item["state"] == "ok"
+                        and not item["evidence"]]
+    verified = [item for item in checks if item["state"] in ("ok", "warn")]
+    if duplicates or blockers:
+        verdict = "violated"
+    elif not verified or missing_critical:
+        verdict = "incomplete"
+    else:
+        verdict = "established"
+
+    try:
+        environment = env_read()
+    except ValueError:
+        environment = {}
+    config = report_config()
+    fingerprint, core_sha = report_fingerprint(environment, config, core_path)
+    report_id = uuid.uuid4().hex
+    run_id = os.environ.get("CLAUDE_SWITCHER_RUN_ID", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", run_id):
+        run_id = report_id
+    probes = optional_json(paths()[0] / "probes.json")
+    if not probes or probes.get("started_at") != report_started_marker(text):
+        probes = None
+    drill = optional_json(paths()[0] / "drill-counters.json")
+    summary = {
+        "expected": len(CHECK_SPECS),
+        "total": len(checks),
+        "passed": sum(1 for item in checks if item["state"] == "ok"),
+        "warning": len(advisories),
+        "failed": sum(1 for item in checks if item["state"] == "fail"),
+        "config": sum(1 for item in checks if item["state"] == "config"),
+        "skipped": len(skipped),
+        "blockers": blockers,
+        "critical_blockers": critical_blockers,
+        "advisories": advisories,
+        "skipped_names": skipped,
+        "missing": missing,
+        "missing_critical": missing_critical,
+        "evidence_missing": evidence_missing,
+        "duplicates": duplicates,
+        "unknown": [item["name"] for item in checks if not item["known"]],
+    }
+    return {
+        "schema": REPORT_SCHEMA,
+        "protocol": REPORT_PROTOCOL,
+        "report_id": report_id,
+        "run_id": run_id,
+        "created_at": iso_time(now),
+        "expires_at": iso_time(now + datetime.timedelta(seconds=REPORT_TTL_SECONDS)),
+        "config_fingerprint": fingerprint,
+        "core_sha256": core_sha,
+        "core_version": app_version(),
+        "host": platform.node(),
+        "platform": platform.system(),
+        "verdict": verdict,
+        "environment": {key: environment.get(key, "") for key in
+                        ("proxy_mode", "proxy_group", "country", "timezone", "locale")},
+        "checks": checks,
+        "summary": summary,
+        **(({"probes": {"proxy": probes.get("proxy"), "direct": probes.get("direct"),
+                        "drill": drill}} if probes or drill else {})),
+    }
 
 
 def write_log(args):
@@ -353,8 +748,30 @@ def main(args):
                 handle.write("\n")
             os.chmod(temporary, 0o600)
             os.replace(temporary, base / "checks.json")
+            revoke_lease()
         except OSError:
             fail()
+    elif action == "probe" and len(args) == 2:
+        document = probe_document(args[1])
+        write_json_private(paths()[0] / "probes.json", document)
+        print(json.dumps(document, ensure_ascii=False, separators=(",", ":")))
+    elif action == "drill-record" and len(args) == 15:
+        write_drill_counters(args[1:])
+        print("OK:drill 计数器已写入")
+    elif action == "lease" and len(args) in (2, 3):
+        core_path = args[2] if len(args) >= 3 else ""
+        try:
+            report = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            fail("找不到可签发租约的检查报告")
+        document = lease_document(report, core_path)
+        write_json_private(lease_path(), document)
+        print("OK:租约有效至 " + document["expires_at"])
+    elif action == "lease-check" and len(args) in (1, 2):
+        lease_check(args[1] if len(args) == 2 else "")
+    elif action == "lease-revoke" and len(args) == 1:
+        revoke_lease()
+        print("OK:租约已撤销")
     elif action == "verdict" and len(args) in (1, 2):
         # 离线复核:只读已有报告,不再探测。意义是事后能回答「当时到底过没过」,
         # 而不是只剩一条被后续日志刷掉的输出。口径与在线检查一致。
@@ -459,6 +876,16 @@ def main(args):
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(doc, ensure_ascii=False, indent=2) + "\n")
         print("OK:" + str(out))
+    elif action == "report" and len(args) in (1, 2, 3):
+        # 只读转换:不重新探测,不修改 last-check.txt。
+        path = Path(args[1]) if len(args) >= 2 and args[1] else paths()[0] / "last-check.txt"
+        core_path = args[2] if len(args) >= 3 else ""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            fail()
+        print(json.dumps(build_report(text, core_path), ensure_ascii=False,
+                         separators=(",", ":")))
     elif action == "env" and len(args) == 1:
         try:
             values = env_read()
@@ -1407,8 +1834,8 @@ def node_scan(clash_dir, group):
 def node_select(clash_dir, group, selector, leaf):
     """把一个 Selector 切到指定叶子。只允许本机、只允许 Selector。
 
-    预留给第二阶段(用户确认后才允许的自动应用),**当前没有对外命令会调到它**。
-    第一阶段 node-scan 全程只读,不应因为这层能力存在就变成有副作用。
+    由 node-apply 在门禁允许时调用,是 node-scan(只读)之后唯一的写操作。
+    仍然只接受显式叶子名,不做自动选路。
     """
     base, secret = controller_config(clash_dir)
     proxies = api_get(base, secret, "/proxies").get("proxies")
@@ -1577,7 +2004,11 @@ SLOT_NODE_DIR="$BASE/slot-node"
 LOG="$HOME/Library/Logs/claude-switch.log"
 ROUTE_MISSED=""
 KEEP_STAGED=0
+# 账号快照里是 Claude 的登录态,比 ~/.claude 本身还敏感。默认 umask 022 会
+# 建出 755 的目录,同机其他用户可读;这里统一收成 700/600。
+umask 077 2>/dev/null || true
 mkdir -p "$BASE/accounts"
+chmod 700 "$BASE" "$BASE/accounts" 2>/dev/null || true
 
 # Clash Verge 配置目录:安装方式与版本不同,路径也不同,不要写死。
 # 优先级:env.json > $CLAUDE_SWITCHER_CLASH_DIR > 已知路径 > 特征文件扫描 > 主路径(便于报错定位)
@@ -1617,22 +2048,37 @@ detect_fake_ip_range() {
     printf '%s\n' "198.18.0.0/16"
 }
 
-# 把 fake-ip 网段换算成 case 能用的前缀:198.18.0.1/16 → "198.18."
+# 把 fake-ip 网段换算成 case 能用的前缀。按掩码取整字节:
+#   /16 → "198.18."，/8 → "10."，/24 → "192.168.1."。
+# 原来固定取前两段,/8 与 /12 会算错(172.16.0.0/12 只认 172.16.,漏掉 172.17-31)。
+# 非整字节掩码(/12)向下取整到 1 段,宁可多匹配一个 /8 也不能漏掉真实 TUN 段。
 fake_ip_prefix() {
-    local range="${1:-}" a b
-    a="${range%%.*}"
-    b="${range#*.}"; b="${b%%.*}"
-    if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then
-        printf '%s\n' "$a.$b."
-    else
-        printf '%s\n' "198.18."
-    fi
+    local range="${1:-}" ip mask octets out part i
+    ip="${range%%/*}"
+    mask="${range#*/}"
+    [ "$mask" = "$range" ] && mask=16
+    case "$mask" in ''|*[!0-9]*) mask=16 ;; esac
+    [ "$mask" -gt 32 ] && mask=32
+    octets=$(( mask / 8 ))
+    [ "$octets" -lt 1 ] && octets=1
+    [ "$octets" -gt 4 ] && octets=4
+    IFS=. read -r o1 o2 o3 o4 <<< "$ip"
+    out=""; i=1
+    for part in "$o1" "$o2" "$o3" "$o4"; do
+        [ "$i" -le "$octets" ] || break
+        case "$part" in ''|*[!0-9]*) printf '%s\n' "198.18."; return 0 ;; esac
+        [ "$part" -le 255 ] || { printf '%s\n' "198.18."; return 0; }
+        out="${out}${part}."
+        i=$(( i + 1 ))
+    done
+    printf '%s\n' "${out:-198.18.}"
 }
 
 # 自调用 _support:一律经当前 shell 重新执行本脚本。
 # 直接 "$0" 调用在脚本没有可执行位时(例如仓库里 `bash core/claude-switch.sh` 跑测试)
 # 会 permission denied,被上层误判成「配置损坏」。
 support() { "${BASH:-/bin/bash}" "$0" _support "$@"; }
+lease_revoke() { support lease-revoke >/dev/null 2>&1 || true; }
 
 # 内核控制接口的 Unix socket。Clash Verge 服务模式下 socket 在 /var/run 下,走它不需要
 # sudo;配置里记的可能是重启后已失效的临时路径,所以两个都试。
@@ -1691,13 +2137,39 @@ load_env() {
         }
         while IFS='=' read -r key value; do
             case "$key" in
-                proxy_mode)    [ -n "$value" ] && PROXY_MODE="$value" ;;
+                proxy_mode)
+                    # 只挡控制字符/空白;新客户端名(或旧版遗留值)仍可读,
+                    # proxy_alive / proxy_name 的默认分支会处理未知值。
+                    if [ -n "$value" ]; then
+                        case "$value" in
+                            *[!a-z0-9-]*) echo "FAIL:env.json 中的 proxy_mode 含非法字符: $value" >&2; return 1 ;;
+                            *) PROXY_MODE="$value" ;;
+                        esac
+                    fi ;;
                 proxy_group)   PROXY_GROUP="$value" ;;
                 country)       [ -n "$value" ] && COUNTRY_TARGET="$value" ;;
-                timezone)      [ -n "$value" ] && TZ_TARGET="$value" ;;
+                timezone)
+                    # 时区会进入管理员命令和 root 看门狗脚本,只接受 IANA 形状;
+                    # 不校验就等于把 env.json 当成 root shell 的片段。
+                    if [ -n "$value" ]; then
+                        if [[ "$value" =~ ^[A-Za-z_]+/[A-Za-z_]+(/[A-Za-z_]+)?$ ]]; then
+                            TZ_TARGET="$value"
+                        else
+                            echo "FAIL:env.json 中的 timezone 无效(应为 Area/City): $value" >&2
+                            return 1
+                        fi
+                    fi ;;
                 locale)        [ -n "$value" ] && LOCALE_TARGET="$value" ;;
                 clash_dir)     CLASH_DIR="$value" ;;
-                fake_ip_range) FAKE_IP_RANGE="$value" ;;
+                fake_ip_range)
+                    if [ -n "$value" ]; then
+                        if [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+                            FAKE_IP_RANGE="$value"
+                        else
+                            echo "FAIL:env.json 中的 fake_ip_range 无效(应为 CIDR): $value" >&2
+                            return 1
+                        fi
+                    fi ;;
             esac
         done <<< "$dump"
     fi
@@ -1768,7 +2240,7 @@ log_result() {
 # TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管(兼容各种 TUN 设备名)
 # TUN 是否在线:看是否有一块网卡拿到了 fake-ip 段的地址。
 # 前缀跟着实际 fake-ip-range 走,不再写死 198.18. —— 用户改过网段就会误判成"TUN 没起"。
-tun_up() { ifconfig 2>/dev/null | grep -q "inet ${FAKE_PREFIX:-198.18.}"; }
+tun_up() { ifconfig 2>/dev/null | grep -qF "inet ${FAKE_PREFIX:-198.18.}"; }
 
 # 代理客户端显示名(供检查细节输出)
 proxy_name() {
@@ -1813,6 +2285,30 @@ quit_clash_verge() {
         pgrep -f "Clash Verge.app/Contents/MacOS/clash-verge" >/dev/null || return 0
         sleep 1
     done
+    return 1
+}
+
+# 安装器在写完全局脚本后调用它。只重启客户端并等待内核真正加载规则,
+# 不重复 fix 的时区/IPv6/账号逻辑;失败时返回非零让安装器提示用户。
+restart_clash() {
+    [ "$PROXY_MODE" = "clash-verge" ] || { echo "SKIP:当前客户端不是 Clash Verge"; return 0; }
+    if ! quit_clash_verge; then
+        echo "FAIL:Clash Verge 未能在 18 秒内退出"; return 1
+    fi
+    # 退出后补注册:运行中改 profiles.yaml 会被它退出时写回覆盖。
+    clash_rules register-script >/dev/null 2>&1 || true
+    open -a "Clash Verge" >/dev/null 2>&1 || { echo "FAIL:无法启动 Clash Verge"; return 1; }
+    local i out="" loaded=0
+    for i in $(seq 1 40); do tun_up && break; sleep 1; done
+    for i in $(seq 1 15); do
+        if out=$(clash_rules verify 2>&1); then loaded=1; break; fi
+        sleep 1
+    done
+    if [ "$loaded" -eq 1 ]; then
+        echo "OK:Clash Verge 已重启,内核已加载置顶规则"
+        return 0
+    fi
+    echo "WARN:Clash Verge 已重启,但内核仍未加载置顶规则:${out:-未知}"
     return 1
 }
 
@@ -1872,7 +2368,6 @@ set_webrtc_policy() {
 
 # 只接受运行中内核加载的规则，不再用配置文本或 fake-ip 代替。
 merge_ok() { clash_rules verify >/dev/null 2>&1; }
-stun_ok() { merge_ok; }
 
 # 把内核校验的失败原因翻成「缺什么 + 点哪里」。
 # verify 在第一个不匹配处就退出,只能报出首个缺失项,所以别在这里写条数
@@ -2919,6 +3414,11 @@ tun_set() {
 # 不需要 sudo,也不会把用户留在断网状态。--manual 保留原来的手动停核路径。
 drill() {
     local mode="auto" answer="" baseline after leaked out code result waited i arg
+    local tcp_ok=0 tcp_fail=0 tcp_status=unknown tcp_start tcp_ms=0
+    local dns_ok=0 dns_fail=0 dns_status=unknown dns_start dns_ms=0
+    local wr_ok=0 wr_fail=0 wr_status=unknown wr_start wr_ms=0 wr_out
+    local tcp_ok_out tcp_fail_out tcp_ms_out dns_ok_out dns_fail_out dns_ms_out
+    local wr_ok_out wr_fail_out wr_ms_out
     for arg in "$@"; do
         case "$arg" in
             --manual) mode="manual" ;;
@@ -2989,12 +3489,52 @@ drill() {
     # 否则核停后代理端口一起死,会得出"没漏"的假结论。
     echo "INFO:内核链路已断开,开始探测直连通路(域名与裸 IP 各 3 次)"
     leaked=""
+    tcp_start=$(date +%s)
     for i in 1 2 3; do
         out=$(curl -s --max-time 4 --noproxy '*' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+        if [ -n "$out" ]; then tcp_ok=$((tcp_ok + 1)); else tcp_fail=$((tcp_fail + 1)); fi
         [ -n "$out" ] && leaked="$leaked $out"
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 --noproxy '*' http://1.1.1.1/ 2>/dev/null)
-        [ -n "$code" ] && [ "$code" != "000" ] && leaked="$leaked bare-ip-http-$code"
+        if [ -n "$code" ] && [ "$code" != "000" ]; then
+            tcp_ok=$((tcp_ok + 1)); leaked="$leaked bare-ip-http-$code"
+        else
+            tcp_fail=$((tcp_fail + 1))
+        fi
     done
+    tcp_ms=$(( ($(date +%s) - tcp_start) * 1000 ))
+    [ "$((tcp_ok + tcp_fail))" -gt 0 ] && {
+        tcp_status=ok; [ "$tcp_ok" -eq 0 ] && tcp_status=fail
+    }
+    # DNS 与 STUN 也用同一条断链通路测:前者看裸解析是否还活着,后者看 UDP 是否
+    # 在 TUN 撤销后仍然出去。拿不到命令/探针时写 unknown,不要用 0 冒充已验证。
+    if command -v dig >/dev/null 2>&1; then
+        dns_status=ok; dns_start=$(date +%s)
+        for i in 1 2 3; do
+            if [ -n "$(dig +short +time=2 +tries=1 www.cloudflare.com 2>/dev/null | head -1)" ]; then
+                dns_ok=$((dns_ok + 1))
+            else
+                dns_fail=$((dns_fail + 1))
+            fi
+        done
+        dns_ms=$(( ($(date +%s) - dns_start) * 1000 ))
+        [ "$dns_ok" -eq 0 ] && dns_status=fail
+    fi
+    if [ -f "$BASE/stun-probe.py" ] && command -v "${CLAUDE_SWITCHER_PYTHON:-python3}" >/dev/null 2>&1; then
+        wr_status=fail; wr_start=$(date +%s)
+        wr_out=$(webrtc_test)
+        if [ -n "$wr_out" ]; then wr_ok=1; wr_status=ok; else wr_fail=1; fi
+        wr_ms=$(( ($(date +%s) - wr_start) * 1000 ))
+    fi
+    # unknown 时不能把 0 打给用户看:那会被读成「查过了,零成功零失败」。
+    tcp_ok_out=$tcp_ok; tcp_fail_out=$tcp_fail; tcp_ms_out=$tcp_ms
+    [ "$tcp_status" = unknown ] && { tcp_ok_out=unknown; tcp_fail_out=unknown; tcp_ms_out=unknown; }
+    dns_ok_out=$dns_ok; dns_fail_out=$dns_fail; dns_ms_out=$dns_ms
+    [ "$dns_status" = unknown ] && { dns_ok_out=unknown; dns_fail_out=unknown; dns_ms_out=unknown; }
+    wr_ok_out=$wr_ok; wr_fail_out=$wr_fail; wr_ms_out=$wr_ms
+    [ "$wr_status" = unknown ] && { wr_ok_out=unknown; wr_fail_out=unknown; wr_ms_out=unknown; }
+    echo "PROBE:tcp=$tcp_status success=$tcp_ok_out failure=$tcp_fail_out elapsed=${tcp_ms_out}ms"
+    echo "PROBE:dns=$dns_status success=$dns_ok_out failure=$dns_fail_out elapsed=${dns_ms_out}ms"
+    echo "PROBE:webrtc=$wr_status success=$wr_ok_out failure=$wr_fail_out elapsed=${wr_ms_out}ms"
     if [ -n "$leaked" ]; then
         leaked=$(printf '%s\n' $leaked | sort -u | tr '\n' ' ')
         leaked="${leaked% }"
@@ -3034,7 +3574,13 @@ drill() {
     trap - EXIT INT TERM
 
     echo "出口IP=${PROBE_IP:-未确认} 演练=$result"
-    [ -n "$BASE" ] && echo "$(date +%s) baseline=$baseline after=${PROBE_IP:-none} result=$result" >> "$BASE/drill.log"
+    if [ -n "$BASE" ]; then
+        support drill-record "$(date '+%F %T')" "$result" \
+            "$tcp_status" "$tcp_ok" "$tcp_fail" "$tcp_ms" \
+            "$dns_status" "$dns_ok" "$dns_fail" "$dns_ms" \
+            "$wr_status" "$wr_ok" "$wr_fail" "$wr_ms" >/dev/null 2>&1 || true
+        echo "$(date +%s) baseline=$baseline after=${PROBE_IP:-none} result=$result tcp=$tcp_ok/$tcp_fail dns=$dns_ok/$dns_fail webrtc=$wr_ok/$wr_fail" >> "$BASE/drill.log"
+    fi
     [ "${result%%:*}" = "established" ]
 }
 
@@ -3138,7 +3684,10 @@ bodyguard_status() {
         return
     fi
     local lastkill
-    lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
+    # 新版守护把日志写在 root 所有的 /var/log 下(避免以 root 跟随用户目录的符号链接);
+    # 老安装件仍在 ~/Library/Logs,读取时两处都看。
+    lastkill=$(tail -1 /var/log/claude-switcher/claude-bodyguard.log 2>/dev/null | cut -c1-40)
+    [ -n "$lastkill" ] || lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
     echo "ok:${lastkill:-待命}"
 }
 
@@ -3472,7 +4021,8 @@ preferred_node_leaf() {
 
 # ---------- 「Claude 在不在跑」的统一判据 ----------
 # 三个入口都要认,少一个就会出现「明明开着却报未运行」:
-#   1. 桌面 App      /Applications/Claude.app/Contents/MacOS/Claude
+#   1. 桌面 App      <安装位置>/Claude.app/Contents/MacOS/Claude
+#                      (官方默认 /Applications,也允许 ~/Applications)
 #   2. 老 npm 包     .../claude-code/cli.js 与 @anthropic-ai/claude-code
 #   3. 原生二进制    brew / ~/.local/bin 装的,argv[0] 就是 `claude`
 #
@@ -3480,7 +4030,8 @@ preferred_node_leaf() {
 # 命令行就是 `claude --version`,上面两条 -f 模式一条都匹配不上。后果是:
 # 节点门禁判成「没在跑」,看门狗熔断时也不会去停它。
 claude_app_running() {
-    pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1
+    # 不写死 /Applications:App 被拖进 ~/Applications 时同样要认出来。
+    pgrep -f "Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1
 }
 
 claude_cli_running() {
@@ -3755,6 +4306,7 @@ node_apply_gate() {
 }
 
 node_apply() {
+    lease_revoke
     # 可选参数:指定要切的叶子。槽位绑定走这条路 —— 「切到 B 就换 B 绑的那条线」,
     # 而不是「换成本次扫描分数最高的那条」。不给参数时维持原语义(用报告里的 BEST)。
     local want_leaf="${1:-}"
@@ -3894,6 +4446,7 @@ slot_node_set() {
     printf '%s\t%s\t%s\n' "$sel" "$leaf" "$(date +%s)" > "$SLOT_NODE_DIR/$slot.tmp" \
         && mv "$SLOT_NODE_DIR/$slot.tmp" "$SLOT_NODE_DIR/$slot" \
         || { echo "FAIL:写入绑定失败"; return 1; }
+    lease_revoke
     echo "OK:账号$slot 已绑定节点 $leaf"
 }
 
@@ -3901,6 +4454,7 @@ slot_node_clear() {
     local slot="${1:-}"
     valid_account "$slot" || return 1
     rm -f "$SLOT_NODE_DIR/$slot"
+    lease_revoke
     echo "OK:已解除账号$slot 的节点绑定"
 }
 
@@ -3962,6 +4516,21 @@ fix_flclash() {
     echo "FIX:FlClash 验证失败，已回滚；请检查 fake-IP、代理组及节点 UDP 支持"
     return 1
 }
+
+# 保镖 plist 的内置副本(base64)。
+# 为什么不从 ~/.local/bin 拷:那是用户可写目录,同用户进程可以把
+# ProgramArguments 改成任意路径,等用户批准「一键修复」的管理员授权后以 root
+# 执行。这里从脚本自身带的内容生成,不再信任用户目录里的文件。
+# tests/test_daemon_contracts.py 会校验它和 daemons/local.claude-bodyguard.plist 一致。
+bodyguard_plist_b64() {
+    cat <<'B64'
+PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPCFET0NUWVBFIHBsaXN0IFBVQkxJQyAiLS8vQXBwbGUvL0RURCBQTElTVCAxLjAvL0VOIiAiaHR0cDovL3d3dy5hcHBsZS5jb20vRFREcy9Qcm9wZXJ0eUxpc3QtMS4wLmR0ZCI+CjwhLS0gbGF1bmNoZCDmqKHmnb86IOWuieijheWIsCAvTGlicmFyeS9MYXVuY2hEYWVtb25zO+iEmuacrOWcqCByb290IOaJgOacieeahCAvTGlicmFyeS9BcHBsaWNhdGlvbiBTdXBwb3J0L2NsYXVkZS1zd2l0Y2hlci8g5LiLKOeUqOaIt+aAgeS4jeWPr+WGmSzpmLLmj5DmnYMpIC0tPgo8cGxpc3QgdmVyc2lvbj0iMS4wIj48ZGljdD4KCTxrZXk+TGFiZWw8L2tleT48c3RyaW5nPmxvY2FsLmNsYXVkZS1ib2R5Z3VhcmQ8L3N0cmluZz4KCTxrZXk+UHJvZ3JhbUFyZ3VtZW50czwva2V5PjxhcnJheT48c3RyaW5nPi9iaW4vYmFzaDwvc3RyaW5nPjxzdHJpbmc+L0xpYnJhcnkvQXBwbGljYXRpb24gU3VwcG9ydC9jbGF1ZGUtc3dpdGNoZXIvY2xhdWRlLWJvZHlndWFyZC5zaDwvc3RyaW5nPjwvYXJyYXk+Cgk8a2V5PlN0YXJ0SW50ZXJ2YWw8L2tleT48aW50ZWdlcj4xMDwvaW50ZWdlcj4KCTxrZXk+UnVuQXRMb2FkPC9rZXk+PHRydWUvPgo8L2RpY3Q+PC9wbGlzdD4K
+B64
+}
+
+# POSIX 单引号转义,给要拼进 `do shell script` 的值用。
+# 不能直接用 "$TZ_TARGET":env.json 虽已校验 IANA 形状,但这里仍按不可信输入处理。
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # 一键修复:按项自动修复,每步输出结果
 fix() {
@@ -4056,7 +4625,7 @@ fix() {
     tz=$(readlink /etc/localtime 2>/dev/null)
     v6=$(ipv6_on_services)
     adminCmds=""
-    [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
+    [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $(shq "$TZ_TARGET"); "
     # 逐条服务关 IPv6。只关 Wi-Fi 会漏掉 Ethernet/iPhone USB,检查项也就跟着漏报。
     if [ -n "$v6" ]; then
         while IFS= read -r svc; do
@@ -4067,7 +4636,7 @@ fix() {
     # 用户看到的就是「一键修复没生效」——所以必须和系统时区在同一次授权里一起对齐。
     wt=$(tz_watchdog_target)
     if [ -n "$wt" ] && [ "$wt" != "$TZ_TARGET" ]; then
-        adminCmds="${adminCmds}/usr/bin/sed -i '' 's|^TARGET=.*|TARGET=$TZ_TARGET|' '/Library/Application Support/claude-switcher/tz-watchdog.sh'; "
+        adminCmds="${adminCmds}/usr/bin/sed -i '' 's|^TARGET=.*|TARGET='$(shq "$TZ_TARGET")'|' '/Library/Application Support/claude-switcher/tz-watchdog.sh'; "
     fi
     # 装了 plist 却没 bootstrap(重装/系统升级后常见)时,看门狗是死的,一并拉起来
     if [ -f /Library/LaunchDaemons/local.tz-watchdog.plist ] && ! launchctl print system/local.tz-watchdog >/dev/null 2>&1; then
@@ -4081,7 +4650,8 @@ fix() {
     # 用户看到的就是「点了修复半天没反应」—— 卡在授权框上，没输入就等到超时。
     # 逐条服务关 IPv6 上面那段 while 已经做了，包括 Wi-Fi，这一行本来就多余。
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
-        adminCmds="${adminCmds}cp $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ && chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist && launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist; "
+        bg_b64=$(bodyguard_plist_b64)
+        adminCmds="${adminCmds}printf '%s' '$bg_b64' | /usr/bin/base64 -D > '/Library/LaunchDaemons/local.claude-bodyguard.plist' && chmod 644 '/Library/LaunchDaemons/local.claude-bodyguard.plist' && chown root:wheel '/Library/LaunchDaemons/local.claude-bodyguard.plist' && launchctl bootstrap system '/Library/LaunchDaemons/local.claude-bodyguard.plist'; "
     fi
     if [ -n "$adminCmds" ]; then
         adminCmds="${adminCmds}dscacheutil -flushcache; killall -HUP mDNSResponder"
@@ -4349,10 +4919,10 @@ set_region() {
 
     # 时区(需管理员权限,会弹一次授权框);看门狗脚本在 root 目录下,顺道用同一次授权同步目标值
     WD="/Library/Application Support/claude-switcher/tz-watchdog.sh"
-    adminCmds="/usr/sbin/systemsetup -settimezone $ntz"
+    adminCmds="/usr/sbin/systemsetup -settimezone $(shq "$ntz")"
     wdsync=0
     if [ -f "$WD" ] && [ ! -w "$WD" ]; then
-        adminCmds="$adminCmds; /usr/bin/sed -i '' 's|^TARGET=.*|TARGET=$ntz|' '$WD'"
+        adminCmds="$adminCmds; /usr/bin/sed -i '' 's|^TARGET=.*|TARGET='$(shq "$ntz")'|' '$WD'"
         wdsync=1
     fi
     if ! osascript <<ASEOF >/dev/null 2>&1
@@ -4456,8 +5026,12 @@ self_update() {
     if [ -f "$APPDIR/claude-bodyguard.sh" ] || [ -f "$APPDIR/tz-watchdog.sh" ]; then
         [ -z "$PM" ] && PM="clash-verge"
         [ -z "$TZV" ] && TZV="America/New_York"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__PROXY_MODE__|$PM|g" "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
+        sed -e "s|__PROXY_MODE__|$PM|g" -e "s|__FAKE_PREFIX__|${FAKE_PREFIX:-198.18.}|g" \
+            -e "s|__LOG_DIR__|/var/log/claude-switcher|g" \
+            "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
+        sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" \
+            -e "s|__LOG_DIR__|/var/log/claude-switcher|g" \
+            "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
         if ! diff -q "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh" >/dev/null 2>&1 || \
            ! diff -q "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh" >/dev/null 2>&1; then
             echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
@@ -4610,8 +5184,92 @@ open_safe() {
     echo "INFO:该窗口不继承你日常浏览器的 cookies/插件;在其中登录产生的会话会随窗口关闭一并丢弃"
 }
 
+# 加密归档降级格式:当 DiskImages 服务异常(create/attach/verify 全部卡住或
+# 报 Resource busy)时,不再赌 hdiutil,改用 openssl + tar。文件仍沿用用户给定
+# 的路径,靠首行 magic 与 DMG 区分;导入端两种都认。
+SNAPSHOT_ARCHIVE_MAGIC="CLAUDE-SWITCHER-ARCHIVE-1"
+
+# ---------- 快照导出/导入辅助 ----------
+# hdiutil 在部分系统版本上会卡住(实测 macOS 27 的 `create -srcfolder` 既可能
+# 报 Resource busy,也可能一直不返回)。没有超时的话,界面会永远停在「导出中」,
+# 用户只能强退;这里用 perl alarm 兜底(macOS 自带),并保留 stderr 供诊断。
+_snapshot_timeout() {
+    local secs="$1"; shift
+    if command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+_snapshot_err() {
+    [ -s "${1:-}" ] || return 0
+    # 只留 hdiutil 自己的错误;超时被杀时 bash 会往 stderr 写 "Alarm clock"
+    # 和脚本行号,那些对用户是噪声。
+    grep -E '^hdiutil:' "$1" 2>/dev/null | tail -n 2 | tr '\n' ' ' | cut -c1-240
+}
+
+# macOS 的 TMPDIR 是 /var/folders/...，而 mount 输出是 /private/var/...。
+# 不归一就直接 grep "on $mnt" 会永远匹配不到,于是函数以为已经卸载,
+# 实际上把临时卷留在了系统里(实测一次测试留下 11 个)。
+_snapshot_realpath() { (cd "${1:-}" 2>/dev/null && pwd -P) || printf '%s\n' "${1:-}"; }
+_snapshot_mounted() {
+    local real
+    real=$(_snapshot_realpath "${1:-}")
+    mount | grep -qF " on $real "
+}
+
+# 卸载失败时重试,最后 -force。挂载点还在时绝不能 rm -rf —— 那会删到镜像里的内容。
+_snapshot_detach() {
+    local mnt real i
+    mnt="$1"
+    real=$(_snapshot_realpath "$mnt")
+    for i in 1 2; do
+        _snapshot_mounted "$real" || return 0
+        _snapshot_timeout 30 hdiutil detach "$real" >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    # CoreDeviceService/模拟器会短暂持有新挂载的卷,普通 detach 会报
+    # Resource busy;force 在实测中仍能卸载。给它更长的超时,再试一次
+    # diskutil eject force(新接口)。
+    _snapshot_timeout 30 hdiutil detach "$real" -force >/dev/null 2>&1 && return 0
+    _snapshot_mounted "$real" || return 0
+    _snapshot_timeout 30 diskutil eject force "$real" >/dev/null 2>&1
+    ! _snapshot_mounted "$real"
+}
+
+# 把 stage 目录写成 "magic + AES-256-CBC(tar.gz)"。密码走 stdin 第一行,
+# 不落 argv;PBKDF2 迭代次数写死在命令里,避免不同机器导出/导入参数不一致。
+_snapshot_archive_write() {
+    local stage="$1" out="$2" pass="$3" tmo="$4" plain rc
+    command -v openssl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || return 1
+    plain=$(mktemp "${TMPDIR:-/tmp}/claude-snapshot-plain.XXXXXX" 2>/dev/null) || return 1
+    if ! tar -czf "$plain" -C "$stage" . 2>/dev/null; then
+        rm -f "$plain"; return 1
+    fi
+    if ! printf '%s\n' "$SNAPSHOT_ARCHIVE_MAGIC" > "$out"; then
+        rm -f "$plain" "$out"; return 1
+    fi
+    { printf '%s\n' "$pass"; cat "$plain"; } | _snapshot_timeout "$tmo" \
+        openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass stdin >>"$out" 2>/dev/null
+    rc=$?
+    rm -f "$plain"
+    [ "$rc" -eq 0 ] || { rm -f "$out"; return 1; }
+    return 0
+}
+
+_snapshot_archive_check() {
+    local file="$1" pass="$2" tmo="$3"
+    { printf '%s\n' "$pass"; tail -c +$(( ${#SNAPSHOT_ARCHIVE_MAGIC} + 2 )) "$file"; } | \
+        _snapshot_timeout "$tmo" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass stdin 2>/dev/null | \
+        tar -tzf - >/dev/null 2>&1
+}
+
 snapshot_export() {
     target="${1:-}"; out="${2:-}"; mode="${3:-}"
+    # 生产环境给足时间(账号数据可能很大);测试用
+    # CLAUDE_SWITCHER_SNAPSHOT_TIMEOUT 压到秒级。
+    local tmo="${CLAUDE_SWITCHER_SNAPSHOT_TIMEOUT:-180}"
     case "$target" in A|B|C|D) ;; *) echo "FAIL:账号必须是 A、B、C 或 D"; return 1 ;; esac
     [ -d "$BASE/accounts/$target" ] || { echo "FAIL:账号$target 没有已归档快照(先切换一次让它归档)"; return 1; }
     [ -n "$out" ] || { echo "FAIL:请指定导出文件路径"; return 1; }
@@ -4642,20 +5300,114 @@ snapshot_export() {
     cat > "$stage/.claude-switcher-snapshot.json" <<EOF
 {"format":"claude-switcher-snapshot","version":1,"account":"$target","created":"$(date '+%F %T')"}
 EOF
-    if ! printf '%s\n' "$pass" | hdiutil create -srcfolder "$stage" -volname "ClaudeSnapshot-$target" \
-        -encryption AES-256 -stdinpass "$out" >/dev/null 2>&1; then
-        rm -rf "$stage"; rm -f "$out"; unset pass pass2
-        echo "FAIL:创建加密镜像失败"; return 1
+    errlog=$(mktemp "${TMPDIR:-/tmp}/claude-snapshot.XXXXXX" 2>/dev/null) || errlog=""
+    created=0
+    primary_err=""; fallback_err=""
+    if printf '%s\n' "$pass" | _snapshot_timeout "$tmo" hdiutil create -srcfolder "$stage" \
+        -volname "ClaudeSnapshot-$target" -encryption AES-256 -stdinpass "$out" \
+        >/dev/null 2>"${errlog:-/dev/null}"; then
+        created=1
+    else
+        primary_err=$(_snapshot_err "$errlog")
+        rm -f "$out"
+        # 降级:先建未加密空镜像,挂载后 ditto 复制,最后转成加密 UDZO。
+        # 避开 create -srcfolder 的系统回归;空镜像路径在本机实测可用。
+        size_mb=$(( $(du -sk "$stage" 2>/dev/null | awk '{print $1}') / 1024 + 32 ))
+        [ "$size_mb" -lt 16 ] && size_mb=16
+        # 空镜像先不加密,复制完再 convert 成 UDZO+AES。直接用加密稀疏镜像
+        # 虽然能挂载,但没有 UDIF 校验和,`hdiutil verify` 会报 "has no checksum";
+        # 先加密再 convert 又会因为源本身加密而失败。未加密 raw → UDZO 是实测可用的顺序。
+        # 必须以 .dmg 结尾:hdiutil 对无扩展名的目标会自动补 .dmg,导致后面
+        # attach 找不到刚创建的文件(实测报 No such file or directory)。
+        raw="${out%.dmg}.raw.$$.dmg"
+        rm -f "$raw" "$raw.dmg"
+        if _snapshot_timeout "$tmo" hdiutil create -size "${size_mb}m" -fs HFS+ \
+            -volname "ClaudeSnapshot-$target" "$raw" >/dev/null 2>"${errlog:-/dev/null}"; then
+            mnt=$(mktemp -d "${TMPDIR:-/tmp}/claude-snapshot-mnt.XXXXXX" 2>/dev/null) || mnt=""
+            populated=0
+            if [ -n "$mnt" ] && _snapshot_timeout "$tmo" hdiutil attach -nobrowse \
+                -mountpoint "$mnt" "$raw" >/dev/null 2>"${errlog:-/dev/null}"; then
+                if _snapshot_timeout "$tmo" ditto "$stage/" "$mnt/" 2>>"${errlog:-/dev/null}"; then
+                    populated=1
+                else
+                    fallback_err=$(_snapshot_err "$errlog")
+                fi
+                _snapshot_detach "$mnt" || echo "WARN:临时镜像未能自动卸载: $mnt" >&2
+            elif [ -n "$mnt" ] && _snapshot_mounted "$mnt"; then
+                # attach 命令超时不代表没挂上:本机实测卷已出现但 hdiutil 不返回。
+                # 只要挂载点真的在,就继续复制,别让一次卡住的 API 白丢整次导出。
+                fallback_err=$(_snapshot_err "$errlog")
+                if _snapshot_timeout "$tmo" ditto "$stage/" "$mnt/" 2>>"${errlog:-/dev/null}"; then
+                    populated=1
+                    fallback_err=""
+                fi
+                _snapshot_detach "$mnt" || echo "WARN:临时镜像未能自动卸载: $mnt" >&2
+            else
+                fallback_err=$(_snapshot_err "$errlog")
+                [ -n "$mnt" ] && _snapshot_detach "$mnt" >/dev/null 2>&1
+            fi
+            # 仍然挂载时绝不能 rm -rf:那会删到镜像里的内容,而不是空的挂载点。
+            if [ -n "$mnt" ] && ! _snapshot_mounted "$mnt"; then
+                rm -rf "$mnt" 2>/dev/null
+            elif [ -n "$mnt" ]; then
+                echo "WARN:临时镜像仍挂载在 $mnt,请手动 hdiutil detach \"$mnt\" -force" >&2
+            fi
+            if [ "$populated" = 1 ]; then
+                : >"${errlog:-/dev/null}"
+                if printf '%s\n' "$pass" | _snapshot_timeout "$tmo" hdiutil convert "$raw" \
+                    -format UDZO -encryption AES-256 -stdinpass -o "$out" \
+                    >/dev/null 2>"${errlog:-/dev/null}"; then
+                    created=1
+                else
+                    fallback_err=$(_snapshot_err "$errlog")
+                fi
+            fi
+            # 仍挂载时不能删底层镜像文件;留给用户按 WARN 手动卸载后再删。
+            if [ -n "$mnt" ] && _snapshot_mounted "$mnt"; then
+                echo "WARN:临时镜像仍挂载,已保留 $raw" >&2
+            else
+                rm -f "$raw"
+            fi
+        else
+            fallback_err=$(_snapshot_err "$errlog")
+        fi
+        [ "$created" = 1 ] || rm -f "$out"
+    fi
+    # 最后一道:完全绕开 DiskImages。本机实测 create/attach 会被模拟器的
+    # CoreDeviceService 拖住;加密归档不挂载任何卷,失败面小得多。
+    archive_backend=0
+    if [ "$created" != 1 ]; then
+        if _snapshot_archive_write "$stage" "$out" "$pass" "$tmo" && \
+           _snapshot_archive_check "$out" "$pass" "$tmo"; then
+            created=1; archive_backend=1
+        else
+            rm -f "$out"
+        fi
     fi
     rm -rf "$stage"
-    # 加密镜像校验必须带密码,否则 macOS 会弹出图形密码框
-    if ! printf '%s\n' "$pass" | hdiutil verify -stdinpass "$out" >/dev/null 2>&1; then
-        rm -f "$out"; unset pass pass2
-        echo "FAIL:镜像校验失败"; return 1
+    if [ "$created" != 1 ]; then
+        rm -f "$out"; rm -f "$errlog"; unset pass pass2
+        echo "FAIL:创建加密镜像失败${primary_err:+ (直接创建: $primary_err)}${fallback_err:+ (降级创建: $fallback_err)}"
+        return 1
     fi
+    if [ "$archive_backend" != 1 ]; then
+        # 加密镜像校验必须带密码,否则 macOS 会弹出图形密码框
+        : >"${errlog:-/dev/null}"
+        if ! printf '%s\n' "$pass" | _snapshot_timeout "$tmo" hdiutil verify -stdinpass "$out" \
+            >/dev/null 2>"${errlog:-/dev/null}"; then
+            verify_err=$(_snapshot_err "$errlog")
+            rm -f "$out" "$errlog"; unset pass pass2
+            echo "FAIL:镜像校验失败${verify_err:+ ($verify_err)}"; return 1
+        fi
+    fi
+    rm -f "$errlog"
     unset pass pass2
     chmod 600 "$out"
-    echo "OK:账号$target 已加密导出到 $out"
+    if [ "$archive_backend" = 1 ]; then
+        echo "OK:账号$target 已加密导出到 $out(兼容归档格式:本机磁盘映像服务不可用)"
+    else
+        echo "OK:账号$target 已加密导出到 $out"
+    fi
 }
 
 snapshot_import() {
@@ -4673,16 +5425,58 @@ snapshot_import() {
 
     mnt=$(mktemp -d)
     attached=0
-    if ! printf '%s\n' "$pass" | hdiutil attach -stdinpass -nobrowse -readonly -mountpoint "$mnt" "$file" >/dev/null 2>&1; then
-        unset pass; rm -rf "$mnt"
-        echo "FAIL:密码错误或镜像损坏"; return 1
+    local tmo="${CLAUDE_SWITCHER_SNAPSHOT_TIMEOUT:-180}"
+    errlog=$(mktemp "${TMPDIR:-/tmp}/claude-snapshot.XXXXXX" 2>/dev/null) || errlog=""
+    archive_magic=$(head -c $(( ${#SNAPSHOT_ARCHIVE_MAGIC} + 1 )) "$file" 2>/dev/null || true)
+    if [ "$archive_magic" = "$SNAPSHOT_ARCHIVE_MAGIC" ]; then
+        # 导出端在 DiskImages 不可用时写的兼容归档:tar.gz + AES-256-CBC。
+        if ! command -v openssl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+            unset pass; rm -f "$errlog"; rm -rf "$mnt"
+            echo "FAIL:缺少 openssl/tar,无法读取兼容归档"; return 1
+        fi
+        plain=$(mktemp "${TMPDIR:-/tmp}/claude-snapshot-plain.XXXXXX" 2>/dev/null) || plain=""
+        if [ -z "$plain" ] || ! { printf '%s\n' "$pass"; tail -c +$(( ${#SNAPSHOT_ARCHIVE_MAGIC} + 2 )) "$file"; } | \
+            _snapshot_timeout "$tmo" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass stdin \
+            >"$plain" 2>"${errlog:-/dev/null}"; then
+            rm -f "$plain" "$errlog"; rm -rf "$mnt"; unset pass
+            echo "FAIL:密码错误或归档损坏"; return 1
+        fi
+        if ! tar -xzf "$plain" -C "$mnt" 2>"${errlog:-/dev/null}"; then
+            extract_err=$(_snapshot_err "$errlog")
+            rm -f "$plain" "$errlog"; rm -rf "$mnt"; unset pass
+            echo "FAIL:归档解压失败${extract_err:+ ($extract_err)}"; return 1
+        fi
+        rm -f "$plain" "$errlog"
+        unset pass
+    else
+        if ! printf '%s\n' "$pass" | _snapshot_timeout "$tmo" hdiutil attach -stdinpass -nobrowse -readonly \
+            -mountpoint "$mnt" "$file" >/dev/null 2>"${errlog:-/dev/null}"; then
+            # 同导出:attach 超时但卷已挂上时继续,否则按密码错误/镜像损坏处理。
+            if _snapshot_mounted "$mnt"; then
+                attached=1
+            else
+                attach_err=$(_snapshot_err "$errlog")
+                unset pass; rm -f "$errlog"; rm -rf "$mnt"
+                echo "FAIL:密码错误或镜像损坏${attach_err:+ ($attach_err)}"; return 1
+            fi
+        else
+            attached=1
+        fi
+        rm -f "$errlog"
+        unset pass
     fi
-    attached=1
-    unset pass
 
     cleanup_import() {
-        [ "$attached" = "1" ] && hdiutil detach "$mnt" >/dev/null 2>&1
-        rm -rf "$mnt" "$BASE/accounts/$target.new"
+        if [ "$attached" = "1" ]; then
+            _snapshot_detach "$mnt" || echo "WARN:镜像未能自动卸载,请手动执行 hdiutil detach \"$mnt\"" >&2
+        fi
+        # 挂载点仍在时删目录会穿透到镜像里,必须先确认已卸载。
+        if _snapshot_mounted "$mnt"; then
+            :
+        else
+            rm -rf "$mnt"
+        fi
+        rm -rf "$BASE/accounts/$target.new"
     }
 
     marker="$mnt/.claude-switcher-snapshot.json"
@@ -4744,10 +5538,12 @@ status() {
 }
 
 quit_claude() {
-    pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || return 0
+    # 不写死 /Applications:App 被拖进 ~/Applications 时同样要认出来。
+    pgrep -f "Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || return 0
     osascript -e 'tell application "Claude" to quit' >/dev/null 2>&1
     for i in $(seq 1 15); do
-        pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || return 0
+        # 不写死 /Applications:App 被拖进 ~/Applications 时同样要认出来。
+    pgrep -f "Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || return 0
         sleep 1
     done
     return 1
@@ -4791,7 +5587,7 @@ stop_claude_now() {
             claude_app_running || break
             sleep 1
         done
-        pkill -f "/Applications/Claude.app/Contents/MacOS/Claude" 2>/dev/null
+        pkill -f "Claude.app/Contents/MacOS/Claude" 2>/dev/null
     fi
     # CLI 一并停掉:后台的 claude 进程比 App 更容易悄悄重试。
     # `-x claude` 认的是原生二进制的进程名(argv[0] 就叫 claude),大小写敏感,
@@ -5162,6 +5958,20 @@ stage_keep_paths() {
 }
 
 # 还原目标账号后,把暂存内容合并回 DATA;失败时保留 stage 供排查
+require_lease_for_launch() {
+    # 只有新报告存在时才启用租约门禁。旧核心没有 last-report.json，
+    # 不能因为升级前留下的旧环境把 CLI 切换永久卡死；
+    # 没有 support 函数的是单元测试抽出的函数段，直接放行。
+    [ -f "$BASE/last-report.json" ] || return 0
+    [ "${CLAUDE_SWITCHER_REQUIRE_LEASE:-1}" = "1" ] || return 0
+    declare -F support >/dev/null 2>&1 || return 0
+    if ! support lease-check "$0" >/dev/null 2>&1; then
+        echo "FAIL:启动租约无效，请先运行 checkdetail --json 并通过检查"
+        return 1
+    fi
+    return 0
+}
+
 restore_keep_paths() {
     local stage="$BASE/keep-stage"
     [ -d "$stage" ] || return 0
@@ -5225,7 +6035,9 @@ switch_to() {
         if [ ! -d "$CLI_DIR" ] && cli_slot_has_payload "$target"; then
             restore_cli "$target" || { echo "FAIL:账号$target 的 Claude Code 状态还原失败"; return 1; }
         fi
+        require_lease_for_launch || return 1
         open -a "Claude"
+        lease_revoke
         echo "INFO:当前已是账号$target"
         return 0
     fi
@@ -5284,7 +6096,9 @@ switch_to() {
         fi
     fi
 
+    require_lease_for_launch || return 1
     open -a "Claude"
+    lease_revoke
     log "已切换到账号$target 并启动 ($(( $(date +%s) - t0 ))s)"
     echo "OK:已切换到账号$target ($(( $(date +%s) - t0 ))s)"
     return 0
@@ -5311,6 +6125,10 @@ help() {
 
 出问题时
   verdict [报告]       复核一份 checkdetail 报告,给出结论(fail/config 即判违反;全关掉判「未验证」)
+  report [报告]        把文本检查报告转成版本化 JSON(稳定 ID / 证据 / 配置指纹,不重新探测)
+  checkdetail --json   执行检查并输出版本化 JSON,同时写 last-report.json
+  lease                从当前 established 报告签发短租约(默认 120 秒)
+  lease-check          校验租约仍对应当前报告 / 环境 / 核心且未过期
   evidence <file>      导出一次检查的证据
   drill [--auto|--manual] [--yes]
                        演练:关掉 TUN 后看流量是否真的出不去(fail-closed)
@@ -5362,21 +6180,55 @@ case "$operation" in
     drill)  drill "${@:2}" ;;  # fail-closed 演练:默认自动关 TUN,--manual 走手动停核
     verdict) support verdict "${2:-}" ;;
     evidence) support evidence "${2:-}" ;;
+    report) support report "${2:-}" "$0" ;;
+    lease) support lease "$BASE/last-report.json" "$0" ;;
+    lease-check) support lease-check "$0" ;;
+    lease-revoke) support lease-revoke ;;  # 隐藏入口:内部状态变更时撤销旧租约
     checkdetail)
+        lease_revoke
         OUT_FILE="$BASE/last-check.txt"
-        # 直接 tee 到 stdout,不要再「先写文件、跑完再 cat」:那等于把十几秒的检查
-        # 结果压到最后一次性吐出来,界面只能干等。bash 的 echo 是逐行刷新的,
-        # tee 原样转发,界面才能边查边显示。
-        {
-            echo "# $(date '+%F %T') pid=$$ 开始"
-            checkdetail
-            rc=$?
-            echo "# 结束"
-        } 2>&1 | tee "$OUT_FILE"
-        summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
+        if [ "${2:-}" = "--json" ]; then
+            # 同一轮检查产出两份:last-check.txt 给旧客户端,last-report.json 给新契约。
+            TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/claude-check.XXXXXX")"
+            CHECK_STARTED_AT="$(date '+%F %T')"
+            {
+                echo "# $CHECK_STARTED_AT pid=$$ 开始"
+                checkdetail
+                check_rc=$?
+                echo "# 结束"
+            } >"$TMP_OUT" 2>&1
+            cp "$TMP_OUT" "$OUT_FILE"
+            rm -f "$TMP_OUT"
+            chmod 600 "$OUT_FILE" 2>/dev/null || true
+            # 代理链路探测是可选 sidecar:失败只让报告缺 probes,不能让整轮检查失败。
+            # 它用报告头同一个 started_at 绑定,避免把上一次探测混进新报告。
+            support probe "$CHECK_STARTED_AT" >/dev/null 2>&1 || true
+            if support report "$OUT_FILE" "$0" > "$BASE/last-report.json" 2>/dev/null; then
+                cat "$BASE/last-report.json"
+            else
+                echo '{"schema":"claude-switcher-report/2","protocol":2,"verdict":"incomplete","error":"report generation failed"}'
+                check_rc=1
+            fi
+            chmod 600 "$BASE/last-report.json" 2>/dev/null || true
+            rc=${check_rc:-1}
+            summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
+        else
+            # 直接 tee 到 stdout,不要再「先写文件、跑完再 cat」:那等于把十几秒的检查
+            # 结果压到最后一次性吐出来,界面只能干等。bash 的 echo 是逐行刷新的,
+            # tee 原样转发,界面才能边查边显示。
+            {
+                echo "# $(date '+%F %T') pid=$$ 开始"
+                checkdetail
+                rc=$?
+                echo "# 结束"
+            } 2>&1 | tee "$OUT_FILE"
+            # 输出里有出口 IP;umask 077 只影响新文件,老安装留下的 644 在这里一并收紧。
+            chmod 600 "$OUT_FILE" 2>/dev/null || true
+            summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
+        fi
         ;;
-    fix) fix ;;
-    set-webrtc-policy) set_webrtc_policy "${2:-}" ;;
+    fix) lease_revoke; fix ;;
+    set-webrtc-policy) lease_revoke; set_webrtc_policy "${2:-}" ;;
     node-scan) scan_nodes ;;
     node-apply) node_apply "${2:-}" ;;
     slot-node)
@@ -5390,10 +6242,12 @@ case "$operation" in
     watch) watch "${2:-10}" "${3:-6}" ;;
     status) status ;;
     switch) switch_to "${2:-}" ;;
-    set-region) set_region ;;
+    set-region) lease_revoke; set_region ;;
     set-client) set_client "${2:-}" ;;
     get-client) get_client ;;
-    update) self_update "${2:-}" ;;
+    fake-prefix) printf '%s\n' "${FAKE_PREFIX:-198.18.}" ;;
+    restart-clash) restart_clash ;;
+    update) lease_revoke; self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;
     cli-info) cli_info ;;

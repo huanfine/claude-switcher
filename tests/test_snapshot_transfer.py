@@ -29,7 +29,10 @@ class SnapshotTransferTests(unittest.TestCase):
         self.image = self.root / "account-a.dmg"
 
     def run_core(self, *args, password=None, home=None):
-        env = dict(os.environ, HOME=str(home or self.home))
+        # hdiutil 在部分系统上会卡住;测试把单步超时压到 15 秒,让失败尽快暴露,
+        # 而不是等满 90 秒的 subprocess 超时。
+        env = dict(os.environ, HOME=str(home or self.home),
+                   CLAUDE_SWITCHER_SNAPSHOT_TIMEOUT="15")
         return subprocess.run(
             ["/bin/bash", str(SCRIPT), *args],
             input=(password + "\n") if password is not None else None,

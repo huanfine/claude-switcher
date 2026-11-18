@@ -16,7 +16,7 @@
 
 1. **macOS**（Apple Silicon 或 Intel 均可）
 2. **代理客户端**已安装且代理可用，支持 Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）。Clash Verge 的配置目录应存在于 `~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/`；Shadowrocket 以 VPN 配置形式存在（`scutil --nc list` 可见）
-3. **Claude 桌面版** 在 `/Applications/Claude.app`
+3. **Claude 桌面版** 在 `/Applications/Claude.app`（也接受 `~/Applications/Claude.app`）
 4. **python3** 可用（`python3 --version` 能输出版本号；没有则引导用户运行 `xcode-select --install`）
 5. **当前出口 IP 所在国家不能是 CN**——先跑 `curl -s https://www.cloudflare.com/cdn-cgi/trace | grep loc=`，返回的 `loc` 不是 `CN` 才能继续。是 CN 就停下，让用户先把代理调好（安装程序会按出口 IP 自动锁定地区目标：国家/时区/地区格式三件套，裸连时装机会把它们锁错）
 
@@ -58,7 +58,7 @@
 2. 探测代理客户端，用 `claude-switch.sh _support env-set "proxy_mode=..."` 写进 `~/.claude-switcher/env.json`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/flclash/shadowrocket/sing-box/clashx/surge/auto 中选择
 3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名，同样用 `env-set "proxy_group=..."` 写入（其他客户端跳过）
 4. 按出口 IP 自动锁定地区目标：多源依次尝试 ipinfo.io（country/timezone）→ ipapi.co（country_code/timezone）→ ifconfig.co（country_iso/timezone）→ Cloudflare trace（loc，时区用国家默认映射），全失败时让用户在 US/JP/TW/HK/SG/GB/DE/FR/KR/AU/CA 中手动选，`FORCE=1` 按 US + America/New_York；country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ locale，然后用 `env-set "country=..." "timezone=..." "locale=..."` 写入 env.json
-5. 参照 `daemons/` 目录的模板，物化保镖与时区看门狗脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` 替换为实际值），用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher/`（chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon 安装到 `/Library/LaunchDaemons/`（plist 的 ProgramArguments 已写死指向系统目录，直接 cp 即可）。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto`）
+5. 参照 `daemons/` 目录的模板，物化保镖与时区看门狗脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` / `__FAKE_PREFIX__` / `__LOG_DIR__` 替换为实际值；`__FAKE_PREFIX__` 由核心 `fake-prefix` 按 env.json 的 fake-ip 网段算出，不能退回写死 `198.18.`），用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher/`（chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon 安装到 `/Library/LaunchDaemons/`（plist 的 ProgramArguments 已写死指向系统目录，直接 cp 即可）。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto`）
 6. 现场编译界面 App（需要 Xcode 命令行工具，必须带 `-target` 否则新 SDK 产物在老系统拒启动）：
    ```bash
    swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o "Claude 环境检查器.app/Contents/MacOS/ClaudeSwitcher" -framework SwiftUI -framework AppKit
@@ -67,10 +67,10 @@
 7. Clash Verge 模式下通过核心脚本的 `write-merge-rules` 隐藏入口生成「全局扩展脚本」(profiles/Script.js)，直接前置 `config.rules`，保留已有 main，备份并迁移 Merge.yaml 中本项目旧标记块；重启 Clash Verge 后必须验证内核 `/rules`。其他客户端提示用户自行添加 DOMAIN-SUFFIX 置顶规则
 
    **重启必须真的重启**：改 Script.js 不会让运行中的内核换规则——Clash Verge 只在自身启动/应用配置时重新生成运行时配置，`clash-verge.yaml` 的时间戳会一直停在上次重启。而 `osascript -e 'tell application "Clash Verge" to quit'` 对这个 Tauri 应用**不生效**（实测 PID 不变），紧跟的 `open -a` 只是把窗口唤到前台，于是内核仍是旧规则、`verify` 失败、用户看到「置顶规则 ✗ 未验证内核加载」。`fix` 现在走 `quit_clash_verge`：先 AppleScript quit，等 8 秒没退就补 SIGTERM，确认进程消失后再 `open`，最后等 TUN 网卡出现。
-8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
+8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、对每个仍开启 IPv6 的网络服务执行 `networksetup -setv6off <服务名>`（需管理员；不能只关 Wi-Fi）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（16 项逐项）/ `node-scan`（只读扫描当前控路 Selector 的候选节点，按纯净度排名出报告；不切节点、不动守护、不写 iphistory）/ `node-apply`（仅门禁允许时把最优节点切上去并固定；切前实时复核门禁、切后复查出口国家，不达标自动回滚）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
+日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（16 项逐项；`checkdetail --json` 输出版本化报告并写 `last-report.json`）/ `report [报告]`（把已有文本报告转成稳定 ID / 证据 / 配置指纹 JSON，不重新探测）/ `lease`（从当前 established 报告签发 120 秒启动租约）/ `lease-check`（校验租约仍对应当前报告、环境与核心且未过期）/ `node-scan`（只读扫描当前控路 Selector 的候选节点，按纯净度排名出报告；不切节点、不动守护、不写 iphistory）/ `node-apply`（仅门禁允许时把最优节点切上去并固定；切前实时复核门禁、切后复查出口国家，不达标自动回滚）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
 
 检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`IP纯净度`、`生态可达性`、`更优节点`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 8 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
@@ -160,7 +160,7 @@ IP 纯净度那侧是独立的证据 bug，别和上面混：
 
 - `dig +short -x` 超时会把诊断行 `;; connection timed out; ...` 写到 **stdout**，`+short` 挡不住。它曾被 `head -1` 取成 `rdns`：既让 `known=1`（零个有效风险源也照常出分），又被当成运营商名拼进检查项，用户看到「评分 60/100 · 机房 · ;; connection timed out;」。诊断行必须以 `;;` 开头丢掉，用 `sed` 而不是 `grep`（空结果别带出非零码）。
 - 降级判型时 `score` 只是 `hosting=55` 这类**类型基线**，风险维度一个都没验过。保留 `评分 N/100` 前缀（下游按它取数），但补 `(类型预估·未实测信誉)`；这类结果写缓存时本来就把 epoch 调成 5 分钟后过期，不要改成 24h。
-- 节点扫描的 `TOPn` 分数来自 `purity-cache.v3`，可能比当前出口旧一天。两处分数对不上时先比 IP 和扫描时间，不要急着改评分模型。
+- 节点扫描的 `TOPn` 分数来自 `purity-cache.v4`，可能比当前出口旧一天。两处分数对不上时先比 IP 和扫描时间，不要急着改评分模型。
 
 同一轮实机复查又挖出四个连带坑，**改评分模型之前先排除它们**：
 
@@ -196,9 +196,17 @@ IP 纯净度那侧是独立的证据 bug，别和上面混：
 
 出口判定不再取单次样本。`check` 对同一域名连采 3 次，全部一致才判 `ok`；采样间不一致判 `fail`（节点在漂移，同一账号的来源在变，比单点异常更危险）；一次都没取到判 `unknown`，只出警告、不拦启动。放宽的前提是连采两轮、共 6 次全空才认 `unknown`——单次空返回多半是网络抖动，之前正是它把抖动误判成「出口IP异常」并拦住 Claude 启动。
 
-`drill [--auto|--manual] [--yes]` 是 fail-closed 演练。平时的检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。它先记录基准出口，同时用域名和裸 IP 各探 3 次：任何一条还能出去就是漏，判 `violated` 并报出直连 IP；全部无响应才算 `established`。**默认 `--auto`** 通过内核接口关 TUN，效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 才是手动停核那条路。全程挂着提醒恢复的 trap，结果追加到 `~/.claude-switcher/drill.log`。2026-11-01 本机实测结论为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去。
+`drill [--auto|--manual] [--yes]` 是 fail-closed 演练。平时的检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。它先记录基准出口，同时用域名和裸 IP 各探 3 次：任何一条还能出去就是漏，判 `violated` 并报出直连 IP；全部无响应才算 `established`。**默认 `--auto`** 通过内核接口关 TUN，效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 才是手动停核那条路。全程挂着提醒恢复的 trap，结果追加到 `~/.claude-switcher/drill.log`。2026-11-01 本机实测结论为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去。演练还会输出并写入 `~/.claude-switcher/drill-counters.json` 的 TCP / DNS / WebRTC 计数器：每项含 `status`、`success`、`failure`、`elapsed_ms`，`dig` 或 STUN 探针不可用时整项为 `unknown` 且数值为 `null`，不得用 0 冒充。
 
 `verdict [报告]` 离线复核 `last-check.txt`（或指定报告），只读不探测，输出 `VERDICT:established|violated|incomplete` 与 blockers/advisories/skipped 三行。`warn` 与 `skip` 既不会被提升成 pass，也不会被当成 fail。`evidence <file>` 把最近一次检查写成 JSON（时间、主机、环境、逐项状态、判定），权限 0600，只新建不覆盖——证据被覆盖就失去追溯意义。
+
+`checkdetail --json` 输出 `claude-switcher-report/2`：稳定 ID、关键性、逐项 evidence/remedy、`config_fingerprint`（env.json 白名单 + checks.json + 核心脚本 SHA-256）与 30 分钟 `expires_at`。缺少关键项或全 `skip` 只能是 `incomplete`，不能是 `established`；`fail`/`config` 仍是 `violated`。`report [报告]` 是同一契约的离线转换入口，不重新探测。报告是检查快照，不是启动授权；启动租约由 `lease` 单独签发，并绑定 `report_id` / 指纹 / TTL。新版报告可选带 `probes`：`proxy` 是正常链路探测，`direct` 在 TUN 开启时显式 `unknown`（`reason=not_measured_while_tun_up`），`drill` 是最近一次演练的 TCP/DNS/WebRTC 计数器。`probes` 不参与 `config_fingerprint`；缺少该字段的旧报告仍能解析并签发租约。
+
+App 检查入口已改为 `checkdetail --json`：JSON 成功时按 `reportRowMap` 的稳定 ID 填 16 行；旧核心忽略参数、继续输出文本时，直接复用同一份输出走文本解析；仅当退出码 2 + usage 表明旧核心拒绝参数时，才补跑一次 `checkdetail`。全 `skip` 的 `incomplete` 报告在 App 侧同样拦启动，不能因为 16/16 行都有值就放行。
+
+租约写入 `~/.claude-switcher/lease.json`（0600）：只有 `established` 报告能签发，有效期取 `min(120 秒, 报告 expires_at)`。`switch` 在 `open -a Claude` 前必须通过 `lease-check`；拉起后立即撤销，旧租约不能重复使用。`env-set` / `set-check-config` / `set-client` / `set-region` / `node-apply` / `slot-node set|clear` / `checkdetail` / `fix` / `switch` 都会撤销旧租约。没有 `last-report.json` 的旧核心保持原有切换行为。
+
+报告的 `core_version` 来自 `app_version()`：先取 `CLAUDE_SWITCHER_VERSION`，再读 `~/.claude-switcher/version.txt`（0600），都没有才是 `unknown`。**写端在 macOS 安装器**——以前只有 `windows/install.ps1` 写这个文件，macOS 侧报告的版本恒为 `unknown`，等于新报告继承了「分不清用户装的哪一版」这个老问题。安装器的版本优先读包里的 `VERSION`（打包脚本写入）；源码安装没有该文件时退回 `git describe --tags --always --dirty` 并去掉前导 `v`，字符集与 40 字长度上限必须与 `app_version()` 的校验一致，否则写进去也读不出来。这里记的是**安装包版本**：核心之后被 `update` 换过没有，看报告的 `core_sha256` / `config_fingerprint`，不要指望 `version.txt` 跟着核心走。回归见 `tests/test_daemon_contracts.py::InstallVersionTests`（抽安装器真实代码执行，含端到端读回 `core_version`）。
 
 ## 运行期出口看门狗（watch）
 
@@ -237,7 +245,7 @@ App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是
 | 症状 | 根因 | 处理 |
 |---|---|---|
 | TUN 网卡消失、出口变回国内 | **Clash Verge 更新/异常重启会把 `enable_tun_mode` 重置为 false** | 退出 App → 改 `verge.yaml` 为 true → 重启 App。切换器的一键修复已内置此逻辑 |
-| 时区总是自己变回去 | macOS 自动时区或未知程序改动 | 看门狗会自动回滚；查 `~/Library/Logs/tz-watchdog.log` 留痕 |
+| 时区总是自己变回去 | macOS 自动时区或未知程序改动 | 看门狗会自动回滚；查 `/var/log/claude-switcher/tz-watchdog.log`（旧安装件仍在 `~/Library/Logs/tz-watchdog.log`）留痕 |
 | 检查结果显示 0/11、数据为空 | 中文日志被 `cut -c` 按字节截断产生非法 UTF-8，Swift 严格解码整体失败 | 脚本必须 `export LC_ALL=en_US.UTF-8`；界面端用容错解码 `String(decoding:as:)` |
 | 修改 App 后界面没变化 | 菜单栏版本关闭窗口仅隐藏；`pkill` 匹配中文路径还可能因 Unicode NFD 编码失配而静默失败 | 先从盾牌菜单选「退出 Claude 环境检查器」，再替换 App；开发排障也可按进程名退出测试实例。不要把关窗改回退出，以免破坏菜单栏驻留 |
 | headless Chrome 做 WebRTC 检测无结果 | headless 模式 ICE 子系统不产出候选 | 不要走浏览器路线，用本项目的纯 Python STUN 探针 |
@@ -257,7 +265,7 @@ App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是
 3. 不要在日志、文档、Issue 里暴露用户的住宅/代理 IP 与任何凭据
 4. 不要改动 `~/.claude-switcher/accounts/` 下的存档结构
 5. **维护纪律**：`core/`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——自动更新靠它校验工件完整性，清单与代码不一致会导致所有用户更新失败
-6. **守护进程脚本只在 root 目录**：`/Library/Application Support/claude-switcher/` 下的保镖/看门狗属 root:wheel，任何功能都不要改回写 `~/.local/bin/` 下的同名脚本（用户可写=提权面）；需要变更时引导用户重跑安装器
+6. **守护进程脚本只在 root 目录**：`/Library/Application Support/claude-switcher/` 下的保镖/看门狗属 root:wheel，任何功能都不要改回写 `~/.local/bin/` 下的同名脚本（用户可写=提权面）；需要变更时引导用户重跑安装器。日志写在 root 所有的 `/var/log/claude-switcher/`，不要以 root 追加到用户目录（符号链接会被跟过去）
 
 ## 问题修复决策规则（Agent 必须遵守）
 

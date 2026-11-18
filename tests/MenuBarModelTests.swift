@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 
 private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性", "更优节点"]
+private let auditIDs = ["proxy_core", "tun", "egress_ip", "ip_stability", "timezone", "locale", "ipv6", "dns", "webrtc", "bodyguard", "rules", "client_language", "asn", "ip_purity", "ecosystem", "better_node"]
 
 private struct TestFailure: Error, CustomStringConvertible {
     let description: String
@@ -42,12 +43,20 @@ private final class Fixture {
         delay() { if [ -f "$root/$1-delay" ]; then /bin/sleep "$(cat "$root/$1-delay")"; fi; }
         result() { if [ -f "$root/$1-exit" ]; then exit "$(cat "$root/$1-exit")"; fi; }
         case "$1" in
-          checkdetail) delay check; cat "$root/audit"; result check ;;
+          checkdetail) delay check
+            if [ "$2" = "--json" ] && [ -f "$root/check-json-exit" ]; then
+              echo '用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region' >&2
+              exit "$(cat "$root/check-json-exit")"
+            fi
+            if [ "$2" = "--json" ] && [ -f "$root/report-json" ]; then cat "$root/report-json"
+            else cat "$root/audit"; fi
+            result check ;;
           status) cat "$root/status"; result status ;;
           get-client) echo 'client=clash-verge' ;;
           get-check-config) cat "$root/check-config"; result get-config ;;
           set-check-config) printf '%s\n' "$2" > "$root/saved-config"; result set-config ;;
           switch) delay switch; cat "$root/switch-output"; result switch ;;
+          lease) echo 'OK:租约有效至 2099-01-01T00:00:00+00:00' ;;
           # 切槽位现在会先扫一遍节点。默认报告里 BEST 为空 = 没什么可换,
           # 切换流程照旧往下走,不会平白多出一次 node-apply。
           node-scan) delay node-scan
@@ -124,6 +133,26 @@ private final class Fixture {
         try write("audit", auditKeys.map { "\($0)=\(changes[$0] ?? "ok")" }.joined(separator: "\n") + "\n")
     }
 
+    /// 让假核心返回 `claude-switcher-report/2`，用于验证界面优先读 JSON。
+    func jsonReport(_ states: [String: String] = [:], verdict: String = "established") throws {
+        let checks: [[String: Any]] = zip(auditIDs, auditKeys).map { pair in
+            let (id, name) = pair
+            let state = states[id] ?? "ok"
+            return ["id": id, "name": name, "state": state,
+                    "detail": "JSON:\(state)", "known": true]
+        }
+        let report: [String: Any] = [
+            "schema": "claude-switcher-report/2", "protocol": 2,
+            "verdict": verdict, "checks": checks,
+            "summary": ["missing": [], "missing_critical": [], "duplicates": []],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+        // 真实核心可能先在 stderr 打一行环境警告，run() 会把 stdout/stderr 合并。
+        // 这里把警告也带上，锁住“只取最后一条 JSON”的解析行为。
+        try write("report-json", "WARN:环境层缺失,使用保底值\n"
+                 + String(decoding: data, as: UTF8.self) + "\n")
+    }
+
     func vm(checkTimeout: TimeInterval = 2, operationTimeout: TimeInterval = 2) -> VM {
         let model = VM(core: core.path, checkTimeout: checkTimeout, operationTimeout: operationTimeout)
         // 拦截记录指到夹具目录:真实路径里是本机真实历史,断言会随环境飘。
@@ -163,8 +192,49 @@ struct MenuBarModelTests {
                 let vm = f.vm()
                 vm.start(); vm.start()
                 try f.idle(vm)
-                try expect(f.calls == ["checkdetail", "get-client", "status"], "启动不应重复检查")
+                try expect(f.calls == ["checkdetail --json", "get-client", "status"], "启动不应重复检查")
                 try expect(vm.phase == .ready && vm.lastCheckSummary == "通过" && vm.current == "A", "初始状态不一致")
+            case "json_report_preferred":
+                // 核心给 JSON 时按稳定 ID 填行，不再依赖中文文本；
+                // 这里故意让文本审计全绿、JSON 的出口 IP 为 fail。
+                try f.jsonReport(["egress_ip": "fail"], verdict: "violated")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                guard let egress = vm.rows.first(where: { $0.name == "出口 IP" }) else {
+                    throw TestFailure(description: "找不到「出口 IP」行")
+                }
+                try expect(egress.state == .fail, "JSON 的 fail 应传入界面")
+                try expect(egress.detail.contains("JSON:fail"), "应使用 JSON detail，实际 \(egress.detail)")
+                try expect(vm.phase == .failed, "violated 报告不应放行")
+                try expect(f.calls == ["checkdetail --json", "get-client", "status"],
+                           "JSON 成功时只能检查一次，实际 \(f.calls)")
+            case "stale_checkdetail_falls_back":
+                // 旧核心不认识 --json，退出码 2 + usage；必须补跑文本命令，
+                // 不能把版本不兼容误报成安全项失败。
+                try f.write("check-json-exit", "2")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.phase == .ready, "旧核心回退文本后应通过")
+                try expect(f.calls == ["checkdetail --json", "checkdetail", "get-client", "status"],
+                           "旧核心只应多补跑一次文本检查，实际 \(f.calls)")
+            case "json_pass_issues_lease":
+                // JSON 检查通过后必须先签发租约，再允许切换/拉起。
+                try f.jsonReport()
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.phase == .ready, "JSON 通过后应就绪")
+                try expect(f.calls == ["checkdetail --json", "get-client", "status", "lease"],
+                           "通过后必须签发一次租约，实际 \(f.calls)")
+            case "json_all_skipped_blocks":
+                // 全部 skip 时报告是 incomplete；16/16 行都有值也不能放行。
+                try f.jsonReport(Dictionary(uniqueKeysWithValues: auditIDs.map { ($0, "skip") }),
+                                 verdict: "incomplete")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.phase == .failed, "全 skip 的 incomplete 报告必须拦启动")
+                try expect(vm.banner.contains("没有任何项目被真正验证"),
+                           "要说清为什么不能启动，实际 \(vm.banner)")
+                try expect(vm.lastCheckSummary == "失败", "摘要不能写成通过（含跳过）")
             case "multi_account_status":
                 try f.write("status", "current=A hasA=1 hasB=1 hasC=1 hasD=0 accounts=A,B,C accA=1.2G@2026-10-20 accB=900M@2026-10-19 accC=2.0G@2026-10-18 cliA=151M@2026-11-04\n")
                 try f.write("switch-output", "OK:已切换到账号 C\n")
@@ -227,7 +297,7 @@ struct MenuBarModelTests {
                 vm.switchTo("B")
                 try f.idle(vm)
                 try expect(vm.lastCheckSummary == "有警告" && vm.current == "B", "警告应展示并允许切换")
-                try expect(f.calls == ["checkdetail", "get-client", "status", "slot-node get B",
+                try expect(f.calls == ["checkdetail --json", "get-client", "status", "slot-node get B",
                                   "node-scan", "switch B"],
                            "切换前必须先完整审计,再扫一遍节点")
             case "skipped_optional_allowed":
@@ -255,7 +325,7 @@ struct MenuBarModelTests {
                 try expect(Set(disabled ?? []) == Set(["DNS", "WebRTC"]), "保存必须保留已有禁用项并加入 WebRTC")
                 try expect(config?["allowOptionalFailures"] as? Bool == true, "保存必须保留非关键失败设置")
                 try expect(config?["logging"] as? Bool == false, "保存必须保留日志开关")
-                try expect(f.calls.contains("checkdetail"), "保存成功后必须重新检查")
+                try expect(f.calls.contains("checkdetail --json"), "保存成功后必须重新检查")
             case "local_status_refresh":
                 let vm = f.vm()
                 vm.refreshAccountStatus()
@@ -263,14 +333,14 @@ struct MenuBarModelTests {
                 vm.start(); try f.idle(vm)
                 try f.write("status", "current=B hasA=1 hasB=1\n")
                 vm.refreshAccountStatus(); try f.idle(vm)
-                try expect(f.calls == ["checkdetail", "get-client", "status", "status"], "展开菜单只应读取本地状态")
+                try expect(f.calls == ["checkdetail --json", "get-client", "status", "status"], "展开菜单只应读取本地状态")
                 try expect(vm.current == "B" && vm.lastCheckSummary == "通过", "账号更新不应改变上次审计结果")
             case "fresh_audit":
                 let vm = f.vm()
                 vm.refresh(); try f.idle(vm)
                 try f.audit(["TUN网卡": "fail:已断开"])
                 try f.deniedSwitch(vm)
-                try expect(f.calls.filter { $0 == "checkdetail" }.count == 2, "不可复用上次通过结果")
+                try expect(f.calls.filter { $0.hasPrefix("checkdetail") }.count == 2, "不可复用上次通过结果")
             case "failed_check":
                 try f.audit(["WebRTC": "fail:演示失败"])
                 try f.deniedSwitch(f.vm())
@@ -371,7 +441,7 @@ struct MenuBarModelTests {
                 try expect(!vm.canQuit, "切换请求开始后不可退出")
                 vm.switchTo("A"); vm.refresh(); vm.fixAll(); vm.inspectFingerprint()
                 try f.idle(vm)
-                try expect(f.calls == ["checkdetail", "get-client", "status", "slot-node get B",
+                try expect(f.calls == ["checkdetail --json", "get-client", "status", "slot-node get B",
                                   "node-scan", "switch B"],
                            "忙碌时应忽略重复操作")
                 try expect(vm.canQuit && vm.current == "B", "切换完成后应允许退出")
@@ -382,7 +452,7 @@ struct MenuBarModelTests {
                 try expect(!vm.canQuit, "修复期间不可退出")
                 vm.refresh(); vm.switchTo("B"); vm.fixAll()
                 try f.idle(vm)
-                try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "修复结束必须重新检查，不能并行执行")
+                try expect(f.calls == ["fix", "checkdetail --json", "get-client", "status"], "修复结束必须重新检查，不能并行执行")
                 try expect(vm.canQuit && vm.phase == .ready, "修复后应该可以退出")
             case "watch_after_pass":
                 // 启动门禁只管拉起那一刻。通过之后必须立刻把运行期守护挂上,
@@ -767,7 +837,7 @@ struct MenuBarModelTests {
                 try expect(vm.note.contains("已切到更干净节点 鱼3·美国-犹他州"),
                            "回执要说清换了哪条,实际 \(vm.note)")
                 // 换完线路必须重新审计:不能拿换之前那份结果放行。
-                let audits = f.calls.filter { $0 == "checkdetail" }.count
+                let audits = f.calls.filter { $0.hasPrefix("checkdetail") }.count
                 try expect(audits == 2, "换完节点要重新审计一遍,实际 \(audits) 次")
 
             case "switch_survives_node_apply_failure":

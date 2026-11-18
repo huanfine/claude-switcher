@@ -45,6 +45,7 @@ class TzWatchdogTests(unittest.TestCase):
         self.assertIn("__TZ_TARGET__", text)
         self.assertIn("__HOME__", text)
         text = text.replace("__TZ_TARGET__", baked).replace("__HOME__", str(self.home))
+        text = text.replace("__LOG_DIR__", str(self.home / "Library/Logs"))
         text = text.replace("/usr/sbin/systemsetup", str(self.fake_systemsetup))
         text = text.replace("/etc/localtime", str(self.localtime))
         path = self.base / "tz-watchdog.sh"

@@ -32,6 +32,9 @@ SCENARIOS = (
     "incidents_loaded", "incidents_malformed_ignored", "incidents_missing_file",
     # 节点扫描报告 → 界面只更新「更优节点」这一行
     "node_scan_report_updates_row",
+    # 新核心优先读 JSON；旧核心拒绝 --json 时回退文本
+    "json_report_preferred", "stale_checkdetail_falls_back", "json_all_skipped_blocks",
+    "json_pass_issues_lease",
     # 换槽位要先扫节点、有更干净的先换线路再切账号;换失败也不能拖死切账号
     "switch_scans_and_applies_better_node", "switch_survives_node_apply_failure",
     "switch_prefers_slot_bound_node", "slot_node_binding_round_trip",

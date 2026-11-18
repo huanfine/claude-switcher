@@ -40,7 +40,7 @@ jobs:
           done
           bash -n "installer/安装.command"
           bash -n "installer/卸载.command"
-          for file in linux/*.sh; do
+          for file in linux/*.sh scripts/*.sh; do
             bash -n "$file"
           done
 
@@ -82,6 +82,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pwsh -NoProfile -File tests\windows-asn-integration.ps1
           exit $LASTEXITCODE
+
+      # 报告 v2 此前只有静态字符串断言；这两个步骤真实执行 report 命令，
+      # 覆盖临时 HOME、14/16 缺失项、指纹与 verdict。
+      - name: Report integration (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-report-integration.ps1
+
+      - name: Report integration (pwsh 7)
+        shell: pwsh
+        run: pwsh -NoProfile -File tests\windows-report-integration.ps1
 
       # windows/ 下的两个隔离集成回归此前只写在 AGENTS.md 里，CI 从不执行，
       # 导致加密快照在 PS 5.1 下整体不可用仍能合入 main。两个 shell 都跑：

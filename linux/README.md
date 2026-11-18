@@ -40,9 +40,13 @@ bash install.sh
 ```bash
 claude-switch menu          # 交互菜单(推荐)
 claude-switch checkdetail   # 14 项逐项检查
+claude-switch checkdetail --json  # 同一轮检查 + last-report.json
+claude-switch report [报告] # 离线转成 claude-switcher-report/2,不重新探测
 claude-switch fix           # 一键修复
 claude-switch switch A      # 切到账号A(切换浏览器登录态)
 ```
+
+`checkdetail --json` 和 `report` 使用与 macOS 相同的 16 个稳定 ID。Linux 版目前只有 14 项，缺少的 `IP纯净度` / `更优节点` 会明确写进 `summary.missing`，不会伪造 `ok` 或让报告看起来已验证。
 
 ## 多代理客户端说明
 

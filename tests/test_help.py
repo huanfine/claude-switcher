@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "core" / "claude-switch.sh"
 
 # 只给安装器调用的隐藏入口,不该出现在面向用户的说明里。
-HIDDEN = {"write-merge-rules"}
+HIDDEN = {"write-merge-rules", "fake-prefix", "restart-clash", "lease-revoke"}
 
 
 def dispatched_commands():

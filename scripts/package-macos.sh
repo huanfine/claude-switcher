@@ -20,12 +20,10 @@ esac
 APP_NAME="Claude 环境检查器"
 BUILD="$ROOT/build"
 APP="$BUILD/$APP_NAME.app"
-ARCH="$(uname -m)"
-case "$ARCH" in
-    arm64)  ARCH_LABEL="arm64" ;;
-    x86_64) ARCH_LABEL="x86_64" ;;
-    *)      ARCH_LABEL="$ARCH" ;;
-esac
+# 通用二进制:同一份包必须能在 Apple Silicon 与 Intel 上启动。
+# 只按构建机 uname -m 出一个 slice 时,Intel 用户下载 arm64 包会直接
+# 「bad CPU type in executable」——这正是换一台电脑就装不上的根因。
+ARCH_LABEL="universal"
 ZIP="$BUILD/ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-app-only.zip"
 DMG="$BUILD/ClaudeSwitcher-$VERSION-macos-$ARCH_LABEL-app-only.dmg"
 KIT_NAME="ClaudeSwitcher-$VERSION"
@@ -40,18 +38,27 @@ trap cleanup EXIT
 
 mkdir -p "$BUILD"
 rm -rf "$APP" "$ZIP" "$DMG" "$KIT_ZIP" "$FULL_ZIP"
+# 发布 workflow / release-check 读这个文件决定资产名,避免两边各写一份架构值。
+printf '%s\n' "$ARCH_LABEL" > "$BUILD/ARCH_LABEL"
 
-echo "==> 编译 $APP_NAME $VERSION ($ARCH_LABEL)"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+echo "==> 编译 $APP_NAME $VERSION (universal: arm64 + x86_64)"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$WORK/bin"
 # -Xfrontend -disable-sandbox:SwiftUI 的 @State 是宏,展开要跑 swift-plugin-server。
 # 编译器把插件关进沙箱时,插件会返回 malformed response,报出来的却是一堆
 # 「@State 不存在 / cannot assign to property」的假错误。安装器早就加了这个开关,
 # 打包脚本没加 —— 同一份源码两套结果,构建机上会莫名其妙编不过。
-swiftc -O -parse-as-library -warnings-as-errors -Xfrontend -disable-sandbox \
-    -target "$ARCH-apple-macos13.0" \
-    "$ROOT/app/main.swift" \
-    -o "$APP/Contents/MacOS/ClaudeSwitcher" \
-    -framework SwiftUI -framework AppKit
+for SLICE in arm64 x86_64; do
+    swiftc -O -parse-as-library -warnings-as-errors -Xfrontend -disable-sandbox \
+        -target "$SLICE-apple-macos13.0" \
+        "$ROOT/app/main.swift" \
+        -o "$WORK/bin/ClaudeSwitcher-$SLICE" \
+        -framework SwiftUI -framework AppKit
+    done
+/usr/bin/lipo -create "$WORK/bin/ClaudeSwitcher-arm64" "$WORK/bin/ClaudeSwitcher-x86_64" \
+    -output "$APP/Contents/MacOS/ClaudeSwitcher"
+ARCHS="$(/usr/bin/lipo -archs "$APP/Contents/MacOS/ClaudeSwitcher")"
+case "$ARCHS" in *arm64*) ;; *) echo "✗ 通用二进制缺少 arm64: $ARCHS" >&2; exit 1 ;; esac
+case "$ARCHS" in *x86_64*) ;; *) echo "✗ 通用二进制缺少 x86_64: $ARCHS" >&2; exit 1 ;; esac
 
 echo "==> 生成图标"
 ICONSET="$WORK/AppIcon.iconset"
@@ -165,7 +172,7 @@ old packages and cannot be opened. Never paste a garbled name into a terminal.
 
 包内已经带上编译好的 App、核心脚本、守护进程与安装器:
 不需要 Xcode、不需要另下别的包、不需要再跑升级命令。
-Needs macOS 13+, Apple Silicon, python3, a running proxy client, Claude desktop.
+Needs macOS 13+, Apple Silicon or Intel, python3, a running proxy client, Claude desktop.
 
 一体化包(*-full.zip)内所有文件名均为 ASCII,解压后不会出现乱码。
 安装入口及其内部路径全是 ASCII,不受解压工具影响。

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Claude 账号切换器 - Linux 核心脚本
-# 用法: claude-switch.sh checkdetail|status|fix|switch A|B|menu  (隐藏: write-merge-rules 供安装器调用)
+# 用法: claude-switch.sh checkdetail [--json]|report [报告]|status|fix|switch A|B|menu  (隐藏: write-merge-rules 供安装器调用)
 set -u
 export LC_ALL=en_US.UTF-8
 
@@ -248,6 +248,160 @@ checkdetail() {
 
 # 置顶规则写入(智能合并):不整文件覆盖,用户已有的 Merge 配置原样保留
 # 标记块自包含 prepend-rules 键+全部规则,重复执行幂等
+# 报告 v2:Linux 原生入口。纯离线转换,不重新探测;16 个稳定 ID 与 macOS
+# 契约一致,本版没有的 IP纯净度/更优节点 会如实留在 summary.missing。
+report_json() {
+    local path="${1:-$BASE/last-check.txt}" core="${2:-$0}"
+    REPORT_PATH="$path" REPORT_BASE="$BASE" REPORT_CORE="$core" \
+    REPORT_PROXY_MODE="$PROXY_MODE" REPORT_PROXY_GROUP="$PROXY_GROUP" \
+    REPORT_COUNTRY="$COUNTRY_TARGET" REPORT_TZ="$TZ_TARGET" \
+    REPORT_LOCALE="$LOCALE_TARGET" python3 - <<'PY'
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import uuid
+
+SPECS = (
+    ("proxy_core", "代理内核", True), ("tun", "TUN网卡", True),
+    ("egress_ip", "出口IP", True), ("ip_stability", "IP一致", False),
+    ("timezone", "时区", True), ("locale", "地区", True),
+    ("ipv6", "IPv6", True), ("dns", "DNS", False),
+    ("webrtc", "WebRTC", False), ("bodyguard", "保镖", True),
+    ("rules", "规则置顶", True), ("client_language", "客户端语言", False),
+    ("asn", "ASN属性", False), ("ip_purity", "IP纯净度", False),
+    ("ecosystem", "生态可达性", False), ("better_node", "更优节点", False),
+)
+
+def fail(message):
+    print(message, file=os.sys.stderr)
+    raise SystemExit(2)
+
+try:
+    text = Path(os.environ["REPORT_PATH"]).read_text(encoding="utf-8", errors="replace")
+except OSError:
+    fail("找不到检查报告")
+now = datetime.datetime.now().astimezone()
+started = now
+first = text.splitlines()[0] if text.splitlines() else ""
+match = re.match(r"^# (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", first)
+if match:
+    try:
+        started = datetime.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").astimezone()
+    except ValueError:
+        started = now
+checked_at = started.isoformat(timespec="seconds")
+
+observed = {}
+order = []
+duplicates = []
+for line in text.splitlines():
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    name, _, rest = line.partition("=")
+    state, _, detail = rest.partition(":")
+    name, state = name.strip(), state.strip()
+    if state not in ("ok", "warn", "fail", "skip", "config") or not name:
+        continue
+    if name in observed:
+        if name not in duplicates:
+            duplicates.append(name)
+        continue
+    observed[name] = (state, detail.strip())
+    order.append(name)
+
+spec_by_name = {name: (check_id, critical) for check_id, name, critical in SPECS}
+known_names = {name for _, name, _ in SPECS}
+checks = []
+for _id, name, critical in SPECS:
+    if name not in observed:
+        continue
+    state, detail = observed[name]
+    checks.append({
+        "id": _id, "name": name, "critical": critical, "state": state,
+        "evidence": detail, "remedy": "", "detail": detail,
+        "checked_at": checked_at, "known": True,
+    })
+for name in order:
+    if name in known_names:
+        continue
+    state, detail = observed[name]
+    checks.append({
+        "id": "unknown-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12],
+        "name": name, "critical": False, "state": state,
+        "evidence": detail, "remedy": "", "detail": detail,
+        "checked_at": checked_at, "known": False,
+    })
+
+present = {name for name in observed}
+missing = [name for _, name, _ in SPECS if name not in present]
+missing_critical = [name for _, name, critical in SPECS if critical and name not in present]
+blockers = [item["name"] for item in checks if item["state"] in ("fail", "config")]
+critical_blockers = [item["name"] for item in checks if item["critical"] and item["state"] in ("fail", "config")]
+advisories = [item["name"] for item in checks if item["state"] == "warn"]
+skipped = [item["name"] for item in checks if item["state"] == "skip"]
+evidence_missing = [item["name"] for item in checks if item["critical"] and item["state"] == "ok" and not item["evidence"]]
+verified = [item for item in checks if item["state"] in ("ok", "warn")]
+if duplicates or blockers:
+    verdict = "violated"
+elif not verified or missing_critical:
+    verdict = "incomplete"
+else:
+    verdict = "established"
+
+try:
+    core_bytes = Path(os.environ["REPORT_CORE"]).read_bytes()
+except OSError:
+    core_bytes = b""
+core_sha = hashlib.sha256(core_bytes).hexdigest()
+version_path = Path(os.environ["REPORT_BASE"]) / "version.txt"
+try:
+    core_version = version_path.read_text(encoding="utf-8").strip()
+except OSError:
+    core_version = "unknown"
+if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", core_version):
+    core_version = "unknown"
+environment = {
+    "proxy_mode": os.environ.get("REPORT_PROXY_MODE", ""),
+    "proxy_group": os.environ.get("REPORT_PROXY_GROUP", ""),
+    "country": os.environ.get("REPORT_COUNTRY", ""),
+    "timezone": os.environ.get("REPORT_TZ", ""),
+    "locale": os.environ.get("REPORT_LOCALE", ""),
+}
+material = json.dumps({"platform": "Linux", "environment": environment,
+                       "core_sha256": core_sha}, sort_keys=True, ensure_ascii=False)
+fingerprint = hashlib.sha256(material.encode("utf-8")).hexdigest()
+report_id = uuid.uuid4().hex
+doc = {
+    "schema": "claude-switcher-report/2", "protocol": 2,
+    "report_id": report_id, "run_id": report_id,
+    "created_at": now.isoformat(timespec="seconds"),
+    "expires_at": (now + datetime.timedelta(minutes=30)).isoformat(timespec="seconds"),
+    "config_fingerprint": fingerprint, "core_sha256": core_sha,
+    "core_version": core_version, "host": platform.node(),
+    "platform": "Linux", "verdict": verdict, "environment": environment,
+    "checks": checks,
+    "summary": {
+        "expected": len(SPECS), "total": len(checks),
+        "passed": sum(1 for item in checks if item["state"] == "ok"),
+        "warning": len(advisories),
+        "failed": sum(1 for item in checks if item["state"] == "fail"),
+        "config": sum(1 for item in checks if item["state"] == "config"),
+        "skipped": len(skipped), "blockers": blockers,
+        "critical_blockers": critical_blockers, "advisories": advisories,
+        "skipped_names": skipped, "missing": missing,
+        "missing_critical": missing_critical, "evidence_missing": evidence_missing,
+        "duplicates": duplicates,
+        "unknown": [item["name"] for item in checks if not item["known"]],
+    },
+}
+print(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
 write_merge_rules() {
     M="$CLASH_DIR/profiles/Merge.yaml"
     B0="# >>> claude-switcher pinned rules >>>"
@@ -558,11 +712,26 @@ menu() {
 }
 
 case "${1:-menu}" in
-    checkdetail) OUT="$BASE/last-check.txt"; { checkdetail; } > "$OUT" 2>&1; cat "$OUT" ;;
+    checkdetail)
+        OUT="$BASE/last-check.txt"
+        if [ "${2:-}" = "--json" ]; then
+            STARTED="$(date '+%F %T')"
+            { echo "# $STARTED pid=$$ 开始"; checkdetail; check_rc=$?; echo "# 结束"; } > "$OUT" 2>&1
+            if report_json "$OUT" "$0" > "$BASE/last-report.json" 2>/dev/null; then
+                chmod 600 "$BASE/last-report.json" 2>/dev/null || true
+                cat "$BASE/last-report.json"
+            else
+                echo '{"schema":"claude-switcher-report/2","protocol":2,"verdict":"incomplete","error":"report generation failed"}'
+                check_rc=1
+            fi
+            exit "${check_rc:-0}"
+        fi
+        { checkdetail; } > "$OUT" 2>&1; cat "$OUT" ;;
+    report) report_json "${2:-$BASE/last-check.txt}" "$0" ;;
     status) status ;;
     fix) fix ;;
     switch) switch_to "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     menu) menu ;;
-    *) echo "用法: claude-switch.sh checkdetail|status|fix|switch A|B|menu"; exit 2 ;;
+    *) echo "用法: claude-switch.sh checkdetail [--json]|report [报告]|status|fix|switch A|B|menu"; exit 2 ;;
 esac

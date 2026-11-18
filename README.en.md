@@ -91,14 +91,14 @@ repository, command-line script, and build artifact name.
 
 ### Another machine: one package, one double-click (recommended)
 
-Download `*-macos-arm64-full.zip` from the
+Download `*-macos-universal-full.zip` from the
 [latest release](https://github.com/huanfine/claude-switcher/releases/latest),
 unzip it, and double-click `INSTALL.command`. Confirm the proxy group / region and
 enter your password once; the app appears on the Desktop.
 
 The bundle already contains the compiled app, core script, daemons, and installer:
 **no Xcode, no choosing between packages, no separate upgrade command.** The target
-needs macOS 13+, Apple Silicon, python3, a running proxy client, and the Claude
+needs macOS 13+, Apple Silicon or Intel (universal binary), python3, a running proxy client, and the Claude
 desktop app. The app is ad-hoc signed and not notarized, so the first launch may need
 right-click → Open (the launcher clears download quarantine inside the package).
 **Use only `INSTALL.command`.** Current full bundles are ASCII-only: after unzipping,
@@ -117,8 +117,7 @@ shasum -a 256 -c SHA256SUMS-release.txt
 ~/.local/bin/claude-switch.sh help | grep -E 'node-scan|slot-node'
 ```
 
-Other packages are only for special cases: `*-installer-kit.zip` (Intel Mac or
-build from source), `*-app-only.dmg` (UI only), `scripts/upgrade-core.sh` (upgrade
+Other packages are only for special cases: `*-installer-kit.zip` (build from source), `*-app-only.dmg` (UI only), `scripts/upgrade-core.sh` (upgrade
 a stale core in place), `*-windows.zip` / `*-linux.tar.gz` (Beta). Pushing a `v*`
 tag triggers the release workflow to rebuild and publish every package.
 
@@ -136,7 +135,7 @@ upgrades only half of it. Releases that change only the core script (such as
 
 When in doubt, re-run the full bundle — it is the least error-prone path:
 
-1. Download `*-macos-arm64-full.zip` from the
+1. Download `*-macos-universal-full.zip` from the
    [latest release](https://github.com/huanfine/claude-switcher/releases/latest).
 2. Unzip it and double-click the top-level `INSTALL.command`; enter your login
    password once. The installer overwrites the desktop app, the core script and the

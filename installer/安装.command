@@ -2,13 +2,21 @@
 # Claude 切换器 - 通用安装程序 (macOS)
 cd "$(dirname "$0")"
 REPO="$(cd .. && pwd)"
-# 版本号只从包里的 VERSION 文件读(打包脚本写入)。以前这里把 1.0 写死在
+# 版本号优先读包里的 VERSION 文件(打包脚本写入)。以前这里把 1.0 写死在
 # Info.plist 里,于是「现场编译」那条路径装出来的界面全都显示 1.0 —— 排查时
 # 分不清用户装的到底是哪一版,连自检输出都失去意义。
 APP_VERSION="$(head -1 "$REPO/VERSION" 2>/dev/null | tr -d '[:space:]')"
+# 源码安装(clone 仓库后直接双击本安装器)没有打包写入的 VERSION。退回 git 描述,
+# 否则文档推荐的这条安装路径装出来的机器一律叫 0.0.0-dev,又回到分不清版本的老问题。
+if [ -z "$APP_VERSION" ]; then
+    APP_VERSION="$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null | tr -d '[:space:]')"
+    APP_VERSION="${APP_VERSION#v}"
+fi
+# 字符集与长度必须与核心 app_version() 的校验一致,不合格的值写进去等于让报告退回 unknown。
 case "$APP_VERSION" in
     ''|*[!0-9A-Za-z._-]*) APP_VERSION="0.0.0-dev" ;;
 esac
+[ "${#APP_VERSION}" -le 40 ] || APP_VERSION="0.0.0-dev"
 H="$HOME"
 # 一体化安装包(*-full.zip)把编译好的 App 一起带上了。检测到就直接复制，
 # 不再要求目标机装 Xcode / swiftc——SwiftUI 宏在部分系统上是装不上的重灾区。
@@ -202,8 +210,27 @@ else
     esac
 fi
 echo "✓ 代理客户端: $MODE"
-if [ ! -d /Applications/Claude.app ]; then
-    echo "⚠️  未检测到 Claude 桌面版(/Applications/Claude.app),请先安装。"
+
+# 哪些网络服务还开着 IPv6,一行一个。
+# 不能只关 Wi-Fi:插网线走 Ethernet、或开着 iPhone USB 共享时,IPv6 会从别的
+# 服务继续可用,安装完检查项立刻报「IPv6未关闭」。这里和核心脚本用同一口径。
+ipv6_on_services() {
+    local s
+    while IFS= read -r s; do
+        case "$s" in ''|'*'*) continue ;; esac
+        /usr/sbin/networksetup -getinfo "$s" 2>/dev/null \
+            | grep -i '^IPv6:' | grep -qiv 'Off' && printf '%s\n' "$s"
+    done <<< "$(/usr/sbin/networksetup -listallnetworkservices 2>/dev/null | tail -n +2)"
+}
+
+# Claude 桌面版不一定在 /Applications:用户可以把 App 拖进 ~/Applications。
+# 只认 /Applications 会让安装器在完全正常的机器上拒绝继续。
+CLAUDE_APP=""
+for _c in /Applications/Claude.app "$H/Applications/Claude.app"; do
+    [ -d "$_c" ] && { CLAUDE_APP="$_c"; break; }
+done
+if [ -z "$CLAUDE_APP" ]; then
+    echo "⚠️  未检测到 Claude 桌面版(/Applications 或 ~/Applications),请先安装。"
     read -n 1 -s -r -p "按任意键退出..."; exit 1
 fi
 if ! python3 --version >/dev/null 2>&1; then
@@ -310,6 +337,7 @@ echo "✓ 地区格式: $LOCALE"
 
 # ---- 3. 安装文件 ----
 mkdir -p "$H/.local/bin" "$H/.claude-switcher" "$H/Library/Logs"
+chmod 700 "$H/.claude-switcher"
 cp "$REPO/core/claude-switch.sh" "$H/.local/bin/"
 cp "$REPO/core/stun-probe.py" "$H/.claude-switcher/"
 chmod +x "$H/.local/bin/claude-switch.sh"
@@ -321,19 +349,41 @@ chmod +x "$H/.local/bin/claude-switch.sh"
     "timezone=$TZV" "locale=$LOCALE" >/dev/null 2>&1 || {
     echo "✗ 环境配置写入失败($H/.claude-switcher/env.json)"; exit 1; }
 
+# 安装版本落盘。核心的报告/诊断靠 ~/.claude-switcher/version.txt 回答「装的是哪一版」,
+# 以前只有 Windows 安装器写它,macOS 侧 app_version() 永远读不到,报告里 version 恒为 unknown。
+# 这里记的是**安装包版本**;核心之后被 update 换过没有,看报告 config_fingerprint 里的核心 SHA-256。
+printf '%s\n' "$APP_VERSION" > "$H/.claude-switcher/version.txt"
+chmod 600 "$H/.claude-switcher/version.txt"
+
+# 保镖必须认识用户实际的 fake-ip 网段(默认 198.18.0.0/16)。让核心按 env.json
+# 与 Clash 订阅解析一次,写成 grep 用的前缀;解析失败退回默认,不能让保镖把
+# 自定义网段的 TUN 判成离线。
+FAKE_PREFIX=$("$H/.local/bin/claude-switch.sh" fake-prefix 2>/dev/null || true)
+case "$FAKE_PREFIX" in
+    *[!0-9.]*|'') FAKE_PREFIX="198.18." ;;
+esac
+case "$FAKE_PREFIX" in
+    *.) ;;
+    *) FAKE_PREFIX="198.18." ;;
+esac
+LOG_DIR="/var/log/claude-switcher"
+
 # 保镖/时区看门狗脚本:物化到临时目录,由 sudo 段装入 root 所有的系统目录(用户态不可写,防提权)
 STAGE=$(mktemp -d)
-sed -e "s|__HOME__|$H|g" -e "s|__PROXY_MODE__|$MODE|g" \
+sed -e "s|__PROXY_MODE__|$MODE|g" -e "s|__FAKE_PREFIX__|$FAKE_PREFIX|g" \
+    -e "s|__LOG_DIR__|$LOG_DIR|g" \
     "$REPO/daemons/claude-bodyguard.sh" > "$STAGE/claude-bodyguard.sh"
 sed -e "s|__HOME__|$H|g" -e "s|__TZ_TARGET__|$TZV|g" \
+    -e "s|__LOG_DIR__|$LOG_DIR|g" \
     "$REPO/daemons/tz-watchdog.sh" > "$STAGE/tz-watchdog.sh"
 chmod +x "$STAGE/claude-bodyguard.sh" "$STAGE/tz-watchdog.sh"
-# 清理旧版本装在用户目录下的守护脚本(用户可写=提权面)
+# 清理旧版本装在用户目录下的守护脚本与 plist(用户可写=提权面)
 rm -f "$H/.local/bin/claude-bodyguard.sh" "$H/.local/bin/tz-watchdog.sh" \
-      "$H/.local/bin/claude-bodyguard.sh.bak" "$H/.local/bin/tz-watchdog.sh.bak"
+      "$H/.local/bin/claude-bodyguard.sh.bak" "$H/.local/bin/tz-watchdog.sh.bak" \
+      "$H/.local/bin/local.claude-bodyguard.plist" "$H/.local/bin/local.tz-watchdog.plist"
 
-# launchd 配置(保镖/看门狗的 ProgramArguments 已指向系统目录,直接拷贝;自动更新为 LaunchAgent)
-cp "$REPO/daemons/local.claude-bodyguard.plist" "$REPO/daemons/local.tz-watchdog.plist" "$H/.local/bin/"
+# LaunchDaemon plist 由 sudo 段直接从安装包拷贝,不再落到用户可写目录;
+# 自动更新仍是用户态 LaunchAgent。
 sed "s|__HOME__|$H|g" "$REPO/daemons/local.claude-update.plist" > "$H/.local/bin/local.claude-update.plist"
 echo "✓ 核心文件已安装"
 
@@ -426,11 +476,16 @@ if [ -n "$DRYRUN" ]; then
     rm -rf "$STAGE"
 else
     # 守护脚本装入 root 所有的系统目录;同时清理旧版的 root 级自动更新(已改为用户态 LaunchAgent)
-    SYSCMDS="mkdir -p '/Library/Application Support/claude-switcher';
+    SYSCMDS="mkdir -p '/Library/Application Support/claude-switcher' '$LOG_DIR';
+        chown root:wheel '/Library/Application Support/claude-switcher' '$LOG_DIR';
+        chmod 755 '/Library/Application Support/claude-switcher' '$LOG_DIR';
+        touch '$LOG_DIR/claude-bodyguard.log' '$LOG_DIR/tz-watchdog.log';
+        chown root:wheel '$LOG_DIR/claude-bodyguard.log' '$LOG_DIR/tz-watchdog.log';
+        chmod 644 '$LOG_DIR/claude-bodyguard.log' '$LOG_DIR/tz-watchdog.log';
         cp '$STAGE/claude-bodyguard.sh' '$STAGE/tz-watchdog.sh' '/Library/Application Support/claude-switcher/';
         chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh';
         chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh';
-        cp '$H/.local/bin/local.claude-bodyguard.plist' '$H/.local/bin/local.tz-watchdog.plist' /Library/LaunchDaemons/;
+        cp '$REPO/daemons/local.claude-bodyguard.plist' '$REPO/daemons/local.tz-watchdog.plist' /Library/LaunchDaemons/;
         chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
         chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
         launchctl bootout system/local.claude-bodyguard 2>/dev/null; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist;
@@ -438,8 +493,14 @@ else
         launchctl bootout system/local.claude-update 2>/dev/null; rm -f /Library/LaunchDaemons/local.claude-update.plist;"
     curt=$(readlink /etc/localtime 2>/dev/null)
     [ "$curt" != "/var/db/timezone/zoneinfo/$TZV" ] && SYSCMDS="$SYSCMDS /usr/sbin/systemsetup -settimezone '$TZV';"
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || SYSCMDS="$SYSCMDS networksetup -setv6off Wi-Fi;"
+    # 逐条服务关 IPv6。只关 Wi-Fi 会漏掉 Ethernet / iPhone USB / 雷雳网桥,
+    # 换一台以有线网络为主的机器,安装完检查项会直接红。
+    v6="$(ipv6_on_services)"
+    if [ -n "$v6" ]; then
+        while IFS= read -r svc; do
+            [ -n "$svc" ] && SYSCMDS="$SYSCMDS /usr/sbin/networksetup -setv6off $(printf '%q' "$svc");"
+        done <<< "$v6"
+    fi
     SYSCMDS="$SYSCMDS dscacheutil -flushcache; killall -HUP mDNSResponder"
     echo ""
     echo "接下来需要输入一次开机密码,用于: 安装守护进程(系统目录) + 锁定时区($TZV) + 关闭IPv6"
@@ -458,10 +519,12 @@ else
 fi
 
 # ---- 7. 重启 Clash 使规则生效(仅 Clash Verge) ----
+# 不要再自己写 osascript quit + sleep 2:该 Tauri 应用对 AppleScript quit 不生效,
+# 内核会继续用旧规则。restart-clash 会等进程真的退出、必要时 SIGTERM,并轮询
+# 内核 /rules 确认置顶规则已加载。
 if [ -z "$DRYRUN" ] && [ "$MODE" = "clash-verge" ]; then
-    osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
-    sleep 2
-    open -a "Clash Verge" >/dev/null 2>&1
+    "$H/.local/bin/claude-switch.sh" restart-clash || \
+        echo "⚠️  客户端重启后置顶规则未验证通过,请稍后运行 claude-switch.sh fix"
 fi
 
 # ---- 8. 自检 ----
