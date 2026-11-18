@@ -295,7 +295,32 @@ FIX:WebRTC ✗ UDP 3478 规则没置顶 · 点「一键修复」
 
 报告里的 `probes` 是可选扩展，不参与 `config_fingerprint`，旧报告没有该字段时仍按原语义解析和签发租约。`probes.proxy` 记录正常代理链路的连通性/延迟（`status` / `http_code` / `latency_ms`）；`probes.direct` 在 TUN 开启时固定为 `unknown`，`reason=not_measured_while_tun_up`，不把“没测”写成 0；`probes.drill` 记录最近一次演练的 `tcp` / `dns` / `webrtc` 计数，每项都有 `status`、`success`、`failure`、`elapsed_ms`，探针或命令不可用时这三个数值为 `null`。
 
-排障手册、架构纪律与验收标准见 [AGENTS.md](AGENTS.md)。
+报告里的 `fail_closed` 字段恒在，回答的是另一个问题：**「代理挂了会不会直连」这件事被证明过没有**。取值 `unverified`（没跑过演练）/ `violated`（演练证明会直连）/ `established`（演练通过且证据在 7 天内）/ `stale`（证据过期或时间读不出来）。它是软信号——不拦启动、不进 `blockers`、不参与 `config_fingerprint`，但会追加到 `check` 的 OK 行并常驻显示在主界面。**16 项全绿只证明流量此刻走了代理**，证明不了故障时不直连；后者只有 `drill` 能验。旧报告缺这个字段时按 `unverified` 处理，不当成通过。
+
+排障手册、架构纪律与验收标准见 [AGENTS.md](AGENTS.md)；分层结构、契约演进与已知缺口见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+## 平台能力矩阵
+
+三个平台共用同一套报告格式与检查 ID，但**防护深度不一样**。装之前先看清自己这个平台有什么：
+
+| 能力 | macOS | Windows（Beta） | Linux（实验） |
+|---|---|---|---|
+| 逐项检查 | 16 项 | 14 项（缺 IP纯净度 / 更优节点） | 14 项（同左） |
+| 报告 v2 / 离线转换 | ✓ | ✓ | ✓ |
+| 一键修复 / A–D 切换 | ✓ | ✓ | ✓ |
+| 保镖（代理进程没了就停 Claude） | ✓ root LaunchDaemon | ✓ 计划任务 | ✓ |
+| 启动租约（120 秒一次性授权） | ✓ | ✗ | ✗ |
+| 运行期出口看门狗（出口漂移即停） | ✓ | ✗ | ✗ |
+| 故障演练 `drill`（证明断开不直连） | ✓ | ✗ | ✗ |
+| 离线复核 `verdict` / `evidence` | ✓ | ✗ | ✗ |
+| 节点扫描 / 应用 / 槽位绑定 | ✓ | ✗ | ✗ |
+| WebRTC 策略切换 | ✓ | ✗ | ✗ |
+| 检查项开关（降级防护） | ✓ | ✓ | ✗ |
+| 加密快照导出 / 导入 | ✓ | ✓（格式与 macOS 不互通） | ✗ |
+| 自动更新（SHA256 校验） | ✓ | ✓ | ✗ |
+| 图形界面 | SwiftUI 菜单栏 App | WPF | 终端菜单 |
+
+缺的那几项不是「以后补」，是当前的真实边界：**没有 `drill` 就无从证明 fail-closed，没有 `watch` 就只覆盖「代理进程没了」，不覆盖「出口悄悄换了」**。Windows / Linux 上「检查全绿」的含义比 macOS 弱，别按同一套预期使用。
 
 ## 来源与许可
 

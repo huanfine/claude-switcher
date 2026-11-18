@@ -316,11 +316,24 @@ struct CheckReport: Decodable {
         }
     }
 
+    /// fail-closed 证据。旧核心没有这个字段 —— 缺字段按「未验证」处理，
+    /// 不能因为读不到就当成通过。
+    struct FailClosed: Decodable {
+        let status: String
+        let checkedAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case checkedAt = "checked_at"
+        }
+    }
+
     let schema: String
     let protocolVersion: Int
     let verdict: String
     let checks: [Item]
     let summary: Summary?
+    let failClosed: FailClosed?
 
     enum CodingKeys: String, CodingKey {
         case schema
@@ -328,6 +341,7 @@ struct CheckReport: Decodable {
         case verdict
         case checks
         case summary
+        case failClosed = "fail_closed"
     }
 }
 
@@ -469,6 +483,9 @@ final class VM: ObservableObject {
     private var cliPollTimer: Timer?
     @Published private(set) var isSwitchingClient = false
     @Published var disabledChecks: Set<String> = []
+    /// fail-closed 证据状态。空 = 还没检查过；旧核心不报这个字段，按「未验证」处理。
+    /// 16 项全绿只说明流量此刻走了代理，证明不了代理挂了会不会直连 —— 那件事只有 drill 能验。
+    @Published var failClosedStatus: String = ""
     @Published var allowOptionalFailures = false
     @Published var loggingEnabled = true
     @Published var settingsMessage = ""
@@ -1134,6 +1151,8 @@ final class VM: ObservableObject {
     /// 不等于「验过了」，不能因为 matched 16/16 就放行。
     private func apply(report: CheckReport, done: @escaping (Bool) -> Void) {
         var allOk = report.verdict == "established"
+        // 缺字段 = 旧核心,按未验证处理;不能因为读不到就当成通过。
+        failClosedStatus = report.failClosed?.status ?? "unverified"
         var matched = Set<Int>()
         var configRows: [String] = []
         var failedRows: [String] = []
@@ -1189,6 +1208,9 @@ final class VM: ObservableObject {
     /// 文本兼容路径。旧核心忽略 --json 时也走这里，所以不能把文本解析删掉。
     private func finishTextCheck(_ result: CoreResult, done: @escaping (Bool) -> Void) {
         var allOk = result.succeeded
+        // 文本回退路径拿不到 fail-closed 证据(旧核心不报)。按未验证处理,
+        // 不能沉默 —— 「读不到」和「验过了」是两件事。
+        failClosedStatus = "unverified"
         var matched = Set<Int>()
         var duplicated = false
         // 「没配好」和「不安全」要分开说:两者都拦启动(没验证过不能当验证通过),
@@ -3409,9 +3431,29 @@ struct ContentView: View {
 
     // MARK: 提示条
 
+    /// fail-closed 证据的常驻提示。检查全绿恰恰是最需要它的时候:
+    /// 那一屏只证明「流量此刻走了代理」，不证明「代理挂了不会直连」。
+    /// 演练已通过且证据新鲜时不出现，避免变成天天都在的噪声。
+    private var failClosedNotice: String? {
+        switch vm.failClosedStatus {
+        case "violated":
+            return "fail-closed 演练未通过：代理断开时可能直连，跑 drill 复验"
+        case "stale":
+            return "fail-closed 证据已过期，跑 drill 复验"
+        case "unverified":
+            return "fail-closed 未验证：全绿只说明流量此刻走了代理，跑 drill 验证断开不会直连"
+        default:
+            return nil
+        }
+    }
+
     private var noticeStrip: AnyView? {
         if vm.isBusy && !vm.banner.isEmpty && (vm.phase == .fixing || vm.phase == .switching) {
             return nil   // hero 已经把这句说清楚了,不重复
+        }
+        // 演练未通过是最重的一条,不能被「修了几项」的回执挤掉。
+        if vm.phase == .ready, vm.failClosedStatus == "violated", let text = failClosedNotice {
+            return AnyView(failClosedStrip(text))
         }
         if !vm.fixNotice.isEmpty {
             return AnyView(
@@ -3439,7 +3481,26 @@ struct ContentView: View {
                 .background(ClaudeTheme.inset)
             )
         }
+        if vm.phase == .ready, let text = failClosedNotice {
+            return AnyView(failClosedStrip(text))
+        }
         return nil
+    }
+
+    /// 与修复回执同一种表面(中性底 + 着色图标),不引入第三种色块。
+    private func failClosedStrip(_ text: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.shield")
+                .font(Type.microLabelFont)
+                .foregroundColor(ClaudeTheme.warning)
+            Text(text)
+                .font(Type.bodyFont)
+                .foregroundColor(ClaudeTheme.ink)
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(ClaudeTheme.inset)
     }
 
     /// banner 里带「已自动停止 Claude：」前缀,hero 已经说了这件事,去掉免得念两遍。
@@ -4794,7 +4855,7 @@ struct NoticeView: View {
 
                 ScrollView {
                     VStack(spacing: 10) {
-                        Text("本产品面向对账号环境一致性有严格要求的专业用户，基于 Fail-Closed（故障即断）原则构建，针对目标平台的 Risk Control 体系提供全链路防护，确保本地真实出口在任何场景下零暴露。")
+                        Text("本产品面向对账号环境一致性有严格要求的专业用户，按 Fail-Closed（故障即断）原则设计，针对目标平台的 Risk Control 体系提供全链路防护。请注意：16 项检查全绿只证明流量此刻走了代理，证明不了代理断开时不会直连——后者只有故障演练（drill）能验证，演练结论会常驻显示在主界面。")
                             .font(Type.bodyFont)
                             .foregroundColor(ClaudeTheme.muted)
                             .frame(maxWidth: .infinity, alignment: .leading)

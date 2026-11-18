@@ -365,6 +365,41 @@ change server-side records and do not guarantee that an account will not be
 restricted. The software is provided as-is under the MIT license; you are
 responsible for how you use it.
 
+## Platform capability matrix
+
+All three platforms share the same report format and check IDs, but **the depth of
+protection differs**. Check what your platform actually has before installing:
+
+| Capability | macOS | Windows (beta) | Linux (experimental) |
+|---|---|---|---|
+| Per-item checks | 16 | 14 (no IP purity / better node) | 14 (same) |
+| Report v2 / offline conversion | ✓ | ✓ | ✓ |
+| One-click repair / A–D switching | ✓ | ✓ | ✓ |
+| Bodyguard (stops Claude when the proxy dies) | ✓ root LaunchDaemon | ✓ scheduled task | ✓ |
+| Launch lease (120s one-shot authorization) | ✓ | ✗ | ✗ |
+| Runtime egress watchdog (stops on egress drift) | ✓ | ✗ | ✗ |
+| Failure drill (`drill`, proves no direct fallback) | ✓ | ✗ | ✗ |
+| Offline review (`verdict` / `evidence`) | ✓ | ✗ | ✗ |
+| Node scan / apply / slot binding | ✓ | ✗ | ✗ |
+| WebRTC policy switch | ✓ | ✗ | ✗ |
+| Check toggles (degraded protection) | ✓ | ✓ | ✗ |
+| Encrypted snapshot export / import | ✓ | ✓ (format not interchangeable with macOS) | ✗ |
+| Auto update (SHA256 verified) | ✓ | ✓ | ✗ |
+| GUI | SwiftUI menu-bar app | WPF | terminal menu |
+
+The gaps are the current boundary, not a roadmap promise: **without `drill` there is no
+way to prove fail-closed, and without `watch` only "the proxy process died" is covered —
+not "the exit quietly changed"**. A green board on Windows / Linux means less than it
+does on macOS.
+
+Reports always carry a `fail_closed` field answering a different question: *has "the
+proxy dying will not leak" ever been proven?* Values are `unverified`, `violated`,
+`established` (drill passed, evidence younger than 7 days) and `stale`. It is a soft
+signal — it never blocks launch and never enters `config_fingerprint` — but it is
+appended to the `check` OK line and stays visible in the main window. **16 green checks
+only prove traffic is going through the proxy right now.** Older reports without the
+field are treated as `unverified`, never as passed.
+
 ## Links
 
 - [中文说明](README.md)
@@ -372,6 +407,7 @@ responsible for how you use it.
 - [Issues](https://github.com/huanfine/claude-switcher/issues)
 - [Security policy](SECURITY.md)
 - [Agent handoff guide](AGENTS.md)
+- [Architecture and known gaps](ARCHITECTURE.md)
 - [Web environment check](https://huanfine.github.io/claude-switcher/) — published
   from `docs/`; enable GitHub Pages (`Deploy from a branch` / `main` / `/docs`)
   before the link resolves.

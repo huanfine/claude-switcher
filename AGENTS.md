@@ -38,7 +38,7 @@
 
 关于时区看门狗(踩过一次,代价是「修好了又坏了」):
 
-- **看门狗的目标值只能来自 env.json**,脚本里那份 `TARGET=` 只是读不到 env.json 时的兜底。原来安装器把目标烧死进脚本,`set-region` / `fix` 只改 env.json 和系统时区,没人回来改这份副本——看门狗于是每小时把系统时区改回旧值,用户每次点「一键修复」都以为没生效。
+- **看门狗的目标值只能来自 env.json**,脚本里那份 `TARGET=` 只是读不到 env.json 时的兜底。原来安装器把目标烧死进脚本,`set-region` / `fix` 只改 env.json 和系统时区,没人回来改这份副本——看门狗于是每 5 分钟（`StartInterval 300`）把系统时区改回旧值,用户每次点「一键修复」都以为没生效。
 - **改系统时区必须同时对齐看门狗**,两件事要落在同一次管理员授权里(`fix` 的 `adminCmds`),否则修完几分钟就被改回去。
 - **`TARGET=` 有两种写法**:安装器写 `TARGET="x"`,同步时写 `TARGET=x`。读的一律剥引号,不要匹配引号。
 
@@ -200,13 +200,25 @@ IP 纯净度那侧是独立的证据 bug，别和上面混：
 
 `verdict [报告]` 离线复核 `last-check.txt`（或指定报告），只读不探测，输出 `VERDICT:established|violated|incomplete` 与 blockers/advisories/skipped 三行。`warn` 与 `skip` 既不会被提升成 pass，也不会被当成 fail。`evidence <file>` 把最近一次检查写成 JSON（时间、主机、环境、逐项状态、判定），权限 0600，只新建不覆盖——证据被覆盖就失去追溯意义。
 
-`checkdetail --json` 输出 `claude-switcher-report/2`：稳定 ID、关键性、逐项 evidence/remedy、`config_fingerprint`（env.json 白名单 + checks.json + 核心脚本 SHA-256）与 30 分钟 `expires_at`。缺少关键项或全 `skip` 只能是 `incomplete`，不能是 `established`；`fail`/`config` 仍是 `violated`。`report [报告]` 是同一契约的离线转换入口，不重新探测。报告是检查快照，不是启动授权；启动租约由 `lease` 单独签发，并绑定 `report_id` / 指纹 / TTL。新版报告可选带 `probes`：`proxy` 是正常链路探测，`direct` 在 TUN 开启时显式 `unknown`（`reason=not_measured_while_tun_up`），`drill` 是最近一次演练的 TCP/DNS/WebRTC 计数器。`probes` 不参与 `config_fingerprint`；缺少该字段的旧报告仍能解析并签发租约。
+`checkdetail --json` 输出 `claude-switcher-report/2`：稳定 ID、关键性、逐项 evidence/remedy、`config_fingerprint`（env.json 白名单 + checks.json + 核心脚本 SHA-256）与 30 分钟 `expires_at`。缺少关键项或全 `skip` 只能是 `incomplete`，不能是 `established`；`fail`/`config` 仍是 `violated`。`report [报告]` 是同一契约的离线转换入口，不重新探测。报告是检查快照，不是启动授权；启动租约由 `lease` 单独签发，并绑定 `report_id` / 指纹 / TTL。新版报告可选带 `probes`：`proxy` 是正常链路探测，`direct` 在 TUN 开启时显式 `unknown`（`reason=not_measured_while_tun_up`），`drill` 是最近一次演练的 TCP/DNS/WebRTC 计数器。`probes` 不参与 `config_fingerprint`；缺少该字段的旧报告仍能解析并签发租约。报告的 `fail_closed` 字段**恒在**（与可选的 `probes` 不同），见下一节「fail-closed 证据」。
 
 App 检查入口已改为 `checkdetail --json`：JSON 成功时按 `reportRowMap` 的稳定 ID 填 16 行；旧核心忽略参数、继续输出文本时，直接复用同一份输出走文本解析；仅当退出码 2 + usage 表明旧核心拒绝参数时，才补跑一次 `checkdetail`。全 `skip` 的 `incomplete` 报告在 App 侧同样拦启动，不能因为 16/16 行都有值就放行。
 
 租约写入 `~/.claude-switcher/lease.json`（0600）：只有 `established` 报告能签发，有效期取 `min(120 秒, 报告 expires_at)`。`switch` 在 `open -a Claude` 前必须通过 `lease-check`；拉起后立即撤销，旧租约不能重复使用。`env-set` / `set-check-config` / `set-client` / `set-region` / `node-apply` / `slot-node set|clear` / `checkdetail` / `fix` / `switch` 都会撤销旧租约。没有 `last-report.json` 的旧核心保持原有切换行为。
 
 报告的 `core_version` 来自 `app_version()`：先取 `CLAUDE_SWITCHER_VERSION`，再读 `~/.claude-switcher/version.txt`（0600），都没有才是 `unknown`。**写端在 macOS 安装器**——以前只有 `windows/install.ps1` 写这个文件，macOS 侧报告的版本恒为 `unknown`，等于新报告继承了「分不清用户装的哪一版」这个老问题。安装器的版本优先读包里的 `VERSION`（打包脚本写入）；源码安装没有该文件时退回 `git describe --tags --always --dirty` 并去掉前导 `v`，字符集与 40 字长度上限必须与 `app_version()` 的校验一致，否则写进去也读不出来。这里记的是**安装包版本**：核心之后被 `update` 换过没有，看报告的 `core_sha256` / `config_fingerprint`，不要指望 `version.txt` 跟着核心走。回归见 `tests/test_daemon_contracts.py::InstallVersionTests`（抽安装器真实代码执行，含端到端读回 `core_version`）。
+
+## fail-closed 证据（报告的 `fail_closed` 字段）
+
+平时的检查只能证明「流量此刻走了代理」，`drill` 才能证明「代理挂了不会直连」。所以**证据状态必须持续可见**：没有证据要说没有，不能沉默，更不能当成通过。
+
+- 判定只读证据，不重跑演练、不发网络请求：优先 `drill-counters.json` 的 `result` / `checked_at`；老安装件没有计数器文件时，倒序解析 `drill.log` 的 `<epoch> … result=` 行。读不懂的记录一律 `unverified`，不猜。
+- 四态：`unverified` / `violated` / `established`（7 天内）/ `stale`。**`violated` 直接返回、不看时间**——「证明过会直连」不会因为放久了就变成通过。有效期 `DRILL_EVIDENCE_TTL_SECONDS` 取 7 天：太短天天催用户断一次网，太长让过期证据冒充当前结论。
+- **不要新增第 17 项检查。** 16 个稳定 ID 与界面 16 行被测试钉死。它是报告字段 + `check` OK 行的追加段 + 界面常驻提示条，三处读同一个 `_support fail-closed` 判定。
+- **它是软信号**：不拦启动、不进 blockers、不参与 `config_fingerprint`（`tests/test_fail_closed.py` 钉着这几条）。拿我们自己的证据缺口去堵用户，和把「没验过」写成「验过了」一样错。
+- App 侧缺字段按 `unverified` 处理（旧核心与文本回退路径都走这条）。公告里不要再写「任何场景下零暴露」——演练可能不通过，那是产品自己打过脸的话。
+
+顺带修掉的既有缺陷：`build_report` 装配 `probes` 时取的是 `probes.get(...)`，条件却是 `if probes or drill`。**跑过一次 drill、又没有本轮 probes sidecar 时（离线 `report` 与 sidecar 失败两条路），对 None 取 `.get` 直接崩，整份 JSON 报告生成失败。**现在是 `(probes or {}).get(...)`。加可选字段时，判空条件要和取值对象对齐。
 
 ## 运行期出口看门狗（watch）
 
@@ -316,6 +328,7 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 
 ## 文件索引
 
+- 架构与已知缺口：`ARCHITECTURE.md`（分层、执行域、三级契约、演进顺序；改跨层结构前先读它）
 - 核心逻辑：`core/claude-switch.sh`（安检/切换/修复全在这一个文件）
 - 泄漏探针：`core/stun-probe.py`
 - 界面：`app/main.swift`（单文件 SwiftUI）

@@ -85,6 +85,10 @@ LEASE_SCHEMA = "claude-switcher-lease/1"
 LEASE_TTL_SECONDS = 120
 PROBES_SCHEMA = "claude-switcher-probes/1"
 DRILL_SCHEMA = "claude-switcher-drill/1"
+# 演练证据的有效期。它证明的是「当时那套配置下代理断开不会直连」,不是永久结论:
+# 换客户端、重写规则、TUN 被重置都可能让它失效。7 天是软信号的折中 ——
+# 太短会天天催用户断一次网,太长会让过期证据冒充当前结论。
+DRILL_EVIDENCE_TTL_SECONDS = 7 * 24 * 3600
 CHECK_SPECS = (
     ("proxy_core", "代理内核", True),
     ("tun", "TUN网卡", True),
@@ -416,6 +420,58 @@ def write_drill_counters(args):
     return document
 
 
+def fail_closed_state(now=None):
+    """fail-closed 到底有没有被证明过。只读演练留下的证据,不重跑、不发网络请求。
+
+    平时 16 项全绿只说明「流量此刻走了代理」,证明不了「代理挂了会不会直连」。
+    这件事必须持续可见:没有证据要说没有,不能沉默,更不能当成通过。
+    它是软信号 —— 不拦启动、不进 blockers、不参与 config_fingerprint。
+    """
+    now = now or datetime.datetime.now().astimezone()
+    base, _ = paths()
+    drill = optional_json(base / "drill-counters.json")
+    result, checked_at = "", ""
+    if drill:
+        result = str(drill.get("result") or "")
+        checked_at = str(drill.get("checked_at") or "")
+    if not result:
+        # 老安装件只有 drill.log,没有计数器文件。最后一行形如:
+        # <epoch> baseline=… after=… result=<结论> tcp=… dns=… webrtc=…
+        try:
+            lines = (base / "drill.log").read_text(
+                encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for line in reversed(lines):
+            parts = line.split()
+            if not parts or not parts[0].isdigit():
+                continue
+            match = re.search(r"(?:^|\s)result=(\S+)", line)
+            if not match:
+                continue
+            result = match.group(1)
+            checked_at = iso_time(
+                datetime.datetime.fromtimestamp(int(parts[0])).astimezone())
+            break
+    state = {"status": "unverified", "result": result, "checked_at": checked_at}
+    verdict = result.split(":", 1)[0]
+    if verdict == "violated":
+        state["status"] = "violated"
+        return state
+    if verdict != "established":
+        return state          # 空记录或读不懂的记录一律算未验证,不猜
+    try:
+        moment = parse_timestamp(checked_at)
+    except ValueError:
+        state["status"] = "stale"
+        return state
+    age = int((now - moment).total_seconds())
+    state["age_seconds"] = age
+    state["status"] = ("established"
+                       if 0 <= age <= DRILL_EVIDENCE_TTL_SECONDS else "stale")
+    return state
+
+
 def lease_path():
     return paths()[0] / "lease.json"
 
@@ -594,7 +650,14 @@ def build_report(text, core_path=""):
                         ("proxy_mode", "proxy_group", "country", "timezone", "locale")},
         "checks": checks,
         "summary": summary,
-        **(({"probes": {"proxy": probes.get("proxy"), "direct": probes.get("direct"),
+        # 与 probes 不同,这个字段恒在:没有证据本身就是要如实报告的事实。
+        # 旧报告缺它时下游按「未验证」处理,不能当成通过。
+        "fail_closed": fail_closed_state(now),
+        # probes 是可选 sidecar,drill 计数器却可能是上一次演练留下的:
+        # 只有 drill 没有 probes 时也要出报告,不能对 None 取 .get 直接崩。
+        # 离线 `report` 与 sidecar 失败这两条路都会走到这里。
+        **(({"probes": {"proxy": (probes or {}).get("proxy"),
+                        "direct": (probes or {}).get("direct"),
                         "drill": drill}} if probes or drill else {})),
     }
 
@@ -772,6 +835,10 @@ def main(args):
     elif action == "lease-revoke" and len(args) == 1:
         revoke_lease()
         print("OK:租约已撤销")
+    elif action == "fail-closed" and len(args) == 1:
+        # 给 bash 侧用的紧凑读法:状态|时间。门禁输出与界面读的是同一个判定。
+        state = fail_closed_state()
+        print(state["status"] + "|" + state.get("checked_at", ""))
     elif action == "verdict" and len(args) in (1, 2):
         # 离线复核:只读已有报告,不再探测。意义是事后能回答「当时到底过没过」,
         # 而不是只剩一条被后续日志刷掉的输出。口径与在线检查一致。
@@ -3367,11 +3434,23 @@ check() {
         degrade="防护降级:${CHECKS_DISABLED//,/、} 已关闭,未参与本次判定"
     fi
 
+    # fail-closed 有没有被证明过,和「防护降级」是同一条纪律:必须持续可见。
+    # 16 项全绿只说明流量此刻走了代理,证明不了代理挂了会不会直连 —— 那件事
+    # 只有 drill 能验。没有证据就说没有,不能沉默,更不能当成通过。
+    # 它是软信号:不拦启动(否则等于拿我们自己的证据缺口去堵用户),但也不许消失。
+    fc=""
+    case "$(support fail-closed 2>/dev/null)" in
+        established*) ;;
+        violated*) fc="fail-closed演练未通过(代理断开可能直连,跑 drill 复验)" ;;
+        stale*) fc="fail-closed证据已过期(跑 drill 复验)" ;;
+        *) fc="fail-closed未验证(跑 drill 验证代理断开不会直连)" ;;
+    esac
+
     if [ -n "$fails" ]; then
         echo "FAIL:${fails#;}"
         return 1
     fi
-    echo "OK:${ip:-未确认}${ipwarn:+|$ipwarn}${degrade:+|$degrade}"
+    echo "OK:${ip:-未确认}${ipwarn:+|$ipwarn}${degrade:+|$degrade}${fc:+|$fc}"
     return 0
 }
 
