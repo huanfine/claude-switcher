@@ -3773,15 +3773,17 @@ struct ContentView: View {
         // 吐槽「找不到」)。overlay 而不是塞进 Button 的 label —— 嵌套的交互控件
         // 收不到点击。
         //
-        // 未绑定时**只在悬停时淡入**:常驻的话四张卡上各有一枚链子,
-        // 和状态词挤在同一行高度,整排就是四张贴纸。已绑定时常驻(那是有内容的
-        // 状态),并降一档透明度 —— 它是「改绑」的入口,不是主信息。
+        // 常驻,但压到很淡,悬停才提亮。
+        // 试过「未绑定时完全隐藏、悬停才淡入」—— 更干净,但入口等于藏起来了:
+        // 用户不知道这排卡还能绑固定出口(工具栏上的扫描入口就吃过这个亏)。
+        // 位置也有讲究:它现在坐在**第二行行尾**的空白里,和体积日期同一条基线;
+        // 原来是钉在卡片右上角,既不属于第一行也不属于第二行,四张卡各钉一枚,
+        // 看起来就是四张贴纸。
         .overlay(alignment: .bottomTrailing) {
             slotNodeMenu(t, bound: node)
                 .padding(.trailing, 6)
-                .padding(.bottom, 8)
-                .opacity(node.isEmpty ? (hovered ? 1 : 0) : 0.7)
-                .allowsHitTesting(node.isEmpty ? hovered : true)
+                .padding(.bottom, 7)
+                .opacity(hovered ? 1 : 0.45)
         }
         .onHover { inside in
             withAnimation(.easeOut(duration: Motion.micro)) {
