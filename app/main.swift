@@ -931,14 +931,23 @@ final class VM: ObservableObject {
 
     /// 走 osascript 而不是 UNUserNotificationCenter:这个 App 是 ad-hoc 签名,
     /// 通知授权在重签名后会失效,而 display notification 不依赖它。
+    /// 测试构建不发真通知 —— 否则每跑一次用例,用户的通知中心就多一条假拦截。
     private func notify(title: String, body: String) {
         let clean = body.replacingOccurrences(of: "\\", with: " ")
             .replacingOccurrences(of: "\"", with: "'")
+        #if CLAUDE_SWITCHER_TESTS
+        // 测试会走完整的「拦停 → 通知」路径,以前这里真发系统通知:
+        // 跑一次菜单栏用例,通知中心就多一条「已自动停止 Claude /
+        // 出口 IPv4 变了(1.2.3.4 → 5.6.7.8)」—— IP 是夹具里的占位值,
+        // 长相却和真拦截一模一样,没人能分出哪条是真事。测试只打日志。
+        FileHandle.standardError.write(Data("NOTIFY: \(title) | \(clean)\n".utf8))
+        #else
         let script = "display notification \"\(clean)\" with title \"Claude 环境检查器\" subtitle \"\(title)\" sound name \"Basso\""
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
         try? p.run()
+        #endif
     }
 
     func stopWatch() {
