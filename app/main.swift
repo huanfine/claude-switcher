@@ -2,7 +2,6 @@ import SwiftUI
 import AppKit
 import Combine
 import UniformTypeIdentifiers
-import UserNotifications
 
 // MARK: - 模型
 
@@ -484,9 +483,23 @@ final class VM: ObservableObject {
     private var cliPollTimer: Timer?
     @Published private(set) var isSwitchingClient = false
     @Published var disabledChecks: Set<String> = []
+    /// 报告里的时间是 `2026-11-01T02:27:06-05:00` 这种带时区的 ISO8601。
+    /// 解析不出来就返回 nil —— 界面宁可只说「时间未知」,也不猜一个日期。
+    static func parseReportTime(_ raw: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        if let d = f.date(from: raw) { return d }
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.date(from: raw)
+    }
+
     /// fail-closed 证据状态。空 = 还没检查过；旧核心不报这个字段，按「未验证」处理。
     /// 16 项全绿只说明流量此刻走了代理，证明不了代理挂了会不会直连 —— 那件事只有 drill 能验。
     @Published var failClosedStatus: String = ""
+    /// 那条证据是什么时候留下的。没有它就分不清「刚刚演练失败」和
+    /// 「半个月前失败过一次」—— 两者的紧迫程度差得远,而原来的横幅
+    /// 对这两种情况说的是同一句话。
+    @Published var failClosedAt: Date?
     @Published var allowOptionalFailures = false
     /// 被升成「安全基线」的可选项：失败时不再受 allowOptionalFailures 影响，一律拦截。
     /// 界面逐项开关，但保存时必须原样带回核心 —— 少了这一项，用户在别处设过的
@@ -933,15 +946,14 @@ final class VM: ObservableObject {
             : "已拦截（拦截时 Claude 没有在运行）：\(reason)"
     }
 
-    /// 拦截通知。本进程自己发、自己接点击 —— 点通知要能回到这个窗口。
+    /// 拦截提醒。本进程自己发、自己接点击 —— 点它要能回到这个窗口。
     ///
-    /// 以前用 `osascript -e 'display notification'`:好处是 ad-hoc 签名下不受
-    /// 通知授权影响(重签会丢授权,而脚本通知不依赖它),代价是那条通知
-    /// **点不开** —— 它是 osascript 发的,和本 App 没有绑定关系,点了只会消失。
-    /// 用户看到的正是这个:拦截发生了,通知也弹了,点一下却什么都没发生。
-    /// 现在走 UNUserNotificationCenter,点击回调里把主窗口叫回来;
-    /// 没拿到授权(用户拒绝过 / 系统没给)才退回 osascript。
-    /// 测试构建不发真通知 —— 否则每跑一次用例,通知中心就多一条假拦截。
+    /// 以前用 `osascript -e 'display notification'`:好处是不受通知授权影响,
+    /// 代价是那条通知**点不开** —— 它是 osascript 发的,和本 App 没有绑定关系,
+    /// 点了只会消失。用户看到的正是这个:拦截发生了,提醒也弹了,点一下什么都没发生。
+    /// 现在走 `Notifier`(本进程自绘的浮层,见那边的注释:系统通知在这台机器上
+    /// 一律拒绝授权),点击回调里把主窗口叫回来。
+    /// 测试构建不发真提醒 —— 否则每跑一次用例,屏幕上就多一条假拦截。
     private func notify(title: String, body: String) {
         #if CLAUDE_SWITCHER_TESTS
         // 跑一次菜单栏用例,通知中心就多一条「已自动停止 Claude /
@@ -1175,6 +1187,7 @@ final class VM: ObservableObject {
         var allOk = report.verdict == "established"
         // 缺字段 = 旧核心,按未验证处理;不能因为读不到就当成通过。
         failClosedStatus = report.failClosed?.status ?? "unverified"
+        failClosedAt = report.failClosed?.checkedAt.flatMap(Self.parseReportTime)
         var matched = Set<Int>()
         var configRows: [String] = []
         var failedRows: [String] = []
@@ -1233,6 +1246,7 @@ final class VM: ObservableObject {
         // 文本回退路径拿不到 fail-closed 证据(旧核心不报)。按未验证处理,
         // 不能沉默 —— 「读不到」和「验过了」是两件事。
         failClosedStatus = "unverified"
+        failClosedAt = nil
         var matched = Set<Int>()
         var duplicated = false
         // 「没配好」和「不安全」要分开说:两者都拦启动(没验证过不能当验证通过),
@@ -3478,15 +3492,37 @@ struct ContentView: View {
         // 三条文案原来都以「fail-closed」开头 —— 那是代码里的叫法,用户读到的
         // 只是一个没头没尾的英文词,既不知道在说哪件事,也不知道要不要管。
         // 现在每条只说两件事:演练测的是什么、结论对当下意味着什么。
+        //
+        // 还要带上**证据日期**。这条当前对应的记录是 11-01 留下的,离今天 18 天,
+        // 而证据有效期是 7 天 —— 原来那句「演练没通过」读起来像刚刚发生,
+        // 用户会以为自己现在正在裸奔。日期一说出来,该不该现在处理就清楚了。
         case "violated":
-            return "代理断开演练没通过：断掉代理后本机仍能直连外网 · 跑 drill 复验，看现在是否还漏"
+            let age = failClosedAgeText
+            let head = age.isEmpty ? "代理断开演练没通过" : "上次代理断开演练（\(age)）没通过"
+            let stale = (failClosedAgeDays ?? 0) > 7 ? " · 这条证据已过期" : ""
+            return "\(head)：断掉代理后本机仍能直连外网\(stale) · 跑 drill 复验，看现在是否还漏"
         case "stale":
-            return "代理断开演练已超过 7 天，结论可能已失效 · 跑 drill 复验"
+            let age = failClosedAgeText
+            return "代理断开演练证据已过期\(age.isEmpty ? "" : "（\(age)）") · 跑 drill 复验"
         case "unverified":
             return "还没做过代理断开演练：16 项全绿只说明此刻流量走了代理 · 跑 drill 验证断开后不会直连"
         default:
             return nil
         }
+    }
+
+    /// 那条演练证据离今天几天。报告里没带时间就是 nil —— 界面不猜日期。
+    private var failClosedAgeDays: Int? {
+        guard let at = vm.failClosedAt else { return nil }
+        return Calendar.current.dateComponents([.day], from: at, to: Date()).day
+    }
+
+    private var failClosedAgeText: String {
+        guard let at = vm.failClosedAt, let days = failClosedAgeDays else { return "" }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "M 月 d 日"
+        return days <= 0 ? f.string(from: at) : "\(f.string(from: at))，\(days) 天前"
     }
 
     private var noticeStrip: AnyView? {
@@ -3563,7 +3599,7 @@ struct ContentView: View {
                 Text("隔离实例槽位")
                     .font(Type.titleFont)
                     .foregroundColor(ClaudeTheme.ink)
-                Text("环境与凭据独立沙盒")
+                Text("每个账号独立的环境与凭据")
                     .font(Type.bodyFont)
                     .foregroundColor(ClaudeTheme.faint)
                     .lineLimit(1)
@@ -3619,100 +3655,105 @@ struct ContentView: View {
         }
     }
 
-    /// 槽位卡:字母方块 + 状态 + 体积日期 + 一行底注。
-    /// 之前是一条扁 chip,「A 1.2G · 10-20」挤在一起,看不出哪个是当前、哪个是空的。
-    /// 现在是四张独立的卡 —— 有面、有投影、有悬浮抬起,不是一个白框里的四段文字。
+    /// 槽位卡:一张卡只回答两件事 —— 是哪个账号、现在能不能直接用。
+    ///
+    /// 之前这张卡是「六件小东西挤两行」:字母块 + 状态词 + 体积日期 + 独立指纹
+    /// + CLI + 登录态。四张并排时每一张都在喊四句不同的话,整排看过去就是一片
+    /// 碎屑。真正要回答的只有两件,其余降级或进 tooltip:
+    ///
+    ///   · 「独立指纹」四张全有 —— 同一个值写四遍不是信息,是装饰,已删;
+    ///   · 「CLI 存档」缩成一枚 8pt 终端符号,知道的人认符号,不知道的人有 tooltip;
+    ///   · 绑定出口的那个链子图标,原来**钉在卡片右上角**。它既不属于第一行也不
+    ///     属于第二行,四张卡上各钉一枚,看起来就是四张贴纸;而且它紧贴着状态词,
+    ///     读起来像「状态的一部分」。现在挪到第二行行尾:未绑定时只在悬停时淡入,
+    ///     已绑定时常驻且把节点名一起写出来 —— 那才是有内容要说的状态。
     private func accountCard(_ t: String) -> some View {
         let isCurrent = vm.current == t
         let archived = vm.archived.contains(t)
         let subtitle = accountSubtitle(t)
+        let node = vm.slotNodes[t] ?? ""
         let hovered = hoveredAccount == t
 
         return Button { vm.switchTo(t) } label: {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    // 四张卡的字母块现在是同一种材质（inset 凹槽）。
-                    // 之前当前槽位挂的是墨黑底白字 —— 一屏里最深的一块，
-                    // 比旁边真正的异常还抢眼，四张卡一眼看去先看到「A」，
-                    // 而不是先看到「有两项提示」。参照设计图也是淡底深字。
-                    //
-                    // 代价是少了一个「一眼定位」的锚点，所以锚点挪到了标签上：
-                    // 当前槽位的状态词用 ink + semibold，其余 muted + regular。
-                    // 这里刻意绑 isCurrent 而不是「Claude 是否在运行」——
-                    // 关掉 Claude 之后这个槽位仍然叫「上次使用」，它依然是
-                    // 指针指向的那一个，不该跟着掉回普通档。
-                    Text(t)
-                        .font(Type.slotLetterFont)
-                        .foregroundColor(archived || isCurrent ? ClaudeTheme.ink : ClaudeTheme.faint)
-                        .frame(width: 30, height: 30)
-                        .background(
-                            RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
-                                .fill(ClaudeTheme.inset)
-                        )
+            HStack(alignment: .center, spacing: 11) {
+                slotLetter(t, isCurrent: isCurrent, archived: archived)
 
-                    VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 3) {
+                    // 第一行:状态 + 登录态。两者都是「现在能不能用」的一部分,
+                    // 所以放在一行里;但字重不同 —— 状态是本卡的主语(13 semibold
+                    // 仅当前槽位),登录态是补充(12 medium + 语义色)。
+                    HStack(spacing: 6) {
                         Text(accountStateLabel(t))
                             .font(isCurrent ? Type.bodyStrongFont : Type.bodyFont)
                             .foregroundColor(isCurrent ? ClaudeTheme.ink : ClaudeTheme.muted)
                             .lineLimit(1)
-                        // 空槽位不再写「空」:「未初始化」已经把话说完了,
-                        // 底注又写着「点击绑定」—— 同一件事说三遍,
-                        // 四张卡里两张显得比另外两张吵。
+                        // 登录态靠右。之前它紧跟状态词(「已保存 ✓已登录」),两个词
+                        // 之间只有 6pt,读起来是一句话;而它带绿色、又比状态词响,
+                        // 主次是反的。分开到行的两端,各占各的位。
+                        Spacer(minLength: 6)
+                        if archived {
+                            loginChip(vm.slotLogin[t] ?? .unknown)
+                        }
+                    }
+
+                    // 第二行:多大、哪天、绑了哪条线。全部是同一档的次要信息,
+                    // 用等宽数字排,免得 473M / 8.0M 一列扫下来忽宽忽窄。
+                    HStack(spacing: 4) {
+                        if subtitle.isEmpty {
+                            // 空槽位也要有第二行。只有一行字的卡在 58pt 高的框里
+                            // 居中飘着,四张并排时它像一块没填满的占位框。
+                            Text("首次切换时创建")
+                                .font(Type.microFont)
+                                .foregroundColor(ClaudeTheme.faint)
+                                .lineLimit(1)
+                        }
                         if !subtitle.isEmpty {
                             Text(subtitle)
                                 .font(Type.microMono)
                                 .monospacedDigit()
                                 .foregroundColor(ClaudeTheme.faint)
                                 .lineLimit(1)
+                            if let stamp = vm.cliStamps[t] {
+                                Image(systemName: "terminal")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(ClaudeTheme.faint)
+                                    .help("该槽位还存着 Claude Code 的 ~/.claude 与 ~/.claude.json"
+                                          + "：\(stamp.size) · \(shortDate(stamp.date))")
+                            }
                         }
-                    }
-                    // 角标放到第三行右端，不放这一行的行尾。
-                    // 放行尾会把「348M · 10-31」挤成「348M · 10-…」——
-                    // 卡片只有 226pt 宽，五样东西（字母块、状态词、角标）
-                    // 挤一行必然要牺牲一样，而体积+日期是这里唯一的量化信息。
-                    Spacer(minLength: 0)
-                }
-
-                HStack(spacing: 4) {
-                    Image(systemName: archived ? "shield.lefthalf.filled" : "plus")
-                        .font(.system(size: 9))
-                    Text(archived ? "独立指纹" : "点击绑定")
-                        .font(Type.microFont)
-                    // 槽位现在连 Claude Code 的状态一起搬。有存档才画这个角标：
-                    // 老脚本 / 从没用过 CLI 的机器不该平白多一个看不懂的 CLI。
-                    if let stamp = vm.cliStamps[t] {
-                        HStack(spacing: 3) {
-                            Image(systemName: "terminal").font(.system(size: 8))
-                            Text("CLI").font(Type.microFont)
+                        // 绑定的出口写在体积日期后面:三者都是「这个槽位的档案
+                        // 长什么样」的元数据,同一行、同一档字号。
+                        if !node.isEmpty {
+                            if !subtitle.isEmpty {
+                                Text("·")
+                                    .font(Type.microFont)
+                                    .foregroundColor(ClaudeTheme.faint)
+                            }
+                            Text(node)
+                                .font(Type.microFont)
+                                .foregroundColor(ClaudeTheme.brandText)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help("切到账号 \(t) 时固定走这条线")
                         }
-                        .foregroundColor(ClaudeTheme.muted)
-                        .help("该槽位还存着 Claude Code 的 ~/.claude 与 ~/.claude.json"
-                              + "：\(stamp.size) · \(shortDate(stamp.date))")
+                        Spacer(minLength: 0)
                     }
-                    Spacer(minLength: 6)
-                    // 「档案在不在」和「会话还有没有效」是两件事，以前只说了前一件。
-                    // 实测有个槽位快照完好、卡片写着「已保存」，但 Cookies 里根本
-                    // 没有 sessionKey —— 点进去是登录页。这个角标就是补这一句。
-                    if archived { loginChip(vm.slotLogin[t] ?? .unknown) }
+                    // 行尾给绑定菜单留出固定宽度,否则悬停时图标会压在这段文字上。
+                    .frame(height: 15, alignment: .leading)
                 }
-                .foregroundColor(ClaudeTheme.faint)
+                .padding(.trailing, 18)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            // 当前槽位不再铺一层陶土色底。选中态靠「字母块是墨底白字」表达就够了 ——
-            // 橙色是「需要你注意」的信号，选中不是异常，不该占用它；
-            // 而四张卡里唯一的深色块，已经足够让人一眼找到「是它」。
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            // 四张卡高度必须一样:空槽位只有一行字,不锁高度就会比邻卡矮一截,
+            // 一排里凹下去一块。
+            .frame(maxWidth: .infinity, minHeight: 58)
+            // 当前槽位不铺陶土色底 —— 橙色是「需要你注意」的信号,选中不是异常。
+            // 选中态交给字母块:四张卡里唯一的墨底白字,一眼就能找到「是它」。
             //
-            // 圆角跟大卡、跟延迟面板里的小卡统一走 22：它们在页面上是同一个角色
-            // （浮在底色上的一张面），原来这里是 14，四张小卡挨着两张 22 的大卡，
-            // 一眼就能看出不是一套。
-            // 槽位卡不投阴影,改成一条发丝描边。
-            //
-            // 四张 22pt 圆角的小卡并排,每张都往下投 12pt 的影子 —— 它们之间的
-            // 空隙只有 10pt,影子正好叠进邻卡的边上,整排看着灰蒙蒙的。
-            // 小卡本来就该「贴着页面」,不是浮在上面:去掉影子、换一条边,
-            // 它和底色之间那条界线反而更清楚。
+            // 槽位卡不投阴影,改成一条发丝描边:四张卡的空隙只有 10pt,
+            // 各自的影子正好叠进邻卡的边上,整排看着灰蒙蒙的。小卡本来就该
+            // 「贴着页面」,不是浮在上面。
             .cardSurface(radius: Geo.cardRadius, fill: ClaudeTheme.card,
                          shadowRadius: 0, shadowY: 0, shadowAlpha: 0)
             .overlay(
@@ -3720,7 +3761,7 @@ struct ContentView: View {
                     // hover 只提亮这条边,不换整张卡的底色。
                     // 之前 hover 是把整块白底刷成灰底(255→246),
                     // 指针扫过一排卡,像有人在上面抹了一遍脏手印。
-                    .strokeBorder(hovered ? ClaudeTheme.muted.opacity(0.55) : ClaudeTheme.hairline,
+                    .strokeBorder(hovered ? ClaudeTheme.muted.opacity(0.45) : ClaudeTheme.hairline,
                                   lineWidth: 1)
             )
             .contentShape(RoundedRectangle(cornerRadius: Geo.cardRadius, style: .continuous))
@@ -3728,13 +3769,19 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .disabled(vm.isBusy)
-        // 绑定入口挂在卡片右上角，不藏进右键菜单：之前扫描入口放在工具栏
-        // 就被用户吐槽「找不到」。这里是个常驻的小图标，绑没绑一眼看得出来。
-        // overlay 而不是塞进 Button 的 label —— 嵌套的交互控件收不到点击。
-        .overlay(alignment: .topTrailing) {
-            slotNodeMenu(t)
-                .padding(.top, 6)
-                .padding(.trailing, 8)
+        // 绑定入口挂在第二行行尾,不藏进右键菜单(之前扫描入口放在工具栏就被
+        // 吐槽「找不到」)。overlay 而不是塞进 Button 的 label —— 嵌套的交互控件
+        // 收不到点击。
+        //
+        // 未绑定时**只在悬停时淡入**:常驻的话四张卡上各有一枚链子,
+        // 和状态词挤在同一行高度,整排就是四张贴纸。已绑定时常驻(那是有内容的
+        // 状态),并降一档透明度 —— 它是「改绑」的入口,不是主信息。
+        .overlay(alignment: .bottomTrailing) {
+            slotNodeMenu(t, bound: node)
+                .padding(.trailing, 6)
+                .padding(.bottom, 8)
+                .opacity(node.isEmpty ? (hovered ? 1 : 0) : 0.7)
+                .allowsHitTesting(node.isEmpty ? hovered : true)
         }
         .onHover { inside in
             withAnimation(.easeOut(duration: Motion.micro)) {
@@ -3742,13 +3789,42 @@ struct ContentView: View {
                 else if hoveredAccount == t { hoveredAccount = nil }
             }
         }
-        .help(isCurrent ? "当前正在使用账号 \(t)" : "切换到账号 \(t)（会先重新检查一遍环境）")
+        .help(isCurrent
+              ? "当前正在使用账号 \(t)。悬停卡片右下角可给它绑定固定出口"
+              : "切换到账号 \(t)（会先重新检查一遍环境）。悬停卡片右下角可绑定固定出口")
+    }
+
+    /// 槽位字母块。三种身份三种底:当前=墨底白字、已建档=浅底墨字、空=白底描边浅字。
+    /// 这是整排卡里唯一的深色块 —— 选中态就靠它,不再额外铺色。
+    ///
+    /// 「墨底白字」这条曾经被撤掉过一次,理由是「一屏里最深的一块比真正的异常还
+    /// 抢眼」。那次撤掉之后,当前槽位只剩状态词的字重差(ink semibold vs muted
+    /// regular)—— 而状态词说的是「未运行 / 已保存」,不是「这是你现在用的那个」,
+    /// 于是四张卡里再也找不到当前账号。现在补回来,换成 28pt 的一小格:
+    /// 一屏最响的仍然是 hero 的环,这一格只负责回答「我在哪个槽位」。
+    private func slotLetter(_ t: String, isCurrent: Bool, archived: Bool) -> some View {
+        Text(t)
+            .font(Type.slotLetterFont)
+            .foregroundColor(isCurrent ? ClaudeTheme.card
+                                       : (archived ? ClaudeTheme.ink : ClaudeTheme.faint))
+            .frame(width: 28, height: 28)
+            .background(isCurrent ? ClaudeTheme.ink
+                                  : (archived ? ClaudeTheme.inset : ClaudeTheme.card),
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            // 空槽位用「白底 + 描边」而不是「更浅的灰块」:灰块坐在白卡上
+            // 只剩一团没有边缘的雾,四个字母里就它看不出形状。
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(archived || isCurrent ? Color.clear : ClaudeTheme.hairline,
+                                  lineWidth: 1)
+            )
+            .help(archived ? "账号 \(t) · 独立指纹（环境与凭据独立沙盒）"
+                           : "账号 \(t) · 还没初始化")
     }
 
     /// 槽位 → 出口的绑定菜单。选项只来自最近一次扫描报告，
     /// 没扫过就先给一个「去扫描」，不让人手敲节点名（敲错就是切到不存在的线）。
-    private func slotNodeMenu(_ t: String) -> some View {
-        let bound = vm.slotNodes[t] ?? ""
+    private func slotNodeMenu(_ t: String, bound: String) -> some View {
         let current = vm.nodeScanInfo["CURRENT"] ?? ""
         let candidates = vm.nodeCandidates
         return Menu {
@@ -3769,9 +3845,9 @@ struct ContentView: View {
             Button("重新扫描节点…") { vm.scanNodes() }
         } label: {
             Image(systemName: bound.isEmpty ? "link.badge.plus" : "link")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(bound.isEmpty ? ClaudeTheme.faint : ClaudeTheme.terracottaDeep)
-                .frame(width: 22, height: 22)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(bound.isEmpty ? ClaudeTheme.faint : ClaudeTheme.brandText)
+                .frame(width: 20, height: 20)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
@@ -3807,11 +3883,11 @@ struct ContentView: View {
         HStack(spacing: 3) {
             Image(systemName: symbol)
                 .font(.system(size: 10, weight: .semibold))
-            // 13 号 + semibold。这一格回答的是「切过去能不能直接用」，
-            // 比旁边的「独立指纹」重要，不该和脚注同号同重。
-            // 13 在规范的刻度上（12/13/14/15/17），没有插值。
+            // 12 号 + medium。它回答的是「切过去能不能直接用」，比体积日期重要,
+            // 但不该和状态词(13 semibold)抢同一行的第一眼 —— 之前是 13 semibold,
+            // 四张卡里那句绿色的「已登录」比「已保存」还响,主次是反的。
             Text(text)
-                .font(Type.bodyStrongFont)
+                .font(Type.microLabelFont)
         }
         .foregroundColor(tint)
         .lineLimit(1)
@@ -5520,88 +5596,190 @@ enum DockPreference {
     }
 }
 
-/// 拦截通知的投递与点击回收。
+/// 拦截提醒:一块由**本进程自己画的浮层**,贴在屏幕右上角,点一下回到主窗口。
 ///
-/// 为什么要换掉 `osascript -e 'display notification'`:那种通知由 osascript
-/// 代发,和本 App 之间没有可回调的关系 —— 点它只会从通知中心消失,不会把
-/// 窗口叫回来。而这个通知的全部意义是「出事了,回来看一眼」,点不开等于
-/// 只剩一半功能。
+/// 为什么不用系统通知 —— 这是实测结论,不是偏好(2026-11-19 本机验证):
 ///
-/// 代价是它需要通知授权:ad-hoc 签名每次重签,系统会当成一个新 App 重新问一次。
-/// 没授权的机器上仍退回 osascript —— 看不到点击,但至少能看到通知。
-final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+///   · `UNUserNotificationCenter.requestAuthorization` 对任何非 App Store 构建
+///     一律返回 ok=false,错误是「Notifications are not allowed for this
+///     application」,连授权弹窗都不弹。ad-hoc 签名、Developer ID 签名、
+///     换新 bundle id、放进 ~/Applications 由 LaunchServices 启动,全试过,
+///     `authorizationStatus` 一直停在 0(notDetermined)。没有授权 = 横幅不会出现,
+///     更谈不上点它回窗口。
+///   · 旧接口 `NSUserNotification` 还能投递,但它是 deprecated(macOS 11 起),
+///     一引用就会把 `-warnings-as-errors` 的构建打红;而且它同样受「允许通知」
+///     这个开关约束。
+///   · `osascript -e 'display notification'` 那条路更不行:通知是脚本发的,
+///     和本 App 没有绑定关系,点了只会消失 —— 用户看到的就是「弹了,点不开」。
+///
+/// 所以这里不再向系统要权限,而是自己开一块无边框浮层:`NSPanel` +
+/// `.nonactivatingPanel`,不抢键、不抢焦点、不进 Dock,但一定画得出来。
+/// 点它调 `onActivate`,那边接的是 `showMainWindow()` —— 点得开,是因为
+/// 它本来就是这个 App 的窗口,不是别人的横幅。
+final class Notifier {
     static let shared = Notifier()
 
-    /// 点通知之后要做什么。启动时由 AppDelegate 接到 `showMainWindow()`。
+    /// 点浮层之后要做什么。启动时由 AppDelegate 接到 `showMainWindow()`。
     var onActivate: (() -> Void)?
 
-    private let center = UNUserNotificationCenter.current()
+    private var panel: NSPanel?
+    private var hideWork: DispatchWorkItem?
+    private static let width: CGFloat = 352
 
-    /// 启动即挂上 delegate 并申请一次授权。挂晚了点击回调收不到 ——
-    /// 授权弹窗是异步的,而拦截可能发生在它回来之前,所以两件事都要早做。
+    /// 第一次启动发一条「已就绪」。它的作用是让用户先见过这块浮层长什么样 ——
+    /// 真拦截那一刻,他不该第一次知道「原来这里会冒出一块东西」。
     func prepare() {
-        center.delegate = self
-        // 无条件申请一次。ad-hoc 签名下系统会当场拒绝(实测返回
-        // 「Notifications are not allowed for this application」),不会弹窗、
-        // 也不会反复骚扰;将来换成正式签名,这一句就是那次授权弹窗。
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        let key = "notifyOnboarded"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        UserDefaults.standard.set(true, forKey: key)
+        post(title: "拦截提醒已就绪",
+             body: "出口一变就会在这里弹出来，不会打断你手上的事")
     }
 
     func post(title: String, body: String) {
-        center.getNotificationSettings { [weak self] settings in
-            guard let self else { return }
-            switch settings.authorizationStatus {
-            case .authorized, .provisional, .ephemeral:
-                self.deliver(title: title, body: body)
-            case .notDetermined:
-                self.center.requestAuthorization(options: [.alert, .sound]) { ok, _ in
-                    if ok { self.deliver(title: title, body: body) }
-                    else { self.fallback(title: title, body: body) }
-                }
-            default:
-                // 用户拒绝过 / 系统策略不允许:退回脚本通知,至少看得见。
-                self.fallback(title: title, body: body)
-            }
+        let host = NSHostingView(rootView: ToastCard(title: title, detail: body))
+        let size = host.fittingSize
+        host.frame = NSRect(origin: .zero, size: size)
+        host.autoresizingMask = [.width, .height]
+
+        // 点击由一层**空白 AppKit 视图**接,不让 SwiftUI 去抢。
+        // 试过两条更省事的路,都不成立:
+        //   · 子类化 NSHostingView 覆盖 mouseDown —— SwiftUI 的命中测试会把
+        //     事件交给它内部的子视图,覆写根本收不到(实测点了没反应);
+        //   · NSClickGestureRecognizer —— 浮层是 .nonactivatingPanel,
+        //     从来不是 key window,第一次点击有概率被系统当成「激活窗口」吃掉。
+        // 一块普通 NSView 参与命中测试、acceptsFirstMouse 恒真,没有这些歧义。
+        let container = NSView(frame: NSRect(origin: .zero, size: size))
+        container.addSubview(host)
+        let catcher = ToastClickCatcher(frame: NSRect(origin: .zero, size: size))
+        catcher.autoresizingMask = [.width, .height]
+        catcher.onClick = { [weak self] in self?.handleClick() }
+        container.addSubview(catcher)
+
+        let p = panel ?? makePanel()
+        panel = p
+        p.contentView = container
+        p.setContentSize(size)
+
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let target = NSRect(x: screen.maxX - size.width - 18,
+                            y: screen.maxY - size.height - 14,
+                            width: size.width, height: size.height)
+        // 从目标位置上方 10pt 滑下来。位移只有 10 —— 再大就成了「抽屉」,
+        // 一块提醒面不该表演进场。
+        p.setFrame(target.offsetBy(dx: 0, dy: 10), display: true)
+        p.alphaValue = 0
+        p.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            p.animator().alphaValue = 1
+            p.animator().setFrame(target, display: true)
         }
+
+        // 10 秒够读完两行字,又不至于一直赖在屏幕上。新提醒直接顶掉旧的。
+        hideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.dismiss() }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
     }
 
-    private func deliver(title: String, body: String) {
-        let content = UNMutableNotificationContent()
-        content.title = "Claude 环境检查器"
-        content.subtitle = title
-        content.body = body
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: UUID().uuidString,
-                                            content: content, trigger: nil)
-        center.add(request)
+    /// 点一下 = 关掉浮层 + 把主窗口叫回来。顺序是先关后叫:
+    /// 浮层还在屏幕右上角时主窗口已经前置,用户会以为「点了没反应」。
+    private func handleClick() {
+        dismiss()
+        onActivate?()
     }
 
-    private func fallback(title: String, body: String) {
-        let clean = body.replacingOccurrences(of: "\\", with: " ")
-            .replacingOccurrences(of: "\"", with: "'")
-        let script = "display notification \"\(clean)\" with title \"Claude 环境检查器\" "
-            + "subtitle \"\(title)\" sound name \"Basso\""
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", script]
-        try? p.run()
+    private func dismiss() {
+        hideWork?.cancel()
+        hideWork = nil
+        guard let p = panel, p.isVisible else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.16
+            p.animator().alphaValue = 0
+        }, completionHandler: { p.orderOut(nil) })
     }
 
-    /// App 在前台时也要弹:这条通知只在「正在用 Claude」时才出现,
-    /// 而那时窗口多半开着 —— 吞掉它就等于没提醒。
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                willPresent notification: UNNotification,
-                                withCompletionHandler completionHandler:
-                                    @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .sound])
+    private func makePanel() -> NSPanel {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: 96),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.level = .statusBar          // 盖住普通窗口,又不去抢系统弹窗的位置
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true            // 影子由系统给:自绘圆角窗口自己投不出连续的影
+        p.hidesOnDeactivate = false   // 用户切到别的 App,提醒也不该跟着消失
+        p.isMovable = false
+        p.ignoresMouseEvents = false
+        // canJoinAllSpaces:用户可能在别的桌面/全屏里干活,拦截提醒要跟过去。
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        return p
     }
+}
 
-    /// 点通知 → 回到主窗口。这就是换掉 osascript 的全部目的。
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                didReceive response: UNNotificationResponse,
-                                withCompletionHandler completionHandler: @escaping () -> Void) {
-        DispatchQueue.main.async { [weak self] in self?.onActivate?() }
-        completionHandler()
+/// 浮层上的点击层。整个浮层就一个动作:回到主窗口。
+///
+/// 存在的唯一理由是「第一次点击也要算数」:浮层窗口不是 key window,
+/// 系统默认会先用一次点击去激活窗口(inactive 外观),把它吞掉 ——
+/// 用户看到的是「点了没反应」,而这正是这次要修的那个毛病。
+/// `acceptsFirstMouse` 恒真,把这一次也接住。
+private final class ToastClickCatcher: NSView {
+    var onClick: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) { onClick?() }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
+/// 浮层的内容。形态刻意贴系统通知:左图标、右两行字、底部一句动作提示 ——
+/// 用户见过这个形状,不用学。
+private struct ToastCard: View {
+    let title: String
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            GuardMark(box: 20)
+                .frame(width: 22, height: 20, alignment: .center)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(Type.bodyStrongFont)
+                    .foregroundColor(ClaudeTheme.ink)
+                    .lineLimit(1)
+                Text(detail)
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(Type.microLineGap)
+                HStack(spacing: 3) {
+                    Text("点这里回到主窗口")
+                    Image(systemName: "arrow.up.forward")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .font(Type.microFont)
+                .foregroundColor(ClaudeTheme.brandText)
+                .padding(.top, 2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 13)
+        .frame(width: 352, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(ClaudeTheme.card)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(ClaudeTheme.hairline, lineWidth: 1)
+        )
     }
 }
 
@@ -5635,15 +5813,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 走的是同一个 Notifier、同一个点击回调。
         if CommandLine.arguments.contains("--notify-test") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                Notifier.shared.post(title: "通知测试", body: "点这条应该会回到主窗口")
+                Notifier.shared.post(title: "通知测试", body: "这是 App 自己画的提醒，不经过系统通知")
             }
         }
         vm.onSwitchCompleted = { [weak self] in self?.mainWindow?.orderOut(nil) }
-        // 拦截时让 Dock 图标跳起来。这是通知之外唯一一条「一定送达」的通道:
-        // 这个 App 是 ad-hoc 签名,系统直接拒发通知(实测 requestAuthorization
-        // 返回「Notifications are not allowed for this application」),
-        // 通知横幅都不会出现,更谈不上点它回窗口。图标弹跳不需要任何授权。
-        vm.onIntercepted = {
+        // 拦截时还有第二条「一定送达」的通道:Dock 图标跳。浮层可能被用户
+        // 眼睛漏掉(他正盯着别的窗口),图标弹跳会一直跳到窗口被处理为止。
+        vm.onIntercepted = { [weak self] in
+            // 拦截必须「一定被看见」,但**不抢键盘焦点**。
+            // 默认策略是 .accessory(不在 Dock 里)—— 那种状态下
+            // requestUserAttention 没有图标可跳,等于没提醒,所以先让 App
+            // 出现在 Dock;但走到这一步不去 activate:拦停本身已经发生了,
+            // 把窗口盖到用户脸上,他只会先关窗再回头问「刚才怎么了」。
+            // 要看详情,点右上角那块提醒面。
+            self?.appearInDockWithoutStealingFocus()
             NSApp.requestUserAttention(.criticalRequest)
         }
         showMainWindow()
@@ -5689,8 +5872,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // 交给检查落定后的观察者调。
         }
         if mainWindow?.isMiniaturized == true { mainWindow?.deminiaturize(nil) }
+        makePresenceObvious()
         mainWindow?.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        // orderFrontRegardless:窗口被别的 App 的全屏空间挡住时,
+        // makeKeyAndOrderFront 可能只是「在它那一层前置」,用户看不到任何变化。
+        mainWindow?.orderFrontRegardless()
+    }
+
+    /// 把这次「打开」做得够显眼。
+    ///
+    /// 默认激活策略是 .accessory(不在 Dock 里)—— 那种状态下窗口就算前置了,
+    /// 屏幕上也没有任何「这个 App 现在在这儿」的凭据:没有 Dock 图标可看,
+    /// 没有菜单栏,窗口一旦被别的窗口盖住就再也找不回来。
+    /// 所以只要是我们主动把窗口推到用户面前(启动、点通知、拦截),就临时切成
+    /// .regular:出现 Dock 图标、菜单栏跟着变成这个 App,用户一眼知道该看哪儿。
+    /// 用户自己关掉窗口时再按设置切回去(见 windowWillClose)。
+    private func makePresenceObvious() {
+        if NSApplication.shared.activationPolicy() != .regular {
+            NSApplication.shared.setActivationPolicy(.regular)
+        }
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// 只要 Dock 里有图标,不要键盘焦点。
+    /// 拦截那一刻用的就是这个:图标出现 + 弹跳 = 有地方可点,
+    /// 但用户正在别的 App 里打字,不该被我们打断。
+    private func appearInDockWithoutStealingFocus() {
+        if NSApplication.shared.activationPolicy() != .regular {
+            NSApplication.shared.setActivationPolicy(.regular)
+        }
     }
 
     /// 用一个不显示的探针视图量内容的自然高度,再改窗口。
@@ -5739,6 +5950,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
+        // 窗口收起来之后,把激活策略交还给用户设置:平时不想在 Dock 里看到它
+        // 的人,不会因为弹过一次窗口就永久多出一个图标。
+        DockPreference.apply()
         return false
     }
 
