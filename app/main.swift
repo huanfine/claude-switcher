@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import UniformTypeIdentifiers
+import UserNotifications
 
 // MARK: - 模型
 
@@ -592,6 +593,9 @@ final class VM: ObservableObject {
     private var checkingUpdate = false
     private var hideAfterSwitch: DispatchWorkItem?
     var onSwitchCompleted: (() -> Void)?
+    /// 拦截发生时的回调。通知点不点得开取决于系统给不给授权(ad-hoc 签名下
+    /// 一律不给),所以还得有一条不依赖通知的「回来看一眼」通道。
+    var onIntercepted: (() -> Void)?
 
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
          checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180) {
@@ -929,25 +933,27 @@ final class VM: ObservableObject {
             : "已拦截（拦截时 Claude 没有在运行）：\(reason)"
     }
 
-    /// 走 osascript 而不是 UNUserNotificationCenter:这个 App 是 ad-hoc 签名,
-    /// 通知授权在重签名后会失效,而 display notification 不依赖它。
-    /// 测试构建不发真通知 —— 否则每跑一次用例,用户的通知中心就多一条假拦截。
+    /// 拦截通知。本进程自己发、自己接点击 —— 点通知要能回到这个窗口。
+    ///
+    /// 以前用 `osascript -e 'display notification'`:好处是 ad-hoc 签名下不受
+    /// 通知授权影响(重签会丢授权,而脚本通知不依赖它),代价是那条通知
+    /// **点不开** —— 它是 osascript 发的,和本 App 没有绑定关系,点了只会消失。
+    /// 用户看到的正是这个:拦截发生了,通知也弹了,点一下却什么都没发生。
+    /// 现在走 UNUserNotificationCenter,点击回调里把主窗口叫回来;
+    /// 没拿到授权(用户拒绝过 / 系统没给)才退回 osascript。
+    /// 测试构建不发真通知 —— 否则每跑一次用例,通知中心就多一条假拦截。
     private func notify(title: String, body: String) {
-        let clean = body.replacingOccurrences(of: "\\", with: " ")
-            .replacingOccurrences(of: "\"", with: "'")
         #if CLAUDE_SWITCHER_TESTS
-        // 测试会走完整的「拦停 → 通知」路径,以前这里真发系统通知:
         // 跑一次菜单栏用例,通知中心就多一条「已自动停止 Claude /
         // 出口 IPv4 变了(1.2.3.4 → 5.6.7.8)」—— IP 是夹具里的占位值,
         // 长相却和真拦截一模一样,没人能分出哪条是真事。测试只打日志。
-        FileHandle.standardError.write(Data("NOTIFY: \(title) | \(clean)\n".utf8))
+        FileHandle.standardError.write(Data("NOTIFY: \(title) | \(body)\n".utf8))
         #else
-        let script = "display notification \"\(clean)\" with title \"Claude 环境检查器\" subtitle \"\(title)\" sound name \"Basso\""
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", script]
-        try? p.run()
+        Notifier.shared.post(title: title, body: body)
         #endif
+        // 通知是「尽量」,这条路才是「一定」:通知可能被系统拒发(ad-hoc 签名
+        // 下必然拒发),而 Dock 图标一跳,用户总有个能点的地方。
+        onIntercepted?()
     }
 
     func stopWatch() {
@@ -2609,9 +2615,12 @@ private struct GhostTextButton: View {
 private struct CardSurface: ViewModifier {
     var radius: CGFloat = Geo.cardRadius
     var fill: Color = ClaudeTheme.card
-    var shadowRadius: CGFloat = 20
-    var shadowY: CGFloat = 12
-    var shadowAlpha: Double = 0.05
+    // 阴影收了一圈:半径 20 / 下移 12 / 5% 黑,在浅底上是一圈发灰的光晕 ——
+    // 大卡勉强撑得住,小卡(槽位那四张)顶着它就整片发糊,像没对准焦。
+    // 现在是小半径贴边阴影:只负责把卡片从底色上抬起一点点,不画光晕。
+    var shadowRadius: CGFloat = 13
+    var shadowY: CGFloat = 5
+    var shadowAlpha: Double = 0.04
 
     func body(content: Content) -> some View {
         content
@@ -2997,7 +3006,7 @@ struct ContentView: View {
     private var mainContent: some View {
         // 组间 32、组内 10 —— 差 3.2 倍。之前是 22 和 11,所有间距都在 20 上下,
         // 每样东西看起来同等重要,眼睛找不到分组。
-        VStack(alignment: .leading, spacing: Geo.group) {
+        VStack(alignment: .leading, spacing: Geo.group - 8) {
             heroCard
             accountSection
             // 两列而不是一列:16 行竖着堆,窗口要么高到离谱,要么矮到要滚动。
@@ -3466,12 +3475,15 @@ struct ContentView: View {
     /// 演练已通过且证据新鲜时不出现，避免变成天天都在的噪声。
     private var failClosedNotice: String? {
         switch vm.failClosedStatus {
+        // 三条文案原来都以「fail-closed」开头 —— 那是代码里的叫法,用户读到的
+        // 只是一个没头没尾的英文词,既不知道在说哪件事,也不知道要不要管。
+        // 现在每条只说两件事:演练测的是什么、结论对当下意味着什么。
         case "violated":
-            return "fail-closed 演练未通过：代理断开时可能直连，跑 drill 复验"
+            return "代理断开演练没通过：断掉代理后本机仍能直连外网 · 跑 drill 复验，看现在是否还漏"
         case "stale":
-            return "fail-closed 证据已过期，跑 drill 复验"
+            return "代理断开演练已超过 7 天，结论可能已失效 · 跑 drill 复验"
         case "unverified":
-            return "fail-closed 未验证：全绿只说明流量此刻走了代理，跑 drill 验证断开不会直连"
+            return "还没做过代理断开演练：16 项全绿只说明此刻流量走了代理 · 跑 drill 验证断开后不会直连"
         default:
             return nil
         }
@@ -3695,12 +3707,22 @@ struct ContentView: View {
             // 圆角跟大卡、跟延迟面板里的小卡统一走 22：它们在页面上是同一个角色
             // （浮在底色上的一张面），原来这里是 14，四张小卡挨着两张 22 的大卡，
             // 一眼就能看出不是一套。
-            .cardSurface(radius: Geo.cardRadius,
-                         // hover 原来铺的是页面底色。页面底色抬到 249 之后，
-                         // 白卡(255) → 249 只差 6 级，是原来的一半，指针划过去
-                         // 几乎看不出来。改用 inset(246)：差 9 级，和改之前的
-                         // 手感基本一致，而且是已有色、不新增表面。
-                         fill: hovered ? ClaudeTheme.inset : ClaudeTheme.card)
+            // 槽位卡不投阴影,改成一条发丝描边。
+            //
+            // 四张 22pt 圆角的小卡并排,每张都往下投 12pt 的影子 —— 它们之间的
+            // 空隙只有 10pt,影子正好叠进邻卡的边上,整排看着灰蒙蒙的。
+            // 小卡本来就该「贴着页面」,不是浮在上面:去掉影子、换一条边,
+            // 它和底色之间那条界线反而更清楚。
+            .cardSurface(radius: Geo.cardRadius, fill: ClaudeTheme.card,
+                         shadowRadius: 0, shadowY: 0, shadowAlpha: 0)
+            .overlay(
+                RoundedRectangle(cornerRadius: Geo.cardRadius, style: .continuous)
+                    // hover 只提亮这条边,不换整张卡的底色。
+                    // 之前 hover 是把整块白底刷成灰底(255→246),
+                    // 指针扫过一排卡,像有人在上面抹了一遍脏手印。
+                    .strokeBorder(hovered ? ClaudeTheme.muted.opacity(0.55) : ClaudeTheme.hairline,
+                                  lineWidth: 1)
+            )
             .contentShape(RoundedRectangle(cornerRadius: Geo.cardRadius, style: .continuous))
             .animation(.easeOut(duration: Motion.micro), value: hovered)
         }
@@ -5498,6 +5520,91 @@ enum DockPreference {
     }
 }
 
+/// 拦截通知的投递与点击回收。
+///
+/// 为什么要换掉 `osascript -e 'display notification'`:那种通知由 osascript
+/// 代发,和本 App 之间没有可回调的关系 —— 点它只会从通知中心消失,不会把
+/// 窗口叫回来。而这个通知的全部意义是「出事了,回来看一眼」,点不开等于
+/// 只剩一半功能。
+///
+/// 代价是它需要通知授权:ad-hoc 签名每次重签,系统会当成一个新 App 重新问一次。
+/// 没授权的机器上仍退回 osascript —— 看不到点击,但至少能看到通知。
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = Notifier()
+
+    /// 点通知之后要做什么。启动时由 AppDelegate 接到 `showMainWindow()`。
+    var onActivate: (() -> Void)?
+
+    private let center = UNUserNotificationCenter.current()
+
+    /// 启动即挂上 delegate 并申请一次授权。挂晚了点击回调收不到 ——
+    /// 授权弹窗是异步的,而拦截可能发生在它回来之前,所以两件事都要早做。
+    func prepare() {
+        center.delegate = self
+        // 无条件申请一次。ad-hoc 签名下系统会当场拒绝(实测返回
+        // 「Notifications are not allowed for this application」),不会弹窗、
+        // 也不会反复骚扰;将来换成正式签名,这一句就是那次授权弹窗。
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func post(title: String, body: String) {
+        center.getNotificationSettings { [weak self] settings in
+            guard let self else { return }
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                self.deliver(title: title, body: body)
+            case .notDetermined:
+                self.center.requestAuthorization(options: [.alert, .sound]) { ok, _ in
+                    if ok { self.deliver(title: title, body: body) }
+                    else { self.fallback(title: title, body: body) }
+                }
+            default:
+                // 用户拒绝过 / 系统策略不允许:退回脚本通知,至少看得见。
+                self.fallback(title: title, body: body)
+            }
+        }
+    }
+
+    private func deliver(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Claude 环境检查器"
+        content.subtitle = title
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString,
+                                            content: content, trigger: nil)
+        center.add(request)
+    }
+
+    private func fallback(title: String, body: String) {
+        let clean = body.replacingOccurrences(of: "\\", with: " ")
+            .replacingOccurrences(of: "\"", with: "'")
+        let script = "display notification \"\(clean)\" with title \"Claude 环境检查器\" "
+            + "subtitle \"\(title)\" sound name \"Basso\""
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        try? p.run()
+    }
+
+    /// App 在前台时也要弹:这条通知只在「正在用 Claude」时才出现,
+    /// 而那时窗口多半开着 —— 吞掉它就等于没提醒。
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler:
+                                    @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// 点通知 → 回到主窗口。这就是换掉 osascript 的全部目的。
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        DispatchQueue.main.async { [weak self] in self?.onActivate?() }
+        completionHandler()
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let vm: VM
     private(set) var mainWindow: NSWindow?
@@ -5520,7 +5627,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DockPreference.apply()
+        // 点拦截通知要能回到这个窗口 —— 这正是它存在的意义。
+        Notifier.shared.onActivate = { [weak self] in self?.showMainWindow() }
+        Notifier.shared.prepare()
+        // `--notify-test` 发一条和真拦截同路径的测试通知,验「点通知能不能回来」。
+        // 拦截本身要等出口真变了才触发,没法随时复现;而这条通知除了内容是假的,
+        // 走的是同一个 Notifier、同一个点击回调。
+        if CommandLine.arguments.contains("--notify-test") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                Notifier.shared.post(title: "通知测试", body: "点这条应该会回到主窗口")
+            }
+        }
         vm.onSwitchCompleted = { [weak self] in self?.mainWindow?.orderOut(nil) }
+        // 拦截时让 Dock 图标跳起来。这是通知之外唯一一条「一定送达」的通道:
+        // 这个 App 是 ad-hoc 签名,系统直接拒发通知(实测 requestAuthorization
+        // 返回「Notifications are not allowed for this application」),
+        // 通知横幅都不会出现,更谈不上点它回窗口。图标弹跳不需要任何授权。
+        vm.onIntercepted = {
+            NSApp.requestUserAttention(.criticalRequest)
+        }
         showMainWindow()
         vm.start()
         vm.trackClaudeProcess()
