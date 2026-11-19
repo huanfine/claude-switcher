@@ -544,6 +544,9 @@ final class VM: ObservableObject {
     /// 正在重查的项。重查时不清空上一轮结果,只给还没回来的行挂一个小转圈 ——
     /// 整屏先变灰再一格格填回来,看着像界面在抽搐,用户会以为卡住了。
     @Published private(set) var rechecking: Set<String> = []
+    /// 已经有落定过的一轮。首轮没有任何旧值可显示,行是一条条落下来的;
+    /// 之后每轮保留旧值就地更新 —— 让整列推倒重来会闪,那才是抽搐。
+    @Published private(set) var hasSettledOnce = false
     /// 看门狗是不是正守着。界面上的「驻守中」呼吸动画只看这一个开关。
     @Published private(set) var guarding = false
     /// 本次驻守从什么时候开始。用来显示「已驻守 2 小时 14 分」。
@@ -1299,6 +1302,7 @@ final class VM: ObservableObject {
                         if lease.succeeded {
                             self.phase = .ready
                             self.rechecking = []
+                            self.hasSettledOnce = true
                             self.loadRTT()
                             done(true)
                         } else {
@@ -1306,6 +1310,7 @@ final class VM: ObservableObject {
                             self.lastCheckSummary = "失败"
                             self.banner = "启动租约签发失败：\(Self.failureLine(lease.output))"
                             self.rechecking = []
+                            self.hasSettledOnce = true
                             done(false)
                         }
                     }
@@ -1315,6 +1320,7 @@ final class VM: ObservableObject {
                 // 收尾时兜底清空:输出缺行时那些项会一直挂着转圈,
                 // 界面看起来像永远没查完。
                 self.rechecking = []
+                self.hasSettledOnce = true
                 // 这一轮刚往 rtt.log 追加了一条采样,顺手读回来 ——
                 // 不读的话洞察窗要等下次刷新才看到新点。
                 self.loadRTT()
@@ -2768,11 +2774,15 @@ private struct SpinRing: View {
     var duration: Double = 0.9
     var trimEnd: CGFloat = 0.24
     var color: Color = ClaudeTheme.muted
+    /// 弧长跟着呼吸(0.55↔1.0 倍)。行内那个 9~12pt 的小圈不开:尺寸太小,
+    /// 弧长一变只像在抖;92pt 的主环才有地方让这段变化被看见。
+    var rhythm: Bool = false
     @State private var angle: Double = 0
+    @State private var swell = false
 
     var body: some View {
         Circle()
-            .trim(from: 0, to: trimEnd)
+            .trim(from: 0, to: trimEnd * (rhythm ? (swell ? 1 : 0.55) : 1))
             .stroke(color.opacity(0.85), style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
             .frame(width: size, height: size)
             .rotationEffect(.degrees(angle))
@@ -2781,24 +2791,30 @@ private struct SpinRing: View {
                 withAnimation(.linear(duration: duration).repeatForever(autoreverses: false)) {
                     angle = 360
                 }
+                guard rhythm else { return }
+                // 呼吸周期和转速同长(autoreverses 一进一出),于是「转两圈、
+                // 弧长长一次再收一次」。匀速转是机器在空转,有收放才像在数东西。
+                withAnimation(.easeInOut(duration: duration).repeatForever(autoreverses: true)) {
+                    swell = true
+                }
             }
     }
 }
 
 /// 看门狗驻守条。
 ///
-/// 为什么要有动画:这个工具的价值全在「它一直盯着」。可一个静止的绿字
-/// 「保镖在线」和一张截图没区别 —— 用户没法区分「正在守」和「上次检查时还在守」。
-/// 动画就是那个「现在进行时」的凭据。
+/// 「它还在盯着」这件事必须看得见 —— 一个静止的「保镖在线」和一张截图没区别。
+/// 但凭据不是循环动画,是右侧那行**每秒自己走字**的「心跳 N 秒前」:
+/// 脚本每巡逻一轮吐一行 `BEAT:<epoch>`,心跳一断,这个数字就停在那儿不动,
+/// 同时标题转成警告色。数字走不动了,比任何转圈都更说明问题。
 ///
-/// 但动画不能自己转。每一圈雷达扫过的涟漪都由脚本吐的 `BEAT:` 心跳驱动:
-/// 守护断了心跳就停,涟漪跟着停,条子转成警告色 —— 这时动画停下来本身就是信号。
-/// 一个永远在转的假动画,比没有动画更危险。
+/// 所以这条带子上没有涟漪、没有呼吸底盘 —— 一个由心跳驱动的动画,
+/// 一旦丢帧或卡住(而心跳其实还好),屏幕上就会谎报「它不动了」。
+/// 用时间戳说话,不会骗人,也不用为它再画一个圆。
 private struct GuardBand: View {
     @ObservedObject var vm: VM
     /// 每秒走一格。只用来把「最近心跳 3 秒前」和失联判定刷新出来。
     @State private var now = Date()
-    @State private var ripple = false
 
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -2847,68 +2863,46 @@ private struct GuardBand: View {
 
             Spacer(minLength: 10)
 
-            // 两个时间戳合成一行。本来就都是「多久以前」的同一个格式,竖着码两行
-            // 只是为了对齐,却让这条带子白白高了 14pt —— 而它是全屏最次要的信息。
-            HStack(spacing: 4) {
-                Text(dutyText)
-                    .foregroundColor(ClaudeTheme.faint)
-                Text("·")
-                    .foregroundColor(ClaudeTheme.faint)
-                Text(beatText)
-                    .foregroundColor(fresh ? ClaudeTheme.ok : ClaudeTheme.faint)
-            }
-            .font(Type.microFont)
-            .monospacedDigit()
-            .lineLimit(1)
-            .fixedSize()
+            // 右侧只放一句。原来是「已驻守 3 分 · 心跳 12 秒前」两段拼起来,
+            // 没驻守时也照样拼,于是成了「未驻守 · —」—— 一个分隔符加一根横杠,
+            // 像两件事都没成。现在没驻守就只说没驻守。
+            Text(metaText)
+                .font(Type.microFont)
+                .monospacedDigit()
+                .foregroundColor(fresh ? ClaudeTheme.muted : ClaudeTheme.faint)
+                .lineLimit(1)
+                .fixedSize()
         }
         // 它现在是一张独立的卡，内边距由调用点给（跟着「卡片左右 32」的规矩走，
         // 否则这枚图标会比上面那枚圆环左边缺 18pt，两张卡的左边缘对不上）。
         .frame(maxWidth: .infinity, alignment: .leading)
         .onReceive(tick) { now = $0 }
-        // 用 onReceive 订阅而不是 onChange:onChange 的单参数形式在 macOS 14
-        // 已废弃,而两参数形式要 14+,这个 App 还要跑 13。
-        .onReceive(vm.$guarding) { on in
-            if on { pulse() }
-        }
-        .onReceive(vm.$lastBeat) { beat in
-            if beat != nil { pulse() }
-        }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(title)，\(subtitle)，\(dutyText)，\(beatText)")
+        .accessibilityLabel("\(title)，\(subtitle)，\(metaText)")
     }
 
     // MARK: 图形
 
     private var glyph: some View {
-        ZStack {
-            // 一块实心底盘，心跳一到就往外扩一圈再收回来。
-            //
-            // 上一版这里是三层线条：1.6pt 的扫描弧 + 1.1pt 的涟漪描边 + 半填充盾牌。
-            // 30pt 的方块里塞三根 1pt 多的线，缩进菜单栏那种尺寸就只剩线框感 ——
-            // 而且「在动」这件事，实心块的呼吸比细弧线更明显，还不用三条动画。
-            Circle()
-                .fill(tone.opacity(ripple ? 0.05 : 0.14))
-                .frame(width: 30, height: 30)
-                .scaleEffect(ripple ? 1.45 : 1)
-
-            Image(systemName: vm.intercepted ? "hand.raised.fill" : "shield.fill")
-                .font(Type.bodyStrongFont)
-                .foregroundColor(tone)
-        }
-        .frame(width: 30, height: 30)
+        // 用**线框**盾牌,不用实心。
+        //
+        // 15pt 的 shield.fill 是一整块实色,在浅灰带子上就是一个墨点 ——
+        // 上一版底下还垫着一个 30pt 同色圆盘,两团糊在一起,这就是那条带子
+        // 看起来脏的全部原因。线框在同样尺寸下还是「一个图形」,
+        // 不会变成一块污渍。
+        Image(systemName: vm.intercepted ? "hand.raised" : "shield")
+            .font(.system(size: 15, weight: .regular))
+            .foregroundColor(tone)
+            .frame(width: 22, height: 22)
     }
 
-    /// 一圈涟漪。1.1s 扩到 1.55 倍并淡出,比扫描弧快一个量级 ——
-    /// 快的那一下是「刚刚」,慢的那圈是「一直在」。
-    private func pulse() {
-        ripple = false
-        // ambient: 心跳涟漪是**循环动画**（每秒扩散一圈），不是状态过渡。
-        // 规范 ≤140ms 管的是 hover/切换这类状态变化；把一圈涟漪压到 140ms，
-        // 它就不再是「一直在守着」，而是「闪了一下」。
-        withAnimation(.easeOut(duration: 1.1)) { ripple = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) { ripple = false }
-    }    // MARK: 文案
+    // MARK: 文案
+
+    /// 右侧那一句。没驻守就只说「未驻守」—— 不驻守的时候没有心跳可报。
+    private var metaText: String {
+        guard vm.guarding else { return "未驻守" }
+        return "\(dutyText) · \(beatText)"
+    }
 
     private var dutyText: String {
         guard vm.guarding, let since = vm.guardSince else { return "未驻守" }
@@ -2920,7 +2914,6 @@ private struct GuardBand: View {
     }
 
     private var beatText: String {
-        guard vm.guarding else { return "—" }
         guard let beat = vm.lastBeat else { return "等待首次心跳" }
         let s = max(0, Int(now.timeIntervalSince(beat)))
         if s < 2 { return "心跳 刚刚" }
@@ -3227,14 +3220,29 @@ struct ContentView: View {
         ZStack {
             Circle()
                 .stroke(ClaudeTheme.hairline, lineWidth: Self.ringStroke)
-            Circle()
-                .trim(from: 0, to: ringProgress)
-                .stroke(healthSummary.color,
-                        style: StrokeStyle(lineWidth: Self.ringStroke, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: Motion.emphasis), value: ringProgress)
+            // 核对期间**不画**进度弧。两段弧同色同环叠在一起:进度弧填到哪儿,
+            // 转着的那段就隐身到哪儿 —— 截图上看起来就是一圈断掉的橙环,
+            // 既不是进度也不是转圈。核对时的进度由下面两张卡的进度条负责,
+            // 这枚环只做一件事:证明它还在动。
+            if !heroBusy {
+                Circle()
+                    .trim(from: 0, to: ringProgress)
+                    .stroke(healthSummary.color,
+                            style: StrokeStyle(lineWidth: Self.ringStroke, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeInOut(duration: Motion.emphasis), value: ringProgress)
+            }
             if heroBusy {
-                ProgressView().scaleEffect(0.6)
+                // 转的就是**这圈环本身**,不是环里另放一个小圈。
+                //
+                // 试过两版都不对:先是系统 ProgressView(缩到 8pt 只剩一颗灰点),
+                // 再是 22pt 的自绘小圈 —— 92pt 的空环里躺着一小段橙弧,
+                // 截图上看就是一道随手的划痕,既不像「在转」,也不像「进度」。
+                // 环本来就是这个位置唯一的主体,让它自己转才是这一屏该有的样子:
+                // 描边 3、弧长 18%、1.1 秒一圈,和整屏「细线 + 主题色」同一套语言。
+                SpinRing(size: Self.ringSize, lineWidth: Self.ringStroke,
+                         duration: 1.1, trimEnd: 0.18, color: healthSummary.color,
+                         rhythm: true)
             } else {
                 VStack(spacing: 3) {
                     // 分子分母拼进**同一个 Text**，而不是 HStack 两段。
@@ -3869,21 +3877,44 @@ struct ContentView: View {
                 if vm.coreMissing {
                     setupPanel
                 } else {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
-                            // 只有「更优节点」可点:其余各行点下去没有任何动作,
-                            // 整行都做成按钮会让人以为到处能点,试两次就学会了不点。
-                            if row.name == "更优节点" {
-                                Button { vm.scanNodes() } label: {
-                                    checkRow(row, index: idx)
+                    ZStack(alignment: .topLeading) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
+                                // 首轮逐条落定:没回来的项先不摆出来,查完一项现一行。
+                                // 十六行一起挂转圈,读者看到的是「一整块在闪」;
+                                // 一行行落下才有节奏,也才对得上「查到哪儿了」。
+                                // 用透明度而不是位移/条件渲染:行高先占住,卡片不抽。
+                                let shown = rowShown(row)
+                                Group {
+                                    // 只有「更优节点」可点:其余各行点下去没有任何动作,
+                                    // 整行都做成按钮会让人以为到处能点,试两次就学会了不点。
+                                    if row.name == "更优节点" {
+                                        Button { vm.scanNodes() } label: {
+                                            checkRow(row, index: idx, interactive: true)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .disabled(vm.nodeScanBusy)
+                                        .help(vm.nodeScanBusy ? "正在扫描可用节点…"
+                                                              : "扫描可用节点（只读，不切线路）")
+                                    } else {
+                                        checkRow(row, index: idx)
+                                    }
                                 }
-                                .buttonStyle(.plain)
-                                .disabled(vm.nodeScanBusy)
-                                .help(vm.nodeScanBusy ? "正在扫描可用节点…"
-                                                      : "扫描可用节点（只读，不切线路）")
-                            } else {
-                                checkRow(row, index: idx)
+                                .opacity(shown ? 1 : 0)
+                                // 透明不等于不可点:按钮得跟着一起藏起来。
+                                .allowsHitTesting(shown)
+                                .animation(.easeOut(duration: Motion.state), value: shown)
                             }
+                        }
+
+                        // 一行都还没落定时这块是空的。留一句进度提示,
+                        // 否则首屏的卡片看起来像坏掉了。
+                        if checking && !rows.contains(where: { rowShown($0) }) {
+                            Text("正在逐项核对 \(rows.count) 项…")
+                                .font(Type.microFont)
+                                .foregroundColor(ClaudeTheme.faint)
+                                .padding(.top, 3)
+                                .transition(.opacity)
                         }
                     }
                     .padding(.horizontal, Rhythm.listInset)
@@ -3903,6 +3934,12 @@ struct ContentView: View {
         .animation(.easeOut(duration: Motion.state), value: checking)
     }
 
+    /// 这一行现在该不该露出来。首轮没有旧值可显示,行随检查逐条落下;
+    /// 落定过一轮之后一律显示 —— 那之后是「旧值就地更新」,推倒重来会闪。
+    private func rowShown(_ row: CheckRow) -> Bool {
+        vm.hasSettledOnce || !vm.rechecking.contains(row.name)
+    }
+
     /// 一条 3pt 的进度线。宽度跟着「已落定的行数」走,和逐行落定是同一个节拍 ——
     /// 两处对不上(条子走完了行还在转)会让人以为卡住了。
     private func checkProgress(_ rows: [CheckRow]) -> some View {
@@ -3912,9 +3949,14 @@ struct ContentView: View {
         return GeometryReader { geo in
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous).fill(ClaudeTheme.inset)
-                RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
-                    .fill(cardAccent(rows).opacity(0.8))
-                    .frame(width: max(4, geo.size.width * ratio))
+                // 一行都还没落定时不画填充条。以前这里写的是 max(4, ...)，
+                // 于是 0% 也留着一块 4×3 的圆角:细线只有 3pt 高，远看就是标题
+                // 左边多了一颗圆点，像项目符号。空进度就该是一条空槽。
+                if done > 0 {
+                    RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
+                        .fill(cardAccent(rows).opacity(0.8))
+                        .frame(width: max(4, geo.size.width * min(1, ratio)))
+                }
             }
         }
         .frame(height: 3)
@@ -3955,7 +3997,8 @@ struct ContentView: View {
         return ClaudeTheme.muted
     }
 
-    private func checkRow(_ row: CheckRow, index: Int = 0) -> some View {
+    private func checkRow(_ row: CheckRow, index: Int = 0,
+                          interactive: Bool = false) -> some View {
         // 提示项(warn)也算「要你动手」:时区不对、地区格式不对都能一键修。
         // 判定只剩这一条 —— 原来还有个 isProblem(fail/config),只用来决定行名加不加粗,
         // 结果是 warn 行和通过行字重一样;现在统一看 needsAttention。
@@ -4177,12 +4220,12 @@ struct ContentView: View {
         // 只有悬浮才铺底色。之前给「要处理」的行铺一层淡色,结果同一张卡里
         // 两行有色、四行没色,看着像两个被选中的行,清单反而不像清单。
         // 「要处理」已经有三个信号了:图标着色、第二行原因、行尾修复按钮。
+        //
+        // 而且只有**能点的行**才铺:十六行全都跟着鼠标亮,划一遍像在扫地 ——
+        // 用户会顺手去点,点下去什么也不会发生。
         .background(
             RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
-                // hover 用 inset 而不是页面底色：页面底色抬到 249 之后，
-                // 白卡上的 hover 只剩 6 级差，太淡；inset(246) 差 9 级，
-                // 和抬底色之前的手感一致，也不新增表面色。
-                .fill(hoveredRow == row.name ? ClaudeTheme.inset : Color.clear)
+                .fill(interactive && hoveredRow == row.name ? ClaudeTheme.inset : Color.clear)
         )
         // 逐行落定,而不是整组一起跳。检查输出是一行行回来的,给每行按顺序
         // 错开十几毫秒,眼睛能跟上「现在核到哪一项」;错开量封顶 96ms,
@@ -4192,7 +4235,9 @@ struct ContentView: View {
         .animation(.easeOut(duration: Motion.micro), value: isRechecking)
         .animation(.easeOut(duration: Motion.micro), value: row.detail)
         .onHover { inside in
-            // 鼠标划过去要有一点反应,否则整张清单像一张不可点的表。
+            // 鼠标划过去要有一点反应,但只给真能点的行 —— 一张不可点的清单
+            // 整列跟着亮,读起来像「随便点哪儿都行」。
+            guard interactive else { return }
             withAnimation(.easeOut(duration: Motion.micro)) {
                 if inside { hoveredRow = row.name }
                 else if hoveredRow == row.name { hoveredRow = nil }

@@ -6549,12 +6549,35 @@ case "$operation" in
             # 同一轮检查产出两份:last-check.txt 给旧客户端,last-report.json 给新契约。
             TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/claude-check.XXXXXX")"
             CHECK_STARTED_AT="$(date '+%F %T')"
+            # 逐项上报进度。JSON 分支原来把整轮输出攒进文件、跑完再生成报告,
+            # 界面拿到的是「16 项一起亮」—— 检查那几秒里进度条始终是 0,
+            # 用户分不清「在查」和「卡死」。文本分支早就用 tee 边查边吐了,
+            # 这里补上同样的能力:报告正文照旧进 TMP_OUT(JSON 由它生成),
+            # 同时把每一行原样写到 fd 3 = 脚本自己的 stderr —— 那也是界面读的
+            # 那一路,于是每查完一项,界面就落定一行。
+            exec 3>&2
             {
                 echo "# $CHECK_STARTED_AT pid=$$ 开始"
-                checkdetail
-                check_rc=$?
+                checkdetail | while IFS= read -r line; do
+                    printf '%s\n' "$line"
+                    # 只转发「名=状态」的报告行:开头由 report 生成的 JSON 不带它,
+                    # 带空格的行(警告/INFO)也不是检查项,别让它们冒充进度。
+                    case "$line" in
+                        *=*)
+                            name=${line%%=*}
+                            case "$name" in
+                                *' '*) ;;
+                                *) printf '%s\n' "$line" >&3 ;;
+                            esac
+                            ;;
+                    esac
+                done
+                # 管道会把 checkdetail 放进子 shell,退出码得从 PIPESTATUS 取,
+                # 否则拿到的是 while 的退出码 —— 永远是 0,失败会被吞。
+                check_rc=${PIPESTATUS[0]}
                 echo "# 结束"
             } >"$TMP_OUT" 2>&1
+            exec 3>&-
             cp "$TMP_OUT" "$OUT_FILE"
             rm -f "$TMP_OUT"
             chmod 600 "$OUT_FILE" 2>/dev/null || true
