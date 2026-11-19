@@ -419,7 +419,7 @@ esac''')
         """查不到就不写缓存 —— 否则一次网络抖动会把「未知」钉住一整天。"""
         self.stub_net("", "", "", "")
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v5"
+        cache = self.home / ".claude-switcher" / "purity-cache.v6"
         if cache.exists():
             self.assertNotIn("203.0.113.10", cache.read_text(encoding="utf-8"))
 
@@ -544,7 +544,7 @@ esac''')
         """
         self.stub_net(RESIDENTIAL, _ipapi("Denver", countryCode="US"), IPINFO_RESID)
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v5"
+        cache = self.home / ".claude-switcher" / "purity-cache.v6"
         self.assertTrue(cache.exists(), "没写 v4 缓存")
         fields = cache.read_text(encoding="utf-8").strip().split("|")
         self.assertEqual(len(fields), 7, "v4 应是 7 列,实际 %d: %s" % (len(fields), fields))
@@ -561,7 +561,7 @@ esac''')
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("风险源不可达", detail)
-        cache = self.home / ".claude-switcher" / "purity-cache.v5"
+        cache = self.home / ".claude-switcher" / "purity-cache.v6"
         line = cache.read_text(encoding="utf-8").strip()
         fields = line.split("|")
         self.assertEqual(len(fields), 7, fields)
@@ -575,7 +575,7 @@ esac''')
         cache.unlink()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        fresh = (self.home / ".claude-switcher" / "purity-cache.v5").read_text(encoding="utf-8")
+        fresh = (self.home / ".claude-switcher" / "purity-cache.v6").read_text(encoding="utf-8")
         rows = [r for r in fresh.strip().splitlines() if r.startswith("203.0.113.10|")]
         self.assertEqual(len(rows), 1, "同一个 IP 不该留下两条缓存")
         remaining = 86400 - (int(time.time()) - int(rows[0].split("|")[1]))
@@ -621,7 +621,7 @@ esac''')
         self.assertEqual(state, "ok", detail)
         self.assertNotIn("硬门槛:", detail)
         # 两次跑的是同一个夹具 IP,不删缓存第二次会直接读到住宅那条结果。
-        (self.home / ".claude-switcher/purity-cache.v5").unlink(missing_ok=True)
+        (self.home / ".claude-switcher/purity-cache.v6").unlink(missing_ok=True)
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
@@ -647,6 +647,8 @@ esac''')
         self.assertIn("住宅宽带", detail)
         self.assertIn("无正面住宅证据", detail)
         self.assertNotIn("机房", detail)
+        # 判成住宅却劝人「换住宅」是自相矛盾的:这一档的 warn 只来自证据不全。
+        self.assertNotIn("建议换住宅", detail)
 
     def test_single_risk_source_never_labels_hosting(self):
         """只剩一家风险源时,未收录的运营商名不能变成「机房」。
@@ -699,7 +701,7 @@ esac''')
         lock.mkdir()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v5"
+        cache = base / "purity-cache.v6"
         self.assertTrue(cache.exists(), "陈旧锁之后仍应写入缓存")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertFalse(lock.exists(), "陈旧锁应被回收")
@@ -713,7 +715,7 @@ esac''')
         (lock / "owner").write_text(str(int(time.time())), encoding="utf-8")
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v5"
+        cache = base / "purity-cache.v6"
         self.assertTrue(cache.exists(), "抢不到锁也要落盘,不能丢掉结果")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertTrue(lock.exists(), "活锁不该被别人抢走")

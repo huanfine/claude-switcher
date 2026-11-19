@@ -2846,7 +2846,10 @@ ip_purity() {
     # v4:类型判定改成证据驱动(见 ip_class 与 clean_residential)。改判定的同时
     # 不换文件名,升级后 24 小时内会继续读到「类型不明 / 机房」这种旧结论 ——
     # 用户重装完还是老样子,只能以为我们又没修好。改口径必须让旧缓存失效。
-    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v5" ]; then
+    # v5/v6 同理:v5 是代理特征按源计数 + 判定词显式化;v6 是住宅档不再劝人换住宅。
+    # 注意缓存里存的是**成品文案**(第 6 列),所以任何措辞变更都得换文件名,
+    # 否则用户 24 小时内看到的还是旧话 —— 这一条以后会一直踩,别再想省这个版本号。
+    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v6" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
@@ -2854,7 +2857,7 @@ ip_purity() {
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v5"
+        done < "$BASE/purity-cache.v6"
     fi
 
     local q1 q2 q3 q4 b1 b2 b3 b4 rdns=""
@@ -3171,6 +3174,9 @@ ip_purity() {
         tor)     next="Tor 会被 Claude 直接标记,换普通住宅节点" ;;
         vpn)     next="代理特征明显,换住宅或原生 IP 节点" ;;
         hosting) next="机房出口风险偏高,建议换住宅 IP" ;;
+        # 已经判成住宅还劝人「换住宅」是自相矛盾的。这一档的 warn 只来自证据不全
+        # (单源/无正面证据),不是换节点能解决的事,所以不给动作建议。
+        residential) next="" ;;
         *)       case "$verdict" in
                      ok)   next="" ;;
                      warn) next="建议换住宅或原生 IP" ;;
@@ -3234,12 +3240,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「五分钟重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v5.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v5" 2>/dev/null
+        tmp="$BASE/purity-cache.v6.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v6" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v5" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v6" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null
