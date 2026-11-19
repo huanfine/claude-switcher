@@ -487,6 +487,10 @@ final class VM: ObservableObject {
     /// 16 项全绿只说明流量此刻走了代理，证明不了代理挂了会不会直连 —— 那件事只有 drill 能验。
     @Published var failClosedStatus: String = ""
     @Published var allowOptionalFailures = false
+    /// 被升成「安全基线」的可选项：失败时不再受 allowOptionalFailures 影响，一律拦截。
+    /// 界面逐项开关，但保存时必须原样带回核心 —— 少了这一项，用户在别处设过的
+    /// 安全基线会被这里的每次「保存设置」静默清空，而界面上完全看不出来。
+    @Published var strictChecks: Set<String> = []
     @Published var loggingEnabled = true
     @Published var settingsMessage = ""
     @Published private(set) var settingsBusy = false
@@ -1736,6 +1740,11 @@ final class VM: ObservableObject {
             self.disabledChecks = Set(disabled)
             self.allowOptionalFailures = allow
             self.loggingEnabled = logging
+            // strict 是可选项：老核心不回这个字段，读不到就当空，不能因此判整份配置无效。
+            let strict = (config["strict"] as? [String]) ?? []
+            self.strictChecks = Set(strict.filter { name in
+                Self.optionalChecks.contains { $0.key == name }
+            })
             self.settingsMessage = ""
         }
     }
@@ -1751,6 +1760,9 @@ final class VM: ObservableObject {
             "disabled": Self.optionalChecks.map { $0.key }.filter { disabledChecks.contains($0) },
             "allowOptionalFailures": allowOptionalFailures,
             "logging": loggingEnabled,
+            // 原样带回：关掉一项和把它设成硬门槛是两件事，不能互相吞掉；
+            // 漏掉这一行等于每次保存都把安全基线清空一次。
+            "strict": Self.optionalChecks.map { $0.key }.filter { strictChecks.contains($0) },
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: config, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return }
@@ -1766,6 +1778,7 @@ final class VM: ObservableObject {
     func restoreCheckDefaults() {
         disabledChecks = []
         allowOptionalFailures = false
+        strictChecks = []
         loggingEnabled = true
         settingsMessage = "已恢复默认选项，点击保存后生效"
     }
@@ -4517,8 +4530,14 @@ struct CheckSettingsView: View {
                                         Toggle(item.label, isOn: Binding(
                                             get: { !vm.disabledChecks.contains(item.key) },
                                             set: { enabled in
-                                                if enabled { vm.disabledChecks.remove(item.key) }
-                                                else { vm.disabledChecks.insert(item.key) }
+                                                if enabled {
+                                                    vm.disabledChecks.remove(item.key)
+                                                } else {
+                                                    vm.disabledChecks.insert(item.key)
+                                                    // 关掉和设成基线是互斥的：核心会拒收同时存在的配置，
+                                                    // 界面上先把它撤掉，别等保存时才报错。
+                                                    vm.strictChecks.remove(item.key)
+                                                }
                                             }
                                         ))
                                         if vm.disabledChecks.contains(item.key) {
@@ -4529,6 +4548,26 @@ struct CheckSettingsView: View {
                                     }
                                 }
                                 Text("默认 16 项全部拦截启动。这里关掉的项会真正跳过探测，并以灰色「已跳过」显示 —— 那不叫通过，叫放弃验证。只在本机环境确实造成误报时才关。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。")
+                                    .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
+                            }
+                            .padding(.vertical, 6)
+                        }
+
+                        GroupBox("安全基线（更严格）") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Toggle("Anthropic 生态必须可达（生态可达性）", isOn: Binding(
+                                    get: { vm.strictChecks.contains("生态可达性") },
+                                    set: { on in
+                                        if on {
+                                            vm.strictChecks.insert("生态可达性")
+                                            // 同上：设成基线就不能同时处于「已关闭」。
+                                            vm.disabledChecks.remove("生态可达性")
+                                        } else {
+                                            vm.strictChecks.remove("生态可达性")
+                                        }
+                                    }
+                                ))
+                                Text("打开后这一项与代理/TUN 同级：claude.ai 或 api.anthropic.com 连不上就拦住启动 —— 即使上面勾了「降为警告」也一样。适合把账号安全看得更重、宁可这次打不开也不在可疑环境里用的情况。默认关闭。")
                                     .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                             }
                             .padding(.vertical, 6)

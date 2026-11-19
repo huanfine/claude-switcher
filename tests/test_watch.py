@@ -4,12 +4,15 @@
 会拿着错误的出口继续发请求 —— watch 补的就是这一段。
 
 这里只测判定,不真的去关进程:stop_claude_now 在单测里换成记录。
+唯一的例外是 StopClaudeSpeedTests —— 它要验证熔断真的会强杀、且够快,
+做法是把 pkill/osascript 一并换掉,所以同样不会打到本机进程。
 """
 import os
 from pathlib import Path
 import re
 import signal
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -270,6 +273,89 @@ class IncidentRecordTests(unittest.TestCase):
         self.assertEqual(len(lines), 50, "只留最近 50 条")
         self.assertIn("第 54 次", lines[-1])
         self.assertNotIn("第 0 次", "\n".join(lines))
+
+
+class StopClaudeSpeedTests(unittest.TestCase):
+    """熔断必须「立刻彻底退出」。
+
+    用户实测的现场:提示已经弹出来了,Claude 还在跑、还在拿错出口重试。
+    原因是这条路径原来是 quit → 每秒探一次 ×3 → 才轮到 pkill,也就是最慢 3 秒
+    才开始真正动手,而且 app 那一段等完还要再等 CLI 那一段。
+    熔断的意义是立刻断,不是排队等它自己收尾 —— 所以现在 0.2 秒 ×5 就动手,
+    到点直接 SIGKILL。这里把「上界」和「真的会 KILL」都钉住。
+
+    全部外部命令都在壳里替换掉:这条路径会 pkill,绝不能让它打到本机进程。
+    """
+
+    TEMPLATE = r"""
+BASE=%(tmp)s
+APP_DIES=%(app_dies)d
+CLI_DIES=%(cli_dies)d
+app_n=0
+cli_n=0
+run_n=0
+claude_running() {
+    run_n=$((run_n+1))
+    # 第一次是「动手前在不在跑」(was),之后一次是「收拾完还在不在」(still)。
+    # 两者必须能给出不同答案,否则 still 永远等于 was,那行日志就成了摆设。
+    if [ "$run_n" -eq 1 ]; then return 0; fi
+    if [ "$APP_DIES" -gt 0 ] && [ "$CLI_DIES" -gt 0 ]; then return 1; fi
+    return 0
+}
+claude_app_running() {
+    app_n=$((app_n+1))
+    if [ "$APP_DIES" -gt 0 ] && [ "$app_n" -gt "$APP_DIES" ]; then return 1; fi
+    return 0
+}
+claude_cli_running() {
+    cli_n=$((cli_n+1))
+    if [ "$CLI_DIES" -gt 0 ] && [ "$cli_n" -gt "$CLI_DIES" ]; then return 1; fi
+    return 0
+}
+osascript() { printf 'osascript %%s\n' "$*" >>"%(tmp)s/calls"; return 0; }
+pkill() { printf 'pkill %%s\n' "$*" >>"%(tmp)s/calls"; return 0; }
+watch_log() { :; }
+watch_incident() { :; }
+%(fn)s
+stop_claude_now "测试熔断" "拦截"
+"""
+
+    def run_stop(self, app_dies=0, cli_dies=0):
+        """app_dies/cli_dies = 探测到第几次之后才「已经退了」;0 表示永远不死。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.TEMPLATE % {
+                "tmp": tmp, "app_dies": app_dies, "cli_dies": cli_dies,
+                "fn": helper("stop_claude_now"),
+            }
+            start = time.time()
+            run = subprocess.run(["/bin/bash", "-c", src], text=True,
+                                 capture_output=True, timeout=30,
+                                 env=dict(os.environ, LC_ALL="C"))
+            elapsed = time.time() - start
+            calls = (Path(tmp) / "calls").read_text(encoding="utf-8") \
+                if (Path(tmp) / "calls").exists() else ""
+        return run, elapsed, calls
+
+    def test_hung_app_is_sigkilled_within_a_couple_of_seconds(self):
+        run, elapsed, calls = self.run_stop()
+        self.assertIn("KILLSTATE:1:1", run.stdout, run.stdout + run.stderr)
+        self.assertIn("-KILL", calls, "不肯退就得强杀,不能只是再等一轮")
+        # 最坏路径是 5×0.2 + 0.3 + 5×0.2 ≈ 2.3 秒。旧写法光「等」就 3 秒打底,
+        # 这里留到 4 秒只是给慢机器的余量,不能更宽 —— 宽了就测不出退化。
+        self.assertLess(elapsed, 4.0, "熔断拖到 %.1f 秒,用户会看到 Claude 还在跑" % elapsed)
+
+    def test_normally_quitting_app_does_not_need_sigkill(self):
+        # 负例对照:正常退出的情况不该留下强杀记录 —— 否则上面那条只证明「永远在杀」。
+        run, elapsed, calls = self.run_stop(app_dies=1, cli_dies=1)
+        self.assertIn("KILLSTATE:1:0", run.stdout, run.stdout + run.stderr)
+        self.assertNotIn("-KILL", calls)
+        self.assertLess(elapsed, 2.5, "正常退出还等了 %.1f 秒" % elapsed)
+
+    def test_cli_is_killed_even_when_the_app_quits_cleanly(self):
+        # 只停 App 是不够的:终端里的 claude 会继续重试,而熔断的整个意义就是断重试。
+        run, _, calls = self.run_stop(app_dies=1, cli_dies=0)
+        self.assertIn("pkill -x claude", calls)
+        self.assertIn("KILLSTATE:1:1", run.stdout, run.stdout + run.stderr)
 
 
 if __name__ == "__main__":

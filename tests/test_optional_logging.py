@@ -84,8 +84,11 @@ esac''')
         run = self.support("config-set", json.dumps(
             {"disabled": ["DNS"], "allowOptionalFailures": True, "logging": False}))
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        # strict 也一并落盘(空表示「没有哪项被升成安全基线」)。
+        # 它缺席会让「设过安全基线」这件事在文件里无从体现,下次读回来只在内存里有。
         self.assertEqual(json.loads(self.settings.read_text(encoding="utf-8")),
-                         {"disabled": ["DNS"], "allowOptionalFailures": True, "logging": False})
+                         {"disabled": ["DNS"], "allowOptionalFailures": True,
+                          "logging": False, "strict": []})
         self.assertEqual(stat.S_IMODE(self.settings.stat().st_mode), 0o600)
         run = self.support("config")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
@@ -151,7 +154,10 @@ esac''')
     def test_allow_optional_failures_warns_only_for_allowlisted_checks(self):
         self.prepare_checkdetail()
         self.write_settings({"allowOptionalFailures": True, "logging": True})
-        (self.base / "lastip").write_text("192.0.2.1", encoding="utf-8")
+        # 判据是「与固定基线是否一致」:种一条别的出口当基线,才有 warn 可测。
+        # (只种 lastip 不再产生告警 —— 那是旧口径「与上次不同」的残留。)
+        (self.base / "ipbaseline").write_text(
+            "v4:192.0.2.1 1794000000\n", encoding="utf-8")
         self.stub("curl", '''case "$*" in
   *cdn-cgi/trace*) printf 'ip=203.0.113.10\\nloc=US\\n' ;;
   *ipinfo.io*) printf '' ;;

@@ -308,12 +308,13 @@ struct MenuBarModelTests {
                 try expect(vm.phase == .done && vm.current == "B", "显式跳过的非关键项不应阻断切换")
                 try expect(vm.rows.first { $0.name == "DNS 走隧道" }?.state == .skip, "跳过项必须显示 skip")
             case "settings_round_trip":
-                try f.write("check-config", #"{"disabled":["DNS"],"allowOptionalFailures":true,"logging":false}"#)
+                try f.write("check-config", #"{"disabled":["DNS"],"allowOptionalFailures":true,"logging":false,"strict":["生态可达性"]}"#)
                 let vm = f.vm()
                 vm.loadCheckConfig()
                 try spin { !vm.settingsBusy }
                 try expect(vm.disabledChecks == Set(["DNS"]), "应读取已禁用的 DNS 检查")
                 try expect(vm.allowOptionalFailures && !vm.loggingEnabled, "应读取非关键失败与日志设置")
+                try expect(vm.strictChecks == Set(["生态可达性"]), "应读取被设成安全基线的项")
                 vm.disabledChecks.insert("WebRTC")
                 vm.saveCheckConfig()
                 try spin { !vm.settingsBusy }
@@ -325,6 +326,9 @@ struct MenuBarModelTests {
                 try expect(Set(disabled ?? []) == Set(["DNS", "WebRTC"]), "保存必须保留已有禁用项并加入 WebRTC")
                 try expect(config?["allowOptionalFailures"] as? Bool == true, "保存必须保留非关键失败设置")
                 try expect(config?["logging"] as? Bool == false, "保存必须保留日志开关")
+                // 保存时若把 strict 丢了,用户设过的安全基线会静默失效,界面还看不出来。
+                let strict = config?["strict"] as? [String]
+                try expect(strict == ["生态可达性"], "保存必须原样带回安全基线")
                 try expect(f.calls.contains("checkdetail --json"), "保存成功后必须重新检查")
             case "local_status_refresh":
                 let vm = f.vm()

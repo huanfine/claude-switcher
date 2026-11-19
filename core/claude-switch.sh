@@ -73,7 +73,8 @@ OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯�
 ALL_CHECKS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
               "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性",
               "更优节点")
-DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True}
+DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True,
+            "strict": []}
 LOG_LIMIT = 512 * 1024
 
 # 检查报告契约。文本行仍然是人读的兼容层,JSON 才是机器契约:
@@ -208,6 +209,16 @@ def validate(value):
             or len(disabled) != len(set(disabled))):
         fail()
     result["disabled"] = [name for name in OPTIONAL if name in disabled]
+    # strict:把原本「只提示」的可选项升成硬性基线。有些人对账号安全要求更高,
+    # 例如要求「Anthropic 生态必须可达」才算能启动 —— 但这是个人选择,不能默认套给所有人。
+    strict = value.get("strict", [])
+    if (not isinstance(strict, list)
+            or any(not isinstance(item, str) or item not in OPTIONAL for item in strict)
+            or len(strict) != len(set(strict))):
+        fail()
+    if set(strict) & set(disabled):
+        fail()   # 既关掉又要求当硬门槛,自相矛盾
+    result["strict"] = [name for name in OPTIONAL if name in strict]
     for key in ("allowOptionalFailures", "logging"):
         if key in value:
             if type(value[key]) is not bool:
@@ -790,6 +801,7 @@ def main(args):
     if action == "config" and len(args) == 1:
         config = load_config()
         print("disabled=" + ",".join(config["disabled"]))
+        print("strict=" + ",".join(config["strict"]))
         print("allowOptionalFailures=" + str(int(config["allowOptionalFailures"])))
         print("logging=" + str(int(config["logging"])))
     elif action == "config-get" and len(args) == 1:
@@ -2060,6 +2072,12 @@ FAKE_PREFIX="198.18."          # 由 FAKE_IP_RANGE 换算,供 case 匹配
 
 DATA="$HOME/Library/Application Support/Claude"
 BASE="$HOME/.claude-switcher"
+# 这几份日志里有出口 IP 与拦截记录。早期创建时没有设过权限,盘上留着一批 644 ——
+# 同机任何用户都能读到「这台机器什么时候从哪个出口出去」。启动时顺手收紧一次,
+# 只 stat 四个文件,代价可以忽略。
+for _lf in watch.log rtt.log update.log drill.log; do
+    [ -f "$BASE/$_lf" ] && chmod 600 "$BASE/$_lf" 2>/dev/null
+done
 # Claude Code 的状态不在 DATA 里:它用 ~/.claude/ 加一个顶层 ~/.claude.json。
 # 槽位只搬 DATA 的话,A/B/C/D 对终端里的 claude 来说就是同一个账号 ——
 # 登录态、历史、配置一份都不变。这两个路径因此也纳入槽位。
@@ -2068,6 +2086,12 @@ CLI_JSON="$HOME/.claude.json"
 CLI_BASE="$BASE/cli"
 # 槽位 → 节点的绑定:每个槽位可以钉一条固定出口,切槽位时按它换线路。
 SLOT_NODE_DIR="$BASE/slot-node"
+# 出口稳定性的判据是「现在用的出口是否等于这条实例的固定基线」(见 ip_baseline_*)。
+# 这里只剩下历史证据的窗口:同一实例一周内不应该换出口,所以证据留 7 天。
+# 早先的写法是「48 小时内出现 3 个出口才提示」,两个都不满足这条要求:
+# 第 3 天换的出口到第 5 天就滑出窗口,统计从 2 掉回 1,看起来「一直很稳」;
+# 只换一次的时候连提示都没有。窗口必须覆盖整个承诺周期。
+IP_STABILITY_WINDOW=604800   # 7 天
 LOG="$HOME/Library/Logs/claude-switch.log"
 ROUTE_MISSED=""
 KEEP_STAGED=0
@@ -2262,6 +2286,7 @@ load_env || exit 1
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >>"$LOG"; }
 
 CHECKS_DISABLED=""
+CHECKS_STRICT=""
 ALLOW_OPTIONAL_FAILURES=0
 load_check_config() {
     local config key value
@@ -2269,11 +2294,14 @@ load_check_config() {
     while IFS='=' read -r key value; do
         case "$key" in
             disabled) CHECKS_DISABLED="$value" ;;
+            strict) CHECKS_STRICT="$value" ;;
             allowOptionalFailures) ALLOW_OPTIONAL_FAILURES="$value" ;;
         esac
     done <<< "$config"
 }
 check_disabled() { case ",$CHECKS_DISABLED," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+# 用户把某个可选项升成了硬性基线:失败要拦启动,不只是提示。
+check_strict() { case ",${CHECKS_STRICT:-}," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 optional_failure() {
     [ "$ALLOW_OPTIONAL_FAILURES" = "1" ] || fails="$fails;$1"
 }
@@ -3163,58 +3191,197 @@ ip_purity() {
 }
 
 
-# IP 审查:记录出口IP并统计最近48h内不同出口个数(账号画像风险指标)
+# 当前实例标识:槽位 A-D。读不到时退回空串(老安装、测试夹具走这条路),
+# 沿用旧的单份历史文件 —— 宁可少一层隔离,也不能让老记录直接读不出来。
+current_instance() {
+    local f="$BASE/current" s
+    [ -r "$f" ] || return 0
+    s=$(tr -d '[:space:]' < "$f" 2>/dev/null)
+    case "$s" in [A-D]) printf '%s' "$s" ;; esac
+}
+
+# 固定出口(基线)。判定只看「现在用的出口是否等于这条基线」,
+# 不再数「窗口里出现过几个出口」—— 后者会把「跳到别处、被熔断、又切回原出口」
+# 这种已经纠正过的事记成一次风险,而用户真正关心的是:现在用的是不是那个固定 IP。
+ip_baseline_file() {
+    local inst
+    inst=$(current_instance)
+    if [ -n "$inst" ]; then printf '%s/ipbaseline-%s' "$BASE" "$inst"
+    else printf '%s/ipbaseline' "$BASE"; fi
+}
+
+# 基线文件一行两列:身份 + 确立时间(epoch)。
+# 时间不是装饰 —— 不一致时要能说「基线已固定 3 天」,否则用户没法判断
+# 是「刚跳过去忘了切回」还是「这条实例本来就换了出口」。
+ip_baseline_line() {
+    local f
+    f=$(ip_baseline_file)
+    [ -r "$f" ] && head -1 "$f" 2>/dev/null
+}
+
+ip_baseline_get() {
+    local line
+    line=$(ip_baseline_line)
+    printf '%s' "${line%% *}"
+}
+
+ip_baseline_since() {
+    local line
+    line=$(ip_baseline_line)
+    case "$line" in *' '*) printf '%s' "${line#* }" ;; esac
+}
+
+# 基线固定了多久。旧格式(只有身份、没有时间)回「时间未知」,不编造。
+ip_baseline_age() {
+    local since now d
+    since=$(ip_baseline_since)
+    case "$since" in ''|*[!0-9]*) printf '时间未知'; return 0 ;; esac
+    now=$(date +%s)
+    d=$(( (now - since) / 86400 ))
+    if [ "$d" -ge 1 ]; then printf '%s 天' "$d"; else printf '不到 1 天'; fi
+}
+
+# 不一致时的唯一文案来源。check 与 checkdetail 都调它 —— 时区那次就是
+# 两边各写一份措辞,改了一边忘了另一边,用户看到的提示互相矛盾。
+# 缺省分支的「怎么改回来」必须给命令:只说「不一致」,用户不知道去哪改。
+ip_baseline_warn() {
+    local cur="$1" base="$2" klass="$3" hint
+    case "$klass" in
+        residential) hint="家宽轮换概率大,先确认不是节点漂移" ;;
+        hosting)     hint="机房出口应固定一个" ;;
+        *)           hint="换回固定出口;确属永久更换就运行 claude-switch.sh ip-baseline accept" ;;
+    esac
+    printf '当前出口与固定基线不一致(当前 %s,基线 %s,基线已固定 %s) · %s' \
+        "$(ip_show "$cur")" "$(ip_show "$base")" "$(ip_baseline_age)" "$hint"
+}
+
+ip_baseline_set() {
+    local f
+    [ -n "${1:-}" ] || return 1
+    f=$(ip_baseline_file)
+    mkdir -p "$BASE" 2>/dev/null || true
+    printf '%s %s\n' "$1" "$(date +%s)" >"$f" && chmod 600 "$f" 2>/dev/null
+}
+
+# 出口历史按实例分开存。原来 A/B/C/D 共用一份:A 换节点记在 B 头上,
+# 反过来 B 的稳定会盖住 A 的漂移 ——「一个实例一周不变」这条根本无从判定。
+ip_history_file() {
+    local inst
+    inst=$(current_instance)
+    if [ -n "$inst" ]; then printf '%s/iphistory-%s.log' "$BASE" "$inst"
+    else printf '%s/iphistory.log' "$BASE"; fi
+}
+
+ip_lastip_file() {
+    local inst
+    inst=$(current_instance)
+    if [ -n "$inst" ]; then printf '%s/lastip-%s' "$BASE" "$inst"
+    else printf '%s/lastip' "$BASE"; fi
+}
+
+# 升级迁移:旧版只有一份 iphistory.log / lastip。第一次按实例跑时把它们
+# 认给当前实例,否则刚升级完「一周内变过」的证据会凭空消失,变成一片绿。
+migrate_ip_state() {
+    local inst target ltarget
+    inst=$(current_instance)
+    [ -n "$inst" ] || return 0
+    target="$BASE/iphistory-$inst.log"
+    if [ ! -f "$target" ] && [ -f "$BASE/iphistory.log" ]; then
+        mv "$BASE/iphistory.log" "$target" 2>/dev/null || true
+    fi
+    ltarget="$BASE/lastip-$inst"
+    if [ ! -f "$ltarget" ] && [ -f "$BASE/lastip" ]; then
+        mv "$BASE/lastip" "$ltarget" 2>/dev/null || true
+    fi
+}
+
+# ---------- 出口历史 ----------
+# 结论已经不再依赖历史(判据是「现在是不是那条固定基线」),历史只留作证据:
+# 万一要回头查「这台机器到底换过几个出口」,得翻得到。
+# 所以写入策略从「每次检查都追加 + 每次统计都重写文件」改成「出口变了才追加」:
+# 稳态(一周同一个出口)下这里只做一次 tail + awk,不重写、不统计。
+# 原来是每次检查都跑三趟 awk/逐行 bash 循环,实测 2000 行 1.3s / 20000 行 13s,
+# 而这条信息对当次结论毫无贡献 —— 检查的热路径不该为证据付钱。
+iphist_record() {
+    local hist last key
+    [ -z "$1" ] && return 0
+    # 生产路径传进来的是 curkey(已归一),但旧调用点/手工排查会传裸地址。
+    # 这里统一归一,历史文件才不会同时存在两种写法 —— 那会让族计数把
+    # 同一个出口算成两个。
+    key=$(ip_key_migrate "$1") || return 0
+    [ -n "$key" ] || return 0
+    migrate_ip_state
+    hist=$(ip_history_file)
+    last=$(tail -1 "$hist" 2>/dev/null | awk '{print $1}')
+    [ "$last" = "$key" ] && return 0
+    mkdir -p "$BASE" 2>/dev/null || true
+    # 变了:追加一行,顺手把窗口外的旧行裁掉(变了才付这一次成本)。
+    # 抽取式夹具不带常量,缺省按 7 天算,否则窗口会被当成 0 秒全裁光。
+    awk -v cutoff=$(( $(date +%s) - ${IP_STABILITY_WINDOW:-604800} )) '
+        $2 + 0 >= cutoff { print }
+    ' "$hist" 2>/dev/null > "$hist.tmp" && mv "$hist.tmp" "$hist"
+    printf '%s %s\n' "$key" "$(date +%s)" >>"$hist"
+    chmod 600 "$hist" 2>/dev/null || true
+}
+
+# 只读:7 天窗口里出现过几个不同出口(按协议族取多的那族)。
+# 双栈节点 v4/v6 是同一出口的两条腿,混在一起数会把一个节点算成两个。
+# 只在「已判定与基线不一致」时才调 —— 那时用户需要知道这是第一次跳还是老在跳。
+# 归一仍然要过 ip_key_migrate:升级现场的文件里还留着裸地址。
 iphist_count() {
-    [ -z "$1" ] && { echo 0; return; }
-    local HIST="$BASE/iphistory.log"
-    local now=$(date +%s) n k
-    echo "$1 $now" >>"$HIST"
-    # 裁掉48小时(172800秒)以前的记录
-    awk -v cutoff=$((now-172800)) '$2>=cutoff' "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
-    # 按协议族分别去重后取最大值。双栈节点 v4 与 v6 是同一出口的两条腿,
-    # 直接混在一起数会把一个节点算成两个;而只取某一族又会漏掉另一族的变化。
-    # 取最大值:任一族换了地址就算一次变化,两条腿都没动就是 0 次新增。
-    # 历史文件里两种形态并存:新版本写的是已归一的 v4:/v6: 键,旧版本写的是裸地址。
-    # 必须走 ip_key_migrate —— 直接再套一层 ip_key 会把 v4:1.2.3.4 当成 v6 地址
-    # (ip_key 靠「有没有冒号」判族),归一成 v6:v4:1.2.3.4,所有 v4 记录塌进 v6 一族,
-    # 「按族取最大」就失效了:实测一个没换过的节点被数成 4 次变动并报 warn,
-    # 而这一项既不在可修复清单里,用户也无从修起。用迁移函数,两种形态都归到同一身份。
-    # ip_key 不带换行(给命令替换用),这里得自己补,否则多行会被 sort 当成一行。
-    # read 在「最后一行没有换行」时返回非零,不补 || 判断的话整段会被跳过。
-    n=$(while read -r addr _ || [ -n "$addr" ]; do
-            [ -n "$addr" ] || continue
-            k=$(ip_key_migrate "$addr") || continue
-            [ -n "$k" ] && printf '%s\n' "$k"
-        done < "$HIST" | sort -u | cut -d: -f1 | uniq -c | sort -rn | head -1 | awk '{print $1}')
+    local hist now n window tmp k
+    hist=$(ip_history_file)
+    [ -r "$hist" ] || { echo 0; return; }
+    window="${IP_STABILITY_WINDOW:-604800}"
+    now=$(date +%s)
+    tmp="$hist.count.$$"
+    awk -v cutoff=$((now - window)) '$2 + 0 >= cutoff {print $1}' "$hist" 2>/dev/null \
+        | sort -u >"$tmp"
+    : >"$tmp.n"
+    # ip_key_migrate 不带换行(它是给命令替换用的),这里必须自己补 ——
+    # 否则两行会粘成一行,把两个出口数成一个。
+    while read -r k; do
+        [ -n "$k" ] && printf '%s\n' "$(ip_key_migrate "$k")" >>"$tmp.n"
+    done <"$tmp"
+    # 数的是「不同出口」,不是「行数」:跳走再切回来会多两行,但出口只有一个。
+    n=$(sort -u "$tmp.n" 2>/dev/null | cut -d: -f1 | sort | uniq -c | sort -rn \
+        | head -1 | awk '{print $1}')
+    rm -f "$tmp" "$tmp.n"
     echo "${n:-0}"
 }
+
 
 # 上次记录的出口身份,按协议族分开取。v4 与 v6 不可比 —— 拿一个去比另一个,
 # 只会得出「IP 变了」,而实际只是这次连接走了另一条腿。
 last_seen() {
-    local fam="$1" line
-    [ -f "$BASE/lastip" ] || return 0
+    local fam="$1" line f
+    migrate_ip_state
+    f=$(ip_lastip_file)
+    [ -f "$f" ] || return 0
     while read -r line || [ -n "$line" ]; do
         line=$(ip_key_migrate "$line")
         case "$line" in "$fam":*) printf '%s' "$line"; return 0 ;; esac
-    done < "$BASE/lastip"
+    done < "$f"
 }
 
 # 写入本次出口身份,保留另一族的记录(两族各自维护自己的「上次」)。
 last_save() {
-    local k="$1" fam tmp="$BASE/lastip.tmp" line
+    local k="$1" fam tmp line cur
+    cur=$(ip_lastip_file)
+    tmp="$cur.tmp"
     case "$k" in v6:*) fam=v6 ;; *) fam=v4 ;; esac
     : > "$tmp"
-    if [ -f "$BASE/lastip" ]; then
+    if [ -f "$cur" ]; then
         while read -r line || [ -n "$line" ]; do
             line=$(ip_key_migrate "$line")
             [ -n "$line" ] || continue
             case "$line" in "$fam":*) continue ;; esac
             printf '%s\n' "$line" >> "$tmp"
-        done < "$BASE/lastip"
+        done < "$cur"
     fi
     printf '%s\n' "$k" >> "$tmp"
-    mv "$tmp" "$BASE/lastip"
+    mv "$tmp" "$cur"
+    chmod 600 "$cur" 2>/dev/null || true
 }
 
 # ---------- 出口采样 ----------
@@ -3237,6 +3404,8 @@ probe_egress() {
     local want="${1:-3}" budget="${2:-10}" start elapsed per trace ip loc n=0 k
     local k4="" k6="" i4="" i6=""
     PROBE_IP=""; PROBE_LOC=""; PROBE_STATUS="unknown"; PROBE_SEEN=""
+    # 采样必须跨时间:三次同时发出看到的是同一瞬间,节点正在漂移也看不出来。
+    # 所以这里坚持串行 —— 快不是把观测压成一次,而是别让它在主路径上白等。
     start=$(date +%s)
     while [ "$n" -lt "$want" ]; do
         elapsed=$(( $(date +%s) - start ))
@@ -3273,6 +3442,35 @@ probe_egress() {
     PROBE_STATUS="ok"; return 0
 }
 
+# 生态可达性探测:两个站点互不依赖,也不依赖出口 IP,所以可以和出口采样同时发,
+# 最后再取结果。串行时这段白占 1.3 秒多,而它本来可以完全藏在采样窗口里。
+# 结果写成两行:「状态码:首包秒」。取不到就是 000。
+ECOLOGY_FILE=""; ECOLOGY_PID=""
+ecology_probe_start() {
+    ECOLOGY_FILE="${TMPDIR:-/tmp}/claude-eco-$$"
+    (
+        curl -s --max-time 8 -o /dev/null -w '%{http_code}:%{time_starttransfer}' https://claude.ai/ 2>/dev/null
+        printf '\n'
+        curl -s --max-time 8 -o /dev/null -w '%{http_code}:%{time_starttransfer}' https://api.anthropic.com/v1/models 2>/dev/null
+        printf '\n'
+    ) >"$ECOLOGY_FILE" 2>/dev/null &
+    ECOLOGY_PID=$!
+}
+ecology_probe_read() {
+    [ -n "${ECOLOGY_PID:-}" ] && wait "$ECOLOGY_PID" 2>/dev/null
+    ECO_CODE1=$(sed -n '1p' "$ECOLOGY_FILE" 2>/dev/null)
+    ECO_CODE2=$(sed -n '2p' "$ECOLOGY_FILE" 2>/dev/null)
+    rm -f "$ECOLOGY_FILE"
+    ECOLOGY_FILE=""; ECOLOGY_PID=""
+    [ -z "$ECO_CODE1" ] && ECO_CODE1="000:0"
+    [ -z "$ECO_CODE2" ] && ECO_CODE2="000:0"
+}
+ecology_probe_discard() {
+    [ -n "${ECOLOGY_PID:-}" ] && wait "$ECOLOGY_PID" 2>/dev/null
+    [ -n "${ECOLOGY_FILE:-}" ] && rm -f "$ECOLOGY_FILE"
+    ECOLOGY_FILE=""; ECOLOGY_PID=""
+}
+
 # 哪些网络服务还开着 IPv6,一行一个。
 # 只看 Wi-Fi 是不够的:插网线走 Ethernet、或开着「iPhone USB」共享时,
 # IPv6 会从另一条服务溜出去,而检查项照样报「已关闭」—— 最隐蔽的一类漏报。
@@ -3289,6 +3487,9 @@ ipv6_on_services() {
 check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
     fails=""
+    # 生态探测不依赖出口 IP,先发出去;出口采样串行跑在它前面的这 2 秒,
+    # 正好把它的往返吃掉。
+    check_disabled "生态可达性" || ecology_probe_start
 
     proxy_alive || fails="$fails;代理内核未运行($(proxy_name))"
     tun_up || fails="$fails;TUN网卡不在线(在客户端开启 TUN 模式)"
@@ -3314,38 +3515,20 @@ check() {
         curkey=""; [ -n "$ip" ] && curkey=$(ip_key "$ip")
         if [ -n "$curkey" ]; then
             lastip=$(last_seen "${curkey%%:*}")
-            changed=""
-            [ -n "$lastip" ] && [ "$curkey" != "$lastip" ] && changed="1"
-
-            # IP 审查:48h 内不同出口个数(账号画像风险指标)
-            ipn=$(iphist_count "$curkey")
-
-            # 只有「变了」或「次数到了」才去查 ASN —— 正常路径不多付一次网络请求。
-            need_org=""
-            [ -n "$changed" ] && need_org="1"
-            case "${ipn:-0}" in ''|*[!0-9]*) ;; *) [ "$ipn" -ge 3 ] && need_org="1" ;; esac
-            klass=""
-            [ -n "$need_org" ] && klass=$(ip_class "$(ip_org "$ip")")
-
-            case "$klass" in
-                residential)
-                    # 家宽换 IP 是运营商在正常轮换,不告警;次数多也不代表风控风险。
-                    ;;
-                hosting)
-                    if [ -n "$changed" ]; then
-                        ipwarn="注意:机房 IP 发生变动($(ip_show "$lastip") -> $(ip_show "$curkey")) · 机房出口应固定一个长期使用"
-                    elif [ "${ipn:-0}" -ge 3 ] 2>/dev/null; then
-                        ipwarn="注意:48h内机房出口变动${ipn}次 · 机房 IP 漂移是明确的风控信号,固定一个出口"
-                    fi ;;
-                *)
-                    # 类型未知时按原来的保守口径:变了就提示,不猜它是家宽还是机房。
-                    if [ -n "$changed" ]; then
-                        ipwarn="注意:出口IP与上次不同($(ip_show "$lastip") -> $(ip_show "$curkey"))"
-                    elif [ "${ipn:-0}" -ge 3 ] 2>/dev/null; then
-                        ipwarn="注意:48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
-                    fi ;;
-            esac
+            # 判据是「现在用的出口是否等于这条实例的固定出口」。
+            # 不数窗口里出现过几个出口:跳到别处 → 被熔断 → 切回原出口,这条链路里
+            # 基线从没变过,用户回来继续用就是正常的,不该背一次「IP 变过」的记录。
+            baseline=$(ip_baseline_get)
+            if [ -z "$baseline" ]; then
+                ip_baseline_set "$curkey"
+            elif [ "$curkey" != "$baseline" ]; then
+                ipn=$(iphist_count)
+                ipwarn="注意:$(ip_baseline_warn "$curkey" "$baseline" "$(ip_class "$(ip_org "$ip")")")"
+                # 只有一次跳变和「老在跳」是两件事:前者多半是忘了切回,后者是节点在漂。
+                [ "${ipn:-0}" -ge 2 ] && ipwarn="$ipwarn(7 天内见过 $ipn 个出口)"
+            fi
             last_save "$curkey"
+            iphist_record "$curkey"
         fi
     fi
 
@@ -3422,9 +3605,18 @@ check() {
     fi
 
     if ! check_disabled "生态可达性"; then
-        r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://claude.ai/ 2>/dev/null)
-        r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models 2>/dev/null)
-        { [ "$r1" = "000" ] || [ "$r2" = "000" ]; } && optional_failure "Anthropic生态不可达($r1/$r2)"
+        ecology_probe_read
+        r1=${ECO_CODE1%%:*}; r2=${ECO_CODE2%%:*}
+        if [ "$r1" = "000" ] || [ "$r2" = "000" ]; then
+            # 用户把它设成安全基线时,这项失败和「代理没开」同级 —— 拦启动。
+            if check_strict "生态可达性"; then
+                fails="$fails;Anthropic生态不可达($r1/$r2)"
+            else
+                optional_failure "Anthropic生态不可达($r1/$r2)"
+            fi
+        fi
+    else
+        ecology_probe_discard
     fi
 
     # 关掉某项防护是用户自己的选择,但不能是「悄悄没了」:门禁输出里必须留痕。
@@ -3795,6 +3987,8 @@ tz_watchdog_target() {
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
+    # 生态探测与出口采样互不依赖:先发出去,等采样跑完再来取,不占主路径。
+    check_disabled "生态可达性" || ecology_probe_start
     if proxy_alive; then
         case "$PROXY_MODE" in
             shadowrocket) echo '代理内核=ok:Shadowrocket 已连接' ;;
@@ -3827,37 +4021,20 @@ checkdetail() {
         if [ -z "$ip" ]; then ipst="fail"; ipdt="未获取到出口IP · 检查网络后重新检查"
         else
             lastip=$(last_seen "${curkey%%:*}")
-            # IP 审查:48h 内不同出口个数(账号画像风险指标)
-            ipn=$(iphist_count "$curkey")
-            changed=""; [ -n "$lastip" ] && [ "$curkey" != "$lastip" ] && changed="1"
-            need_org=""
-            [ -n "$changed" ] && need_org="1"
-            case "${ipn:-0}" in ''|*[!0-9]*) ;; *) [ "$ipn" -ge 3 ] && need_org="1" ;; esac
-            klass=""
-            [ -n "$need_org" ] && klass=$(ip_class "$(ip_org "$ip")")
-
-            if [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
-            elif [ -z "$changed" ]; then ipst="ok"
+            baseline=$(ip_baseline_get)
+            if [ -z "$baseline" ]; then
+                ip_baseline_set "$curkey"
+                ipst="ok"; ipdt="已把 $(ip_show "$curkey") 记为固定出口"
+            elif [ "$curkey" = "$baseline" ]; then
+                ipst="ok"; ipdt="与固定出口一致(已固定 $(ip_baseline_age))"
             else
-                case "$klass" in
-                    residential) ipst="ok"; ipdt="住宅 IP 变动 · 运营商正常轮换,不算风险" ;;
-                    hosting) ipst="warn"; ipdt="机房 IP 变动:$(ip_show "$lastip") → $(ip_show "$curkey") · 机房出口应固定一个" ;;
-                    *) ipst="warn"; ipdt="$(ip_show "$lastip") → $(ip_show "$curkey")" ;;
-                esac
-            fi
-            # 次数阈值同样分类型:家宽轮换再多次也不构成风险信号。
-            # 文案要说明「哪一类出口」在变 —— 只写「出口变动 7 次」,用户不知道
-            # 这是家宽的正常轮换还是机房漂移,也就不知道该不该处理。
-            if [ "${ipn:-0}" -ge 3 ] 2>/dev/null && [ "$klass" != "residential" ]; then
-                label="出口"
-                [ "$klass" = "hosting" ] && label="机房出口"
-                if [ "$ipst" = "ok" ]; then
-                    ipst="warn"; ipdt="48h内${label}变动${ipn}次,建议固定节点"
-                else
-                    ipdt="$ipdt;48h内${label}变动${ipn}次"
-                fi
+                ipn=$(iphist_count)
+                ipst="warn"
+                ipdt=$(ip_baseline_warn "$curkey" "$baseline" "$(ip_class "$(ip_org "$ip")")")
+                [ "${ipn:-0}" -ge 2 ] && ipdt="$ipdt(7 天内见过 $ipn 个出口)"
             fi
             last_save "$curkey"
+            iphist_record "$curkey"
         fi
         optional_result "IP一致" "$ipst" "$ipdt"
     fi
@@ -4004,8 +4181,8 @@ checkdetail() {
     else
         # 首包时间顺手带上:参考里的「路径要短且干净」是一条,但我们只能观测、不能判断,
         # 所以只报数字,不替你下结论(亚洲访问 100ms 以上本来也正常)。
-        r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}:%{time_starttransfer}' https://claude.ai/ 2>/dev/null)
-        r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}:%{time_starttransfer}' https://api.anthropic.com/v1/models 2>/dev/null)
+        ecology_probe_read
+        r1="$ECO_CODE1"; r2="$ECO_CODE2"
         c1=${r1%%:*}; t1=${r1##*:}
         c2=${r2%%:*}; t2=${r2##*:}
         [ -z "$c1" ] && c1="000"
@@ -4027,6 +4204,9 @@ checkdetail() {
         fi
         if [ "$c1" != "000" ] && [ "$c2" != "000" ]; then
             optional_result "生态可达性" ok "$detail"
+        elif check_strict "生态可达性"; then
+            # 设成安全基线时不接受「非关键失败」降级:说拦就拦。
+            echo "生态可达性=fail:$detail · 已设为安全基线,必须可达 · 换条线路后重新检查"
         else
             optional_result "生态可达性" fail "$detail · 换条线路后重新检查"
         fi
@@ -5044,6 +5224,8 @@ self_update() {
     [ "$UHOME" = "$BIN" ] && UHOME="$HOME"
     if [ "$auto" -eq 1 ]; then
         mkdir -p "$BASE"
+        # 先建再收紧:重定向会按 umask 新建,直接在 exec 之后没法改权限。
+        : >>"$BASE/update.log" 2>/dev/null; chmod 600 "$BASE/update.log" 2>/dev/null
         exec >>"$BASE/update.log" 2>&1
         echo "# $(date '+%F %T') update --auto 开始"
     fi
@@ -5644,7 +5826,15 @@ quit_claude() {
 # 系统更新把 IPv6 又打开 —— 这些都不会自己停下 Claude,它会拿着错误的出口
 # 继续把请求发出去。watch 就是补这一段:运行期间持续复查,一有问题立刻关掉它。
 
-watch_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$BASE/watch.log"; }
+watch_log() {
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$BASE/watch.log"
+    # 留最近 5000 行。这是流水账不是审计存档,但也不能无限长 ——
+    # 每轮「复检、接管、检查未通过」都写一行,长期驻守时它只增不减。
+    if [ "$(wc -l < "$BASE/watch.log" 2>/dev/null || echo 0)" -gt 5000 ] 2>/dev/null; then
+        tail -n 5000 "$BASE/watch.log" > "$BASE/watch.log.tmp" 2>/dev/null \
+            && mv "$BASE/watch.log.tmp" "$BASE/watch.log"
+    fi
+}
 
 # 拦截记录:给人看的历史。watch.log 是流水账(启动、复检、接管全在里面),
 # 这份只记「真的动过手」的事件,界面按它渲染「异常记录」。TAB 分隔三列:
@@ -5673,11 +5863,18 @@ stop_claude_now() {
     claude_running && was=1
     if claude_app_running; then
         osascript -e 'tell application "Claude" to quit' >/dev/null 2>&1
-        for i in 1 2 3; do
+        # 只给 1 秒体面退出。这是熔断路径:多等一秒就多一秒裸连重试的机会,
+        # 原来「quit → 每秒探一次、探三次」最多要 3 秒才轮到 pkill。
+        for i in 1 2 3 4 5; do
             claude_app_running || break
-            sleep 1
+            sleep 0.2
         done
-        pkill -f "Claude.app/Contents/MacOS/Claude" 2>/dev/null
+        if claude_app_running; then
+            pkill -TERM -f "Claude.app/Contents/MacOS/Claude" 2>/dev/null
+            sleep 0.3
+            # 还不走就 SIGKILL:熔断场景下「让它自己收尾」不值这个时间。
+            claude_app_running && pkill -KILL -f "Claude.app/Contents/MacOS/Claude" 2>/dev/null
+        fi
     fi
     # CLI 一并停掉:后台的 claude 进程比 App 更容易悄悄重试。
     # `-x claude` 认的是原生二进制的进程名(argv[0] 就叫 claude),大小写敏感,
@@ -5685,11 +5882,16 @@ stop_claude_now() {
     pkill -x claude 2>/dev/null
     pkill -f "claude-code/cli.js" 2>/dev/null
     pkill -f "@anthropic-ai/claude-code" 2>/dev/null
-    # 给 CLI 一点退出时间,别在它还没死透时就断言「已停止」。
-    for i in 1 2 3; do
+    # 给 CLI 一点退出时间,别在它还没死透时就断言「已停止」。同样只给 1 秒,
+    # 到点直接 SIGKILL —— 熔断的意义是立刻断,不是排队等它收尾。
+    for i in 1 2 3 4 5; do
         claude_cli_running || break
-        sleep 1
+        sleep 0.2
     done
+    if claude_cli_running; then
+        pkill -KILL -x claude 2>/dev/null
+        pkill -KILL -f "claude-code/cli.js" 2>/dev/null
+    fi
     claude_running && still=1
     echo "KILLSTATE:$was:$still"
     watch_log "已停止 Claude:$reason(熔断时在运行=$was, 处理后仍在运行=$still)"
@@ -6230,6 +6432,7 @@ help() {
 区域与客户端
   set-region           按当前出口对齐时区 / 地区 / 语言
   set-client <mode>    指定代理客户端(clash-verge / flclash / shadowrocket / sing-box …)
+  ip-baseline [show]   查看本实例的固定出口;accept 把当前出口设为新的固定出口
   set-webrtc-policy <proxy|reject>   WebRTC UDP 策略;节点不支持 UDP 时用 reject(「一键修复」会自动切)
   get-client           打印当前选定的代理客户端
   open-safe <url>      在受控环境里打开链接
@@ -6334,6 +6537,23 @@ case "$operation" in
     switch) switch_to "${2:-}" ;;
     set-region) lease_revoke; set_region ;;
     set-client) set_client "${2:-}" ;;
+    ip-baseline)
+        case "${2:-show}" in
+            show|'') b=$(ip_baseline_get)
+                if [ -z "$b" ]; then printf 'NONE(还没记录)\n'
+                else printf '%s  已固定 %s\n' "$(ip_show "$b")" "$(ip_baseline_age)"; fi ;;
+            accept)
+                _cur=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+                if [ -z "$_cur" ]; then echo "FAIL:取不到当前出口,基线未改动 · 检查代理后重试"; return 1; fi
+                _k=$(ip_key "$_cur")
+                if ip_baseline_set "$_k"; then
+                    echo "OK:$(current_instance | sed 's/^$/默认/') 实例的固定出口已更新为 $(ip_show "$_k")"
+                else
+                    echo "FAIL:写入基线失败"; return 1
+                fi ;;
+            *)
+                echo "FAIL:ip-baseline 支持 show | accept"; return 1 ;;
+        esac ;;
     get-client) get_client ;;
     fake-prefix) printf '%s\n' "${FAKE_PREFIX:-198.18.}" ;;
     restart-clash) restart_clash ;;
