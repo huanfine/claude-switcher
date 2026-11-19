@@ -226,13 +226,43 @@ esac''')
         self.assertEqual(state, "fail", detail)
         self.assertIn("代理/VPN", detail)
 
-    def test_second_source_catches_what_first_misses(self):
-        """ipquery 说不是代理、ip-api 说是 —— 必须以「任一报出特征」为准。
+    def test_single_source_proxy_against_multi_source_hosting_is_flagged(self):
+        """单源代理特征 vs 多源机房证据 = 证据冲突,标出来但不拦启动。
 
-        实测 Cloudflare WARP 就落在这个缝里:ipquery 只报 datacenter,
-        ip-api 报 proxy:true。只看一个源会把它判成普通机房放过。
+        实测 AS14956 的三个出口,ipquery 三份响应的每个字段都一样
+        (is_datacenter:true、risk_score:85、is_proxy:false、is_vpn:false),
+        只有 144.172.65.26 被 ip-api 单独标了 proxy:true —— 于是同一台机器换个 IP
+        就从「warn 可启动」变成「fail 拦启动」,分数还从 43 跳到 53。
+        一个来源的一个布尔不该有这种决定权,但也不能当没看见。
         """
         self.stub_net(HOSTING, _ipapi("Ogden", proxy=True, hosting=True), IPINFO_HOSTING)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("代理特征(单源)", detail)
+        # 类型必须落在机房上,不能被单源代理特征洗成「代理/VPN」。
+        self.assertIn("机房", detail)
+        self.assertNotIn("代理/VPN", detail)
+
+    def test_two_sources_reporting_proxy_still_blocks(self):
+        """两家都说有代理特征时没有讨论余地 —— 尤其 WARP 那种:ipquery 只报
+        datacenter、ip-api 报 proxy:true,一旦放过去就会被当成普通机房放行。
+        相互印证过的证据仍然直接拦。
+        """
+        both = _ipquery("Cloudflare", "Cloudflare, Inc.", city="Denver", risk_score=20,
+                        is_proxy=True, is_datacenter=True)
+        self.stub_net(both, _ipapi("Denver", proxy=True, hosting=True), IPINFO_PROXY)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "fail", detail)
+        self.assertIn("代理/VPN", detail)
+        self.assertNotIn("代理特征(单源)", detail)
+
+    def test_ipquery_proxy_alone_is_enough(self):
+        """ipquery 自己报代理特征就算硬证据:它是我们对齐的那家源,
+        同一份响应里的 is_proxy/is_vpn 不该被别家的沉默抵消。
+        """
+        flagged = _ipquery("Cloudflare", "Cloudflare, Inc.", city="Denver",
+                           risk_score=20, is_vpn=True)
+        self.stub_net(flagged, _ipapi("Denver", hosting=True), IPINFO_PROXY)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "fail", detail)
         self.assertIn("代理/VPN", detail)
@@ -389,7 +419,7 @@ esac''')
         """查不到就不写缓存 —— 否则一次网络抖动会把「未知」钉住一整天。"""
         self.stub_net("", "", "", "")
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v4"
+        cache = self.home / ".claude-switcher" / "purity-cache.v5"
         if cache.exists():
             self.assertNotIn("203.0.113.10", cache.read_text(encoding="utf-8"))
 
@@ -514,7 +544,7 @@ esac''')
         """
         self.stub_net(RESIDENTIAL, _ipapi("Denver", countryCode="US"), IPINFO_RESID)
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v4"
+        cache = self.home / ".claude-switcher" / "purity-cache.v5"
         self.assertTrue(cache.exists(), "没写 v4 缓存")
         fields = cache.read_text(encoding="utf-8").strip().split("|")
         self.assertEqual(len(fields), 7, "v4 应是 7 列,实际 %d: %s" % (len(fields), fields))
@@ -531,7 +561,7 @@ esac''')
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("风险源不可达", detail)
-        cache = self.home / ".claude-switcher" / "purity-cache.v4"
+        cache = self.home / ".claude-switcher" / "purity-cache.v5"
         line = cache.read_text(encoding="utf-8").strip()
         fields = line.split("|")
         self.assertEqual(len(fields), 7, fields)
@@ -545,7 +575,7 @@ esac''')
         cache.unlink()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        fresh = (self.home / ".claude-switcher" / "purity-cache.v4").read_text(encoding="utf-8")
+        fresh = (self.home / ".claude-switcher" / "purity-cache.v5").read_text(encoding="utf-8")
         rows = [r for r in fresh.strip().splitlines() if r.startswith("203.0.113.10|")]
         self.assertEqual(len(rows), 1, "同一个 IP 不该留下两条缓存")
         remaining = 86400 - (int(time.time()) - int(rows[0].split("|")[1]))
@@ -591,36 +621,32 @@ esac''')
         self.assertEqual(state, "ok", detail)
         self.assertNotIn("硬门槛:", detail)
         # 两次跑的是同一个夹具 IP,不删缓存第二次会直接读到住宅那条结果。
-        (self.home / ".claude-switcher/purity-cache.v4").unlink(missing_ok=True)
+        (self.home / ".claude-switcher/purity-cache.v5").unlink(missing_ok=True)
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertNotIn("硬门槛:", detail)
 
 
-    def test_clean_carrier_is_residential_like_the_reference_site(self):
-        """两家风险源都明确否认证机房时按住宅判 —— 与 ip.net.coffee 同口径。
+    def test_clean_carrier_is_residential_but_not_full_marks(self):
+        """两家源都说没问题 → 类型按住宅判(与 ip.net.coffee 同口径),但分数封顶 70。
 
-        用户原话:「其他地方检查都是住宅 ip,我们却提示是机房 ip」。
-        实测 66.17.65.38:ipquery 报 is_datacenter:false / risk_score:0、
-        ip-api 报 hosting:false / proxy:false、ipinfo 报 AS3257 GTT;
-        ip.net.coffee 判它「住宅 98/100」,我们却给
-        「ASN 属性:疑似机房 · 建议换住宅节点」和「评分 70/100 · 类型不明」。
-
-        依据是**正面证据**:两家风险源都可达、标志全否、risk_score ≤10、无滥用记录、
-        运营商名里没有机房词。缺任何一条就退回类型不明(70 分 warn) —— 不是
-        「没查到就把人放行」。
+        用户先说「其他地方检查都是住宅 ip,我们却提示是机房 ip」(11-06),
+        又说「骨干网地址拿 100 分不对」(11-19)。两句都对,分开处理:
+        类型跟参考站一致,分数不跟着满分 —— 100 分是给有**正面住宅证据**的出口的
+        (运营商名命中白名单,或 PTR 自曝 hsd/dynamic/dhcp 这类家宽特征)。
+        实测 66.17.65.38 是 AS3257 GTT 的骨干网地址,靠「没查到异常」拿到 100/100。
         """
         self.write_env("America/New_York")
         self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
                                             timezone="America/New_York"),
                       IPINFO_CARRIER)
         state, detail, _ = self.run_detail()
-        self.assertEqual(state, "ok", detail)
-        self.assertEqual(self.score(detail), 100, detail)
+        self.assertEqual(state, "warn", detail)
+        self.assertEqual(self.score(detail), 70, detail)
         self.assertIn("住宅宽带", detail)
+        self.assertIn("无正面住宅证据", detail)
         self.assertNotIn("机房", detail)
-        self.assertNotIn("建议换住宅 IP", detail)
 
     def test_single_risk_source_never_labels_hosting(self):
         """只剩一家风险源时,未收录的运营商名不能变成「机房」。
@@ -673,7 +699,7 @@ esac''')
         lock.mkdir()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v4"
+        cache = base / "purity-cache.v5"
         self.assertTrue(cache.exists(), "陈旧锁之后仍应写入缓存")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertFalse(lock.exists(), "陈旧锁应被回收")
@@ -687,7 +713,7 @@ esac''')
         (lock / "owner").write_text(str(int(time.time())), encoding="utf-8")
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v4"
+        cache = base / "purity-cache.v5"
         self.assertTrue(cache.exists(), "抢不到锁也要落盘,不能丢掉结果")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertTrue(lock.exists(), "活锁不该被别人抢走")

@@ -2846,7 +2846,7 @@ ip_purity() {
     # v4:类型判定改成证据驱动(见 ip_class 与 clean_residential)。改判定的同时
     # 不换文件名,升级后 24 小时内会继续读到「类型不明 / 机房」这种旧结论 ——
     # 用户重装完还是老样子,只能以为我们又没修好。改口径必须让旧缓存失效。
-    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v4" ]; then
+    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v5" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
@@ -2854,7 +2854,7 @@ ip_purity() {
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v4"
+        done < "$BASE/purity-cache.v5"
     fi
 
     local q1 q2 q3 q4 b1 b2 b3 b4 rdns=""
@@ -2881,14 +2881,21 @@ ip_purity() {
            | sed -e '/^;;/d' -e '/^[[:space:]]*$/d' | head -1 | sed 's/\.$//')
 
     local dc="" mob="" px="" tor="" risk="" tzip="" abfreq="" cc=""
-    case "$(_ipfield "$b1" is_datacenter)" in true) dc=1 ;; esac
+    # 代理特征按「几个独立源报出来」计数:ipquery(is_vpn/is_proxy)算一个源
+    # (同一家不会自己反驳自己)、ip-api(proxy)算第二个、PTR 自曝算第三个。
+    # 计数是为了区分两种情况:多源一致的代理特征,和「只有一家说它是代理,
+    # 另外两家都说这是机房」—— 后者实测会让同一个节点的不同 IP 得到一个 fail
+    # 一个 warn,用户看到的是一台机器换个 IP 结论就翻脸。
+    local px_q="" px_a="" px_r="" px_src=0
+    case "$(_ipfield "$b1" is_vpn)" in true) px_q=1 ;; esac
     case "$(_ipfield "$b1" is_mobile)" in true) mob=1 ;; esac
-    case "$(_ipfield "$b1" is_vpn)" in true) px=1 ;; esac
-    case "$(_ipfield "$b1" is_proxy)" in true) px=1 ;; esac
+    case "$(_ipfield "$b1" is_proxy)" in true) px_q=1 ;; esac
     case "$(_ipfield "$b1" is_tor)" in true) tor=1 ;; esac
     risk=$(_ipfield "$b1" risk_score)
     tzip=$(_ipfield "$b1" timezone)
-    case "$(_ipfield "$b2" proxy)" in true) px=1 ;; esac
+    # 机房证据同样两源都收:ipquery 说 datacenter、ip-api 说 hosting,任一成立即算。
+    case "$(_ipfield "$b1" is_datacenter)" in true) dc=1 ;; esac
+    case "$(_ipfield "$b2" proxy)" in true) px_a=1 ;; esac
     case "$(_ipfield "$b2" hosting)" in true) dc=1 ;; esac
     case "$(_ipfield "$b2" mobile)" in true) mob=1 ;; esac
     abfreq=$(_ipfield "$b4" frequency)
@@ -2905,8 +2912,12 @@ ip_purity() {
         *tor-exit*|*tor-relay*|*torexit*|*.exit.*) tor=1 ;;
     esac
     case "$rdns" in
-        *vpn*|*openvpn*|*wireguard*|*proxy*) px=1 ;;
+        *vpn*|*openvpn*|*wireguard*|*proxy*) px_r=1 ;;
     esac
+    [ -n "$px_q" ] && px_src=$((px_src+1))
+    [ -n "$px_a" ] && px_src=$((px_src+1))
+    [ -n "$px_r" ] && px_src=$((px_src+1))
+    [ "$px_src" -ge 1 ] && px=1
 
     # 两件事必须分开判,混成一件就会在两侧各错一次:
     #   ① 数据源「认识」这个地址吗 —— 有的源对不存在的网段不报错,而是回一份结构完整、
@@ -2937,6 +2948,25 @@ ip_purity() {
     # 一家风险源都没答上来:进入降级判型,结论只能给到类型这一层。
     local degraded=""
     [ "$src_n" = "0" ] && degraded=1
+
+    # 代理特征够不够「硬」。三条路都算硬:
+    #   · 两家以上独立源都报了(互相印证);
+    #   · ipquery 自己报了 is_vpn/is_proxy —— 它是我们对齐的那家源,报错代价低;
+    #   · 没有任何机房证据兜底 —— 那时单源代理特征也没有别的解释。
+    # 只有「单源 ip-api + 多源都说机房」这一种落进冲突区:实测 AS14956 的三个
+    # 出口,ipquery 三份响应完全一致(机房、risk 85、is_proxy:false),只有其中
+    # 一个 IP 被 ip-api 标了 proxy:true,于是同一台机器换 IP 就从 warn 变成 fail
+    # 拦启动。这种冲突按机房处理并留标记,不按代理一票否决。
+    local px_strong="" px_conflict=""
+    if [ -n "$px" ]; then
+        if [ "$px_src" -ge 2 ] || [ -n "$px_q" ]; then
+            px_strong=1
+        elif [ -z "$dc" ] || [ "$src_n" -lt 2 ]; then
+            px_strong=1
+        else
+            px_conflict=1
+        fi
+    fi
 
     # 类型判定。顺序即优先级:Tor > 代理/VPN > 机房 > 移动 > 住宅。
     # 低优先级不许覆盖高优先级 —— Tor 出口常常同时被打上 residential 标记
@@ -2982,9 +3012,20 @@ ip_purity() {
         case "${abfreq:-}" in ''|*[!0-9]*|0) ok_abuse=1 ;; *) ok_abuse="" ;; esac
         [ -n "$ok_risk" ] && [ -n "$ok_abuse" ] && clean_residential=1
     fi
+    # 「没查到问题」不等于「有住宅的正面证据」。下面这条 clean_residential 只说明
+    # 两家源都没报异常,运营商名也不在机房名单里 —— 实测 AS3257 GTT 这种骨干网地址
+    # 靠它拿到了 100/100「住宅宽带」(66.17.65.38)。
+    # 与参考站对齐的是**类型**(ip.net.coffee 也给住宅),但分数不能直接满分:
+    # 没有正面住宅证据(运营商名命中白名单 / PTR 自曝家宽特征)时封顶 70,
+    # 也就是「看着还行,但没拿到证据」那一档。类型保留,不把它硬说成机房。
+    local clean_only=""
+    if [ -n "$clean_residential" ] && [ -z "$resid_hint" ] \
+       && [ "$asn_kind" != "residential" ]; then
+        clean_only=1
+    fi
     if [ -n "$tor" ]; then
         type=tor
-    elif [ -n "$px" ]; then
+    elif [ -n "$px_strong" ]; then
         type=vpn
     elif [ -n "$dc" ] || [ -n "$host_hint" ] \
          || { [ "$asn_kind" = "hosting" ] && [ -z "$name_only_host" ]; }; then
@@ -3011,6 +3052,11 @@ ip_purity() {
         # 类型不明不给满分,也不当机房:70 分落在「良好」档,提示但不拦。
         *)           base=70 ;;
     esac
+    # 只靠「没查到异常」判出来的住宅,分数封顶在 70(与「类型不明」同档):
+    # 100 分是给有正面住宅证据的出口的,不能拿没查到来冒充查干净了。
+    if [ -n "$clean_only" ] && [ "$base" -gt 70 ]; then
+        base=70
+    fi
 
     local pen=0 riskpen=0 abpen=0 flags=""
     # 1) 第三方风险分:分段而非线性 —— 对齐 net.coffee 对 abuser_score 的处理方式
@@ -3066,6 +3112,11 @@ ip_purity() {
             fi ;;
     esac
 
+    # 证据冲突必须写在脸上:否则用户只知道「这次比上次分低」,不知道是 ip-api
+    # 一个布尔在说话。分开标,分类讨论才有依据。
+    [ -n "$px_conflict" ] && flags="$flags ·代理特征(单源)"
+    [ -n "$clean_only" ] && flags="$flags ·无正面住宅证据"
+
     # 降级判型时分数封顶 70。70 是本模型里「类型不明」的基线,含义正是「看着还行
     # 但没拿到证据」;带着一个没验证过的出口报 100 分,等于用「没查」冒充「查干净了」。
     # 这里不再叠任何扣分:风险分、滥用频次都取不到,地理也只剩一个源,没有可罚的依据。
@@ -3082,7 +3133,7 @@ ip_purity() {
     # 而大量用户就是在用机房节点,一票否决等于把门焊死。所以机房固定 warn,
     # 只有「机房 + 有滥用记录」这种转租段(分数掉到 30 以下)才拦。
     local verdict
-    if [ -n "$tor" ] || [ -n "$px" ]; then
+    if [ -n "$tor" ] || [ -n "$px_strong" ]; then
         verdict=fail
     elif [ -n "$degraded" ]; then
         # 降级判型:类型之外的东西一概没验证,判定封顶在 warn。
@@ -3142,7 +3193,15 @@ ip_purity() {
     # 反复出现五分钟。保留「评分 N/100」前缀(下游与测试都按它取数),补上口径。
     local score_label="评分 ${score}/100"
     [ -n "$degraded" ] && score_label="评分 ${score}/100(类型预估·未实测信誉)"
-    local detail="${score_label} · ${tlabel} · ${who}${flags}${next:+ · $next}"
+    # 判定词单独写出来。分数是信誉分(宽口径),判定是「这次能不能开」,
+    # 两者不是同一个轴 —— 实测用户会拿「这个 53 分、那个 43 分」反推「53 更安全」,
+    # 而 53 那个其实是 fail。不写清楚,分数越精确越误导。
+    local vlabel=""
+    case "$verdict" in
+        fail) vlabel="判定:拦启动" ;;
+        warn) vlabel="判定:仅提示" ;;
+    esac
+    local detail="${score_label} · ${tlabel} · ${who}${flags}${vlabel:+ · $vlabel}${next:+ · $next}"
 
     # 证据不全的结果不能钉住 24h。实测:ipquery / ip-api 同时超时那次,分数被
     # 降级到 70 并写进缓存,之后整整一天每次检查都拿这句「风险源不可达」当结论,
@@ -3175,12 +3234,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「五分钟重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v4.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v4" 2>/dev/null
+        tmp="$BASE/purity-cache.v5.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v5" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v4" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v5" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null
