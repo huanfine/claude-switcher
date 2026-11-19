@@ -117,6 +117,9 @@ class SetClientTests(unittest.TestCase):
         core = self.copy.read_text(encoding="utf-8")
         guard_fn = re.search(r"(?ms)^bodyguard_status\(\) \{\n.*?^\}", core).group(0)
         check_fn = re.search(r"(?ms)^check\(\) \{\n.*?^\}", core).group(0)
+        # check() 的时区一行改走 tz_current():抽取式夹具必须把它一起带上,
+        # 否则只剩「command not found」,用例会因为夹具缺件而不是逻辑而红。
+        tz_fn = re.search(r"(?ms)^tz_current\(\) \{\n.*?^\}", core).group(0)
         harness = r"""
 PROXY_MODE="shadowrocket"
 load_check_config() { return 0; }
@@ -138,7 +141,7 @@ route_ok() { return 0; }
 launchctl() { return 0; }
 """
         env = dict(os.environ, HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
-        src = harness + '\n' + guard_fn + '\n' + check_fn + '\ncheck\n'
+        src = harness + '\n' + guard_fn + '\n' + check_fn + '\n' + tz_fn + '\ncheck\n'
         fail = subprocess.run(["/bin/bash", "-c", src], env=env, cwd=self.root,
                               text=True, capture_output=True, timeout=6)
         self.assertNotEqual(fail.returncode, 0, fail.stdout + fail.stderr)

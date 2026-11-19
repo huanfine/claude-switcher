@@ -241,5 +241,30 @@ esac''')
                     self.assertTrue(got.split("·", 1)[1].strip(), "「·」后面要有动作")
 
 
+class TimezoneSingleSourceTests(unittest.TestCase):
+    """时区取值只留一处。
+
+    以前 check()、checkdetail()、fix() 各写一遍 `readlink /etc/localtime` + 剥前缀,
+    文案也各写一遍。改了口径就会出现「检查说 ok、修复还在改时区」这种自相矛盾,
+    而且三份迟早漂成三种口径。这类重复只能靠静态门禁拦住 —— 断言读的是文本,
+    不需要环境,也就不受开发机真实时区影响。
+    """
+
+    @staticmethod
+    def _code_lines():
+        return [line for line in SOURCE.read_text(encoding="utf-8").splitlines()
+                if not line.lstrip().startswith("#")]
+
+    def test_system_timezone_is_read_in_exactly_one_place(self):
+        hits = [line for line in self._code_lines() if "readlink /etc/localtime" in line]
+        self.assertEqual(len(hits), 1, "时区取值应只出现在 tz_current() 里:" + repr(hits))
+
+    def test_timezone_helper_is_defined_once_and_reused(self):
+        text = SOURCE.read_text(encoding="utf-8")
+        self.assertEqual(text.count("tz_current() {"), 1, "tz_current 定义只能有一份")
+        used = [line for line in self._code_lines() if "tz_current)" in line]
+        self.assertGreaterEqual(len(used), 3, "check/checkdetail/fix 都应复用 tz_current:" + repr(used))
+
+
 if __name__ == "__main__":
     unittest.main()

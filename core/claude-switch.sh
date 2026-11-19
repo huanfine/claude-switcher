@@ -3351,7 +3351,7 @@ check() {
 
     # 时区/地区/目标国家缺失是环境层没配好,不是实测不达标 —— 提示语必须分开,
     # 否则用户会拿着「时区异常」去改时区,而真正错的是目标值。
-    tz=$(readlink /etc/localtime 2>/dev/null); tz=${tz##*/zoneinfo/}
+    tz=$(tz_current)
     if [ -z "$TZ_TARGET" ]; then
         fails="$fails;环境未配置(时区目标缺失,点一键修复)"
     elif [ "$tz" != "$TZ_TARGET" ]; then
@@ -3770,6 +3770,17 @@ bodyguard_status() {
     echo "ok:${lastkill:-待命}"
 }
 
+# 当前系统时区(IANA 名,读不到就输出空)。
+# 取值方式只留这一份:check()、checkdetail()、fix() 原来各写一遍
+# `readlink /etc/localtime` + 剥前缀,任一处改口径就会让「检查说 ok、修复还在改」
+# 这种自相矛盾的事情重新出现。只输出名字,不输出 /var/db/timezone/zoneinfo/ 前缀 ——
+# 那个路径对用户没有意义,看着像系统坏了。
+tz_current() {
+    local tz
+    tz=$(readlink /etc/localtime 2>/dev/null) || return 0
+    printf '%s\n' "${tz##*/zoneinfo/}"
+}
+
 # 已安装的时区看门狗守着哪个目标值(读不到就输出空)。
 # 老安装件写的是 TARGET="America/New_York",set-region 同步时写的是不带引号的
 # TARGET=America/New_York,两种都得认,所以剥引号而不是匹配引号。
@@ -3853,7 +3864,7 @@ checkdetail() {
     # 时区/地区:报「当前值 vs 期望值」,不报 readlink 的完整路径。
     # 原来直接打印 /var/db/timezone/zoneinfo/America/Los_Angeles,看起来像系统坏了,
     # 实际只是目标值和当前值不一致 —— 用户看不出该改哪一边。
-    tz=$(readlink /etc/localtime 2>/dev/null); tz=${tz##*/zoneinfo/}
+    tz=$(tz_current)
     if [ -z "$TZ_TARGET" ]; then
         config_result "时区" "环境层未就绪(未取到时区目标) · 点「一键修复」"
     elif [ "$tz" != "$TZ_TARGET" ]; then
@@ -4701,10 +4712,10 @@ fix() {
     fi
 
     # B. 时区/IPv6/DNS缓存/保镖(需管理员权限,会弹一次密码框)
-    tz=$(readlink /etc/localtime 2>/dev/null)
+    tz=$(tz_current)
     v6=$(ipv6_on_services)
     adminCmds=""
-    [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $(shq "$TZ_TARGET"); "
+    [ "$tz" != "$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $(shq "$TZ_TARGET"); "
     # 逐条服务关 IPv6。只关 Wi-Fi 会漏掉 Ethernet/iPhone USB,检查项也就跟着漏报。
     if [ -n "$v6" ]; then
         while IFS= read -r svc; do

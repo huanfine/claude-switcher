@@ -30,7 +30,7 @@ def extract(name, text=None):
 
 
 PROBE_FN = extract("ip_key") + "\n\n" + extract("probe_egress")
-CHECK_FN = extract("check")
+CHECK_FN = extract("check") + "\n\n" + extract("tz_current")
 
 # 出口身份归一:check() 与 probe_egress() 都靠它,隔离环境里必须一起带上。
 IP_HELPERS = "\n".join(extract(n) for n in (
