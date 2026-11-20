@@ -172,6 +172,15 @@ esac''' % (rdns, rdns))
   *claude.ai*|*api.anthropic.com*) printf '200' ;;
 esac''')
 
+    def drop_cache(self):
+        """删掉纯度缓存。
+
+        缓存按 IP 存 24 小时,而夹具每次都用同一个 IP —— 同一用例里换 risk_score 再跑,
+        第二次会直接命中上一次的结果,断言就永远拿第一次的数。这一条踩过:
+        「连续扣分」用例五个 risk 全报 70,看起来像扣分没生效,其实是缓存。
+        """
+        (self.home / ".claude-switcher" / "purity-cache.v7").unlink(missing_ok=True)
+
     def run_detail(self, cmd="checkdetail"):
         run = subprocess.run(["/bin/bash", str(SOURCE), cmd], text=True,
                              capture_output=True, env=self.env, timeout=180)
@@ -202,13 +211,14 @@ esac''')
         """机房要提示但不拦启动:大量用户就用机房节点,一票否决等于把门焊死。
 
         基线 55 取自 net.coffee 实测的机房带(51~58)中位;这个样本 risk_score=20
-        再扣 7,所以落在 48 —— 分数低是风险分扣的,不是类型基线拍脑袋。
+        按连续口径扣 4 分((20×12+30)/60),所以落在 51 —— 分数低是风险分扣的,
+        不是类型基线拍脑袋。
         """
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("机房", detail)
-        self.assertEqual(self.score(detail), 48, detail)
+        self.assertEqual(self.score(detail), 51, detail)
 
     def test_clean_datacenter_lands_in_the_published_band(self):
         """没有任何风险记录的机房,分数要落回网站实测的 51~58 —— 两边才能对比。"""
@@ -318,8 +328,8 @@ esac''')
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertIn("时区不符", detail)
-        # 基线 55 − 风险 7 = 48(地理维度只标记,不进分数)
-        self.assertEqual(self.score(detail), 48, detail)
+        # 基线 55 − 风险扣分 4 = 51(地理维度只标记,不进分数)
+        self.assertEqual(self.score(detail), 51, detail)
         self.assertEqual(state, "warn", detail)
 
     def test_geo_ambiguity_is_not_blamed_on_the_user(self):
@@ -375,13 +385,17 @@ esac''')
         self.assertIn("机房", detail)
 
     def test_rdns_residential_hint_rescues_unknown_asn(self):
-        """反向解析里的 hsd/dsl/dynamic 是运营商家宽的典型命名,能补上被漏掉的类型。"""
+        """反向解析里的 hsd/dsl/dynamic 是运营商家宽的典型命名,能补上被漏掉的类型。
+
+        类型救回来了,但这一份样本的 ipquery 没报运营商名(等于少一家风险源),
+        风险维度只验了一半 —— 所以分数封顶 85、判定只到 warn。类型对不等于验过了。
+        """
         self.set_ptr("c-73-158-10-5.hsd1.ca.comcast.net")
         self.stub_net(NEUTRAL, _ipapi(), "")
         state, detail, _ = self.run_detail()
-        self.assertEqual(state, "ok", detail)
+        self.assertEqual(state, "warn", detail)
         self.assertIn("住宅宽带", detail)
-        self.assertEqual(self.score(detail), 100, detail)
+        self.assertEqual(self.score(detail), 85, detail)
 
     # ---- 「不知道」必须说不知道 ----
 
@@ -419,7 +433,7 @@ esac''')
         """查不到就不写缓存 —— 否则一次网络抖动会把「未知」钉住一整天。"""
         self.stub_net("", "", "", "")
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v6"
+        cache = self.home / ".claude-switcher" / "purity-cache.v7"
         if cache.exists():
             self.assertNotIn("203.0.113.10", cache.read_text(encoding="utf-8"))
 
@@ -513,17 +527,70 @@ esac''')
         self.assertEqual(self.score(detail), 70, detail)
 
     def test_single_risk_source_is_flagged(self):
-        """只剩一家风险源时照常算分,但要标明证据不全。
+        """只剩一家风险源时:类型照判,但分数封顶 85、判定最多 warn。
 
         实测 WARP 只有 ip-api 报 proxy:true,ipquery 只报 datacenter —— 缺了任何一家,
-        代理特征就可能漏判。这不是「有警报」,是「这次的结论只基于一半证据」,
-        所以只加说明、不改判定。
+        代理特征就可能漏判。以前这里「只加说明、不改判定」,结果是 ipquery 一超时,
+        一个没验过风险的出口照样报 100/ok —— 和两家源都验过的 100 长得一模一样。
+        现在分数表达「现有证据支持到这里」:封顶 85,并且不给绿勾。
         """
         self.stub_net(RESIDENTIAL, _ipapi(status="fail"), "")
         state, detail, _ = self.run_detail()
-        self.assertEqual(state, "ok", detail)
-        self.assertEqual(self.score(detail), 100, detail)
+        self.assertEqual(state, "warn", detail)
+        self.assertEqual(self.score(detail), 85, detail)
         self.assertIn("仅一家风险源可达", detail)
+
+    # ---- 精确度:分数要能表达「证据到什么程度」,而不是「落在第几档」 ----
+
+    def test_missing_risk_score_is_capped_not_skipped(self):
+        """两源都在,但 ipquery 没给 risk_score:封顶 85,不能当「0 风险」白拿满分。
+
+        缺数据的形态是最阴的一种:字段为空 → 罚分算 0 → 100 分 ok,
+        和「验过且干净」的 100 完全一样。现在 85 + 「风险未验证」,并只钉 5 分钟。
+        """
+        no_risk = ('{"ip":"203.0.113.10","isp":{"asn":"AS7922",'
+                   '"org":"Comcast Cable Communications, LLC",'
+                   '"isp":"Comcast Cable Communications, LLC"},'
+                   '"location":{"country_code":"US","city":"Denver",'
+                   '"timezone":"America/Denver"},"risk":{"is_vpn":false}}')
+        self.stub_net(no_risk, _ipapi("Denver"), IPINFO_RESID)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertEqual(self.score(detail), 85, detail)
+        self.assertIn("风险未验证", detail)
+
+    def test_risk_threshold_does_not_flip_the_type(self):
+        """risk_score 从 10 变 11,不许把「住宅宽带」变成「类型不明」。
+
+        信誉维度曾经写在类型判定的条件里(risk≤10 且无滥用),于是 1 分的抖动
+        同时改了类型标签、分数(67→63)和动作建议(多一句「建议换住宅」)。
+        类型回答「这是什么线路」,不该被「这条线脏不脏」改口。
+        """
+        for risk in (10, 11):
+            with self.subTest(risk=risk):
+                self.drop_cache()
+                self.stub_net(_ipquery("Example ISP LLC", "Example ISP LLC",
+                                       city="Ashburn", risk_score=risk),
+                              _ipapi("Ashburn"), "")
+                state, detail, _ = self.run_detail()
+                self.assertEqual(state, "warn", detail)
+                self.assertIn("住宅宽带", detail)
+                self.assertNotIn("类型不明", detail)
+                self.assertNotIn("建议换住宅", detail)
+                self.assertEqual(self.score(detail), 68, detail)
+
+    def test_risk_penalty_is_continuous(self):
+        """风险扣分是连续函数:每 +5 分风险正好 -1 分信誉,没有档口跳变。"""
+        scores = {}
+        for risk in (0, 5, 10, 25, 50):
+            self.drop_cache()
+            self.stub_net(_ipquery("Example ISP LLC", "Example ISP LLC",
+                                   city="Ashburn", risk_score=risk),
+                          _ipapi("Ashburn"), "")
+            _, detail, _ = self.run_detail()
+            scores[risk] = self.score(detail)
+        # 基线 70(只靠「没查到异常」判出的住宅),扣分 (risk*12+30)/60
+        self.assertEqual(scores, {0: 70, 5: 69, 10: 68, 25: 65, 50: 60}, scores)
 
     # ---- 与门禁、缓存的一致性 ----
 
@@ -544,7 +611,7 @@ esac''')
         """
         self.stub_net(RESIDENTIAL, _ipapi("Denver", countryCode="US"), IPINFO_RESID)
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v6"
+        cache = self.home / ".claude-switcher" / "purity-cache.v7"
         self.assertTrue(cache.exists(), "没写 v4 缓存")
         fields = cache.read_text(encoding="utf-8").strip().split("|")
         self.assertEqual(len(fields), 7, "v4 应是 7 列,实际 %d: %s" % (len(fields), fields))
@@ -561,7 +628,7 @@ esac''')
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("风险源不可达", detail)
-        cache = self.home / ".claude-switcher" / "purity-cache.v6"
+        cache = self.home / ".claude-switcher" / "purity-cache.v7"
         line = cache.read_text(encoding="utf-8").strip()
         fields = line.split("|")
         self.assertEqual(len(fields), 7, fields)
@@ -575,7 +642,7 @@ esac''')
         cache.unlink()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        fresh = (self.home / ".claude-switcher" / "purity-cache.v6").read_text(encoding="utf-8")
+        fresh = (self.home / ".claude-switcher" / "purity-cache.v7").read_text(encoding="utf-8")
         rows = [r for r in fresh.strip().splitlines() if r.startswith("203.0.113.10|")]
         self.assertEqual(len(rows), 1, "同一个 IP 不该留下两条缓存")
         remaining = 86400 - (int(time.time()) - int(rows[0].split("|")[1]))
@@ -621,7 +688,7 @@ esac''')
         self.assertEqual(state, "ok", detail)
         self.assertNotIn("硬门槛:", detail)
         # 两次跑的是同一个夹具 IP,不删缓存第二次会直接读到住宅那条结果。
-        (self.home / ".claude-switcher/purity-cache.v6").unlink(missing_ok=True)
+        (self.home / ".claude-switcher/purity-cache.v7").unlink(missing_ok=True)
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
@@ -701,7 +768,7 @@ esac''')
         lock.mkdir()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v6"
+        cache = base / "purity-cache.v7"
         self.assertTrue(cache.exists(), "陈旧锁之后仍应写入缓存")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertFalse(lock.exists(), "陈旧锁应被回收")
@@ -715,7 +782,7 @@ esac''')
         (lock / "owner").write_text(str(int(time.time())), encoding="utf-8")
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v6"
+        cache = base / "purity-cache.v7"
         self.assertTrue(cache.exists(), "抢不到锁也要落盘,不能丢掉结果")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertTrue(lock.exists(), "活锁不该被别人抢走")

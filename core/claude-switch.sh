@@ -2847,9 +2847,11 @@ ip_purity() {
     # 不换文件名,升级后 24 小时内会继续读到「类型不明 / 机房」这种旧结论 ——
     # 用户重装完还是老样子,只能以为我们又没修好。改口径必须让旧缓存失效。
     # v5/v6 同理:v5 是代理特征按源计数 + 判定词显式化;v6 是住宅档不再劝人换住宅。
+    # v7:信誉维度连续扣分 + 风险未验证封顶 85。这一版**分数本身变了**(同一 IP 可能
+    # 差几分),旧缓存里的数字会和新口径混着显示 —— 必须换文件名让它整体作废。
     # 注意缓存里存的是**成品文案**(第 6 列),所以任何措辞变更都得换文件名,
     # 否则用户 24 小时内看到的还是旧话 —— 这一条以后会一直踩,别再想省这个版本号。
-    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v6" ]; then
+    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v7" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
@@ -2857,7 +2859,7 @@ ip_purity() {
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v6"
+        done < "$BASE/purity-cache.v7"
     fi
 
     local q1 q2 q3 q4 b1 b2 b3 b4 rdns=""
@@ -3004,16 +3006,17 @@ ip_purity() {
         name_only_host=1
     fi
     # 「民用宽带」也要正面证据,不能靠「没查到问题」默认放行:
-    #   两家风险源都答了(src_n>=2) + 有运营商名 + 所有风险标志全否
-    #   + risk_score 有值且 ≤10 + 无滥用记录 + 运营商名里没有机房词。
-    # 这几条同时成立时,判住宅是 ip.net.coffee 的同款口径(它对 GTT 这种干净骨干
-    # 也给「住宅 98」);任何一条缺失就退回 unknown(70 分 warn),不洗成满分。
-    local clean_residential="" ok_risk="" ok_abuse=""
+    #   两家风险源都答了(src_n>=2) + 有运营商名 + 所有风险标志全否 + 运营商名里没有机房词。
+    # **信誉维度(risk_score / 滥用记录)故意不参与类型判定。** 它们曾经参与过:
+    # 条件里写着「risk≤10 且无滥用」,于是同一个出口 risk_score 从 10 变 11 时,
+    # 类型从「住宅宽带」翻成「类型不明」,分数 67→63,还多挂一句「建议换住宅」——
+    # 一个 1 分的抖动改了三处结论,用户看到的是「同一个 ISP 换了个说法」。
+    # 类型回答的是「这是什么线路」,信誉回答的是「这条线脏不脏」;混进同一个 if
+    # 就会互相冒充:脏一点被当成线路变了,线路不明又被当成脏。
+    local clean_residential=""
     if [ "$src_n" -ge 2 ] && [ -n "$asn_org" ] && [ "$asn_kind" != "hosting" ] \
        && [ -z "$dc" ] && [ -z "$host_hint" ] && [ -z "$px" ] && [ -z "$tor" ] && [ -z "$mob" ]; then
-        case "${risk:-}" in ''|*[!0-9]*) ok_risk="" ;; *) [ "$risk" -le 10 ] && ok_risk=1 ;; esac
-        case "${abfreq:-}" in ''|*[!0-9]*|0) ok_abuse=1 ;; *) ok_abuse="" ;; esac
-        [ -n "$ok_risk" ] && [ -n "$ok_abuse" ] && clean_residential=1
+        clean_residential=1
     fi
     # 「没查到问题」不等于「有住宅的正面证据」。下面这条 clean_residential 只说明
     # 两家源都没报异常,运营商名也不在机房名单里 —— 实测 AS3257 GTT 这种骨干网地址
@@ -3062,24 +3065,25 @@ ip_purity() {
     fi
 
     local pen=0 riskpen=0 abpen=0 flags=""
-    # 1) 第三方风险分:分段而非线性 —— 对齐 net.coffee 对 abuser_score 的处理方式
-    #    (Low/Elevated/High 各一档),连续值直接相乘会让一家源的刻度决定全局。
+    # 1) 第三方风险分:**连续扣分**,每 5 分风险约 1 分信誉分,60 分以上封顶 12。
+    #    上一版是四档阶梯(1-10→3、11-25→7、26-50→9、≥51→12),坏处有两个:
+    #    ① 同档内不可分辨 —— risk 1 和 10 同分、11 和 25 同分,数字看着精确其实
+    #       只表达「在第几档」;② 档口会跳 —— risk 10→11 一次掉 4 分。
+    #    实测把所有可能取值枚举出来只有 36 个可达分值,101 个整数里过半取不到。
+    #    连续化后曲线单调、可达分值九十多个,且 0 分仍是 0 扣分(与参考站口径一致)。
     case "${risk:-}" in
         ''|*[!0-9]*) ;;
-        *) if   [ "$risk" -ge 51 ]; then riskpen=12
-           elif [ "$risk" -ge 26 ]; then riskpen=9
-           elif [ "$risk" -ge 11 ]; then riskpen=7
-           elif [ "$risk" -ge 1 ];  then riskpen=3
-           fi ;;
+        *) riskpen=$(( (risk * 12 + 30) / 60 ))    # 5→1 · 10→2 · 25→5 · 50→10 · 60+→12
+           [ "$riskpen" -gt 12 ] && riskpen=12 ;;
     esac
     # 2) 滥用记录(stopforumspam)。实测住宅与正常机房都是 0,只有 Tor/VPN 段会命中,
-    #    所以这一条几乎不会误伤 —— 命中就是真的被拿去刷过。
+    #    所以这一条几乎不会误伤 —— 命中就是真的被拿去刷过。同样连续:1 次就罚 5 分,
+    #    之后按频次缓慢加码,45 次以上封顶 14。原来的 1-10→5 / 11-50→9 是阶梯,
+    #    第 10 次和第 11 次之间凭空掉 4 分,没有对应的现实差异。
     case "${abfreq:-}" in
         ''|*[!0-9]*|0) ;;
-        *) if   [ "$abfreq" -ge 51 ]; then abpen=14
-           elif [ "$abfreq" -ge 11 ]; then abpen=9
-           else abpen=5
-           fi
+        *) abpen=$(( 5 + abfreq / 5 ))
+           [ "$abpen" -gt 14 ] && abpen=14
            flags="$flags ·滥用记录" ;;
     esac
     # 两个都是「历史信誉」信号,而且高度相关:Tor 出口的 risk_score 天然高、
@@ -3130,6 +3134,19 @@ ip_purity() {
     local score=$((base - pen))
     [ "$score" -lt 0 ] && score=0
 
+    # 「没查」不等于「查干净了」,这一条以前是**直接跳过扣分**:风险维度取不到值,
+    # 罚分自然是 0,于是一个 ipquery 超时的白名单出口照样拿 100/ok —— 和两家源都
+    # 验过的 100 一模一样,只在行尾挂一个小标记。实测(ipquery 空 + ip-api 正常 +
+    # ipinfo 报 Comcast):`100|ok|住宅宽带|…仅一家风险源可达`,是最难发现的那种假绿。
+    # 现在改成封顶 85 且判定最多到 warn:分数表达「现有证据支持到这里」,不表达满分。
+    local risk_known=""
+    case "${risk:-}" in ''|*[!0-9]*) ;; *) risk_known=1 ;; esac
+    local unverified=""
+    if [ -z "$risk_known" ] || [ "$src_n" -lt 2 ] || [ -n "$degraded" ]; then
+        unverified=1
+        [ "$score" -gt 85 ] && score=85
+    fi
+
     # 判定比分数严:分数是 IP 信誉(宽口径),判定回答的是「能不能拿它开 Claude」。
     # 但机房要单独定档:它的分数天然比住宅低一档,按分数卡在 50 分线上,会让一个
     # 51 分和 49 分的机房段得到相反结论 —— 实测 RouterHosting 正好卡在 49,
@@ -3151,6 +3168,10 @@ ip_purity() {
     else
         verdict=fail
     fi
+    # 证据不全的结果不许报 ok:分数可能被算高了(风险维度没验过),给个绿勾等于
+    # 替一次没做完的检查背书。封顶 85 已经让分数落在 warn 区间之上,这里再兜一次,
+    # 免得以后调阈值时又把它放出来。
+    [ -n "$unverified" ] && [ "$verdict" = ok ] && verdict=warn
 
     local isp="" who tlabel next
     # 冒号两侧可能有空格(不同源的 JSON 排版不一样),所以不能写死 "isp":"。
@@ -3193,12 +3214,20 @@ ip_purity() {
         # 双源交叉退化成单源:代理特征可能被漏判(实测 WARP 只有 ip-api 报 proxy:true,
         # ipquery 只报 datacenter)。分数照算,但必须让用户知道这次的证据是不全的。
         flags="$flags ·仅一家风险源可达"
+    elif [ -n "$unverified" ]; then
+        # 两家源都在,但 ipquery 的 risk 字段是空的 —— 风险维度没值可罚,
+        # 而这正好是最容易被当成「0 风险」的形态。
+        flags="$flags ·风险未验证"
     fi
     # 降级时 score 只是「按运营商名/PTR 推出的类型基线」,风险维度一个都没验证过。
     # 不加标记地报「评分 60/100」,用户会当成实测信誉分,而这个数还会在缓存里
     # 反复出现五分钟。保留「评分 N/100」前缀(下游与测试都按它取数),补上口径。
     local score_label="评分 ${score}/100"
-    [ -n "$degraded" ] && score_label="评分 ${score}/100(类型预估·未实测信誉)"
+    if [ -n "$degraded" ]; then
+        score_label="评分 ${score}/100(类型预估·未实测信誉)"
+    elif [ -n "$unverified" ]; then
+        score_label="评分 ${score}/100(风险未验证·封顶)"
+    fi
     # 判定词单独写出来。分数是信誉分(宽口径),判定是「这次能不能开」,
     # 两者不是同一个轴 —— 实测用户会拿「这个 53 分、那个 43 分」反推「53 更安全」,
     # 而 53 那个其实是 fail。不写清楚,分数越精确越误导。
@@ -3214,8 +3243,9 @@ ip_purity() {
     # 哪怕两家源早就恢复了。做法是给这类结果一个已经「快过期」的时间戳:
     # 读侧仍按 now-epoch < TTL 判,300 秒后自动重查,逻辑不用分叉。
     # 单源可达同理 —— 代理特征可能被漏判,不该把那次的分数当定论。
+    # 「风险未验证」也同理:封顶 85 是保守估计,不是结论,风险源恢复后要立刻重算。
     local cache_epoch="$now" lock="$BASE/.purity-cache.lock" got=0 i owner tmp
-    if [ -n "$degraded" ] || [ "$src_n" = "1" ]; then
+    if [ -n "$degraded" ] || [ "$src_n" = "1" ] || [ -n "$unverified" ]; then
         cache_epoch=$((now - PURITY_CACHE_TTL + 300))
     fi
     if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
@@ -3240,12 +3270,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「五分钟重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v6.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v6" 2>/dev/null
+        tmp="$BASE/purity-cache.v7.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v7" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v6" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v7" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null
