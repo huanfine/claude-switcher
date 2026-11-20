@@ -234,8 +234,8 @@ a "type estimate / reputation not measured" or "risk not verified / capped"
 score, the risk dimension was not verified this round: either none of the risk
 sources answered (the number is a type-based baseline) or the type evidence
 arrived without a reputation score (capped at 85, never better than an
-advisory). Neither is a measured reputation, and both are retried after
-15 minutes.
+advisory). Neither is a measured reputation. The background guard does not re-ask
+the sources for them; pressing "Check again" fetches a fresh answer immediately.
 
 ## Exit IP score looks wrong
 

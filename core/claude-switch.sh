@@ -2781,17 +2781,28 @@ ip_class() {
 #                  198.18.x,黑名单命中率全是假的,所以只能用 HTTP 接口。
 PURITY_CACHE_TTL=86400
 
-# 证据不全时的重查间隔。「证据不全」= 源全挂 / 只剩一个源 / risk 字段没取到。
-# 这类结果不能像完整结果那样复用 24 小时(一次网络抖动会把「不确定」钉一整天),
-# 但也不能像原来那样五分钟就作废 —— 2026-11-20 量到了那个代价:
-#   巡检(watch)默认每 60 秒跑一次完整 check,而 check 每次都进 ip_purity;
-#   降级态下缓存五分钟失效 → 每 5 分钟打一轮四源并发 = 288 轮/天 = 1152 个请求
-#   落到四家免费源上,是常态(4 个/天)的 288 倍。
-# 更要紧的是它构成负反馈:某个源限流 → 更可能进降级态 → 查得更勤 → 更容易继续
-# 限流,越限越查、越查越限。实测 ipinfo 已经回过 429(Rate limit hit)。
-# 900 秒把这条路径压到 384 个/天(按源分下来每家 96 个/天),仍是保守值;
-# 出口 IP 变了是新 key,照样立刻重查 —— 这个延迟只影响「同一 IP、源恢复」这一种。
-PURITY_RETRY_TTL=900
+# 「什么时候问源」和「一条结论能用多久」是两件事,不能塞进同一个参数。
+#
+# 曾经把它们绑在一起:证据不全的结果只留 5 分钟,靠「提前过期」逼出一次重查。
+# 代价在 2026-11-20 量清楚了:巡检每 60 秒跑一次完整 check,而 check 每次都进
+# ip_purity —— 降级态下每 5 分钟打一轮四源并发 = 1152 个请求/天,是常态
+# (4 个/天)的 288 倍;更糟的是它构成负反馈:某个源限流 → 更容易降级 →
+# 查得更勤 → 更容易继续限流。实测 ipinfo 已经回过 429(Rate limit hit)。
+#
+# 把窗口从 5 分钟调到 15 分钟只是止痛,而且换来了一个更坏的代价:用户手动
+# 重查也可能拿到一刻钟前的旧数字 —— 这违背「结果只讲现在对不对」。
+# 所以不再调窗口,改成把两件事拆开,用**调用方**区分:
+#
+#   ip_purity <ip>       读缓存。巡检(check)走这条。出口没变,同一 IP 的信誉
+#                        一天内不会剧变,后台每分钟去打扰四家源是纯浪费 ——
+#                        那也正是「我们的 IP 被反复送出去」的唯一来源。
+#   ip_purity <ip> 1     强制重问。checkdetail 走这条。任何一次给人看的检查
+#                        都必须是真结论,绝不返回几小时前的数字。
+#
+# 于是:出口不变时后台 0 请求;用户要看就一定最新;出口一变就是新的 key,
+# 天然重查。降级结果照样按 24h 缓存 —— 它不需要「定时自愈」,用户点一次
+# 重新检查就够,而那一次是显式的、他自己要的。
+PURITY_CACHE_TTL=86400
 
 # 从扁平 JSON 取标量字段。不引入 jq:检查链路得能在只装了 Xcode 命令行工具的机器上跑,
 # 多一个依赖就多一个装不上的理由。
@@ -2845,7 +2856,7 @@ purity_band() {
 # 输出一行: <score>|<verdict>|<flags>|<detail>|<cc>
 # verdict 取 ok|warn|fail|unknown;unknown = 没拿到数据,由调用方决定怎么报。
 ip_purity() {
-    local ip="${1:-}" now cip cep cver cscore ctype cdet
+    local ip="${1:-}" force="${2:-0}" now cip cep cver cscore ctype cdet
     # 字段分隔用 | 而不是 tab:tab 属于 IFS 空白,read 会把前导空字段整个吞掉,
     # 于是「无分数」这条路径会被解析成 score=unknown、detail 为空 —— 静默错位。
     [ -z "$ip" ] && { printf '|unknown||未取到出口IP|'; return 0; }
@@ -2853,6 +2864,8 @@ ip_purity() {
 
     # 同一出口 24h 内复用结果:一次检查要打 4 个网络请求,而出口一天里不会变几十次。
     # 查不到不写缓存,否则一次网络抖动会把「未知」钉住一整天。
+    # 第二个参数是「强制重问」:checkdetail 传 1,巡检不传(见 PURITY_CACHE_TTL 的说明)。
+    # 跳过缓存不等同于清缓存 —— 查完仍要落盘,下一次巡检才不会重复打源。
     # 文件名带 v3:第 7 列是出口国家代码。v2 的 6 列没有它,混读会让 detail
     # 把「|US」吞进去,宁可让旧缓存作废(v3 同时清掉 v2 里被钉住 24h 的降级结果)。
     # v4:类型判定改成证据驱动(见 ip_class 与 clean_residential)。改判定的同时
@@ -2861,9 +2874,12 @@ ip_purity() {
     # v5/v6 同理:v5 是代理特征按源计数 + 判定词显式化;v6 是住宅档不再劝人换住宅。
     # v7:信誉维度连续扣分 + 风险未验证封顶 85。这一版**分数本身变了**(同一 IP 可能
     # 差几分),旧缓存里的数字会和新口径混着显示 —— 必须换文件名让它整体作废。
+    # v8:降级结果不再有单独的短过期(一律 24h),要新结论由 checkdetail 传 force
+    # 显式重问。同时把降级文案的「稍后重查」改成「点重新检查可重算」—— 缓存里存的是
+    # 成品文案,不换名会让用户 24 小时内继续看到「稍后重查」,而它已经不成立了。
     # 注意缓存里存的是**成品文案**(第 6 列),所以任何措辞变更都得换文件名,
     # 否则用户 24 小时内看到的还是旧话 —— 这一条以后会一直踩,别再想省这个版本号。
-    if [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v7" ]; then
+    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v8" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
@@ -2871,7 +2887,7 @@ ip_purity() {
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v7"
+        done < "$BASE/purity-cache.v8"
     fi
 
     local q1 q2 q3 q4 b1 b2 b3 b4 rdns=""
@@ -3221,7 +3237,7 @@ ip_purity() {
         # 「换节点」这类需要证据的建议 —— 否则一个真实的住宅用户会被劝去换住宅 IP。
         # 只说清发生了什么、下一步做什么。
         flags="$flags ·风险源不可达"
-        next="仅按运营商名或反向解析判型,稍后重查"
+        next="仅按运营商名或反向解析判型,点重新检查可重算"
     elif [ "$src_n" = "1" ]; then
         # 双源交叉退化成单源:代理特征可能被漏判(实测 WARP 只有 ip-api 报 proxy:true,
         # ipquery 只报 datacenter)。分数照算,但必须让用户知道这次的证据是不全的。
@@ -3250,16 +3266,12 @@ ip_purity() {
     esac
     local detail="${score_label} · ${tlabel} · ${who}${flags}${vlabel:+ · $vlabel}${next:+ · $next}"
 
-    # 证据不全的结果不能钉住 24h。实测:ipquery / ip-api 同时超时那次,分数被
-    # 降级到 70 并写进缓存,之后整整一天每次检查都拿这句「风险源不可达」当结论,
-    # 哪怕两家源早就恢复了。做法是给这类结果一个已经「快过期」的时间戳:
-    # 读侧仍按 now-epoch < TTL 判,PURITY_RETRY_TTL 秒后自动重查,逻辑不用分叉。
-    # 单源可达同理 —— 代理特征可能被漏判,不该把那次的分数当定论。
-    # 「风险未验证」也同理:封顶 85 是保守估计,不是结论,风险源恢复后要重算。
+    # 结论一律按 24h 缓存,不再按「证据齐不齐」分两种过期时间。
+    # 那套提前过期正是后台重查的发动机:它把一个「这次没查全」的观察
+    # 变成了「每 N 分钟必须再问一次」的定时任务,而问的那一方是每分钟
+    # 都在跑 check 的巡检,不是人。证据不齐只影响**文案与封顶**(见上),
+    # 不该影响一条缓存能活多久。要新的,就由 checkdetail 显式传 force 来要。
     local cache_epoch="$now" lock="$BASE/.purity-cache.lock" got=0 i owner tmp
-    if [ -n "$degraded" ] || [ "$src_n" = "1" ] || [ -n "$unverified" ]; then
-        cache_epoch=$((now - PURITY_CACHE_TTL + PURITY_RETRY_TTL))
-    fi
     if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
         # 节点扫描会并发给多个 IP 打分,每个后台子 shell 都会落缓存;不锁的话
         # 两份 grep -v 会各自读同一份旧文件,后写的那份把先写的结果抹掉。
@@ -3282,12 +3294,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「证据不全就提前重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v7.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v7" 2>/dev/null
+        tmp="$BASE/purity-cache.v8.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v8" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v7" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v8" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null
@@ -3703,6 +3715,10 @@ check() {
     # 机房节点,把它当硬失败等于把所有人挡在门外;代理特征和 Tor 才拦。
     # 取不到数据同样是 warn 级:网络抖动不该拦住启动,但也不能悄悄算通过。
     if ! check_disabled "IP纯净度"; then
+        # 这里**读缓存、不重问**。check 是巡检每分钟跑一次的后台判定,它要回答的
+        # 是「出口此刻还过不过门槛」,而不是「这条出口的信誉有没有变」——
+        # 同一 IP 的信誉一天内不会剧变,为了它每分钟去敲四家源,既是纯浪费,
+        # 也是我们自己的 IP 被反复送给第三方的唯一来源。要新结论走 checkdetail。
         IFS='|' read -r pscore pver ptype pdet pcc <<<"$(ip_purity "$ip")"
         case "${pver:-unknown}" in
             # 不能写成「纯净度低」:68 分的代理/VPN 出口是被硬门槛拦下的,
@@ -4308,8 +4324,10 @@ checkdetail() {
     if check_disabled "IP纯净度"; then
         optional_result "IP纯净度" ok
     else
-        # 缓存命中时这一项不产生网络请求;换出口或首次才两个源并行问一次。
-        IFS='|' read -r pscore pver ptype pdet pcc <<<"$(ip_purity "$ip")"
+        # 第二参数 1 = 强制重问。任何一次给人看的检查都必须是真的新结论:
+        # 用户点「重新检查」时最不能接受的就是拿到几小时前的旧数字。
+        # 代价是每次详细检查 4 个请求,而它是用户显式触发的,不是后台定时。
+        IFS='|' read -r pscore pver ptype pdet pcc <<<"$(ip_purity "$ip" 1)"
         case "${pver:-unknown}" in
             # 取不到就明说没评级。这里绝不能借 ok 混过去 —— 用户看到绿勾会
             # 以为「出口干净已经验过了」,而实际上什么都没验。
@@ -4429,9 +4447,9 @@ NODE_SCAN_TTL=86400
 NODE_SCAN_MARGIN=10       # 比当前高至少 10 分才值得建议换,免得天天让用户换线路
 NODE_SCAN_PARALLEL=1      # 每个 ip_purity 内部已经 4 路并发,再乘 N 就是 4N 个并发
                           # 打四家免费源。原来是 3(12 并发),2026-11-20 收成 1(4 并发):
-                          # 本机 11 个叶子去重后只有 3 个出口 IP,一轮只差约 8 秒,
-                          # 换来的是不再把源打成限流 —— 而限流会反过来把结果推进
-                          # 降级态,触发 PURITY_RETRY_TTL 那条更勤的重查路径。
+                          # 本机 11 个叶子去重后只有 3 个出口 IP,一轮只差约 8 秒。
+                          # 扫描是用户显式触发的,一天顶多几次,但它一次性打出的是
+                          # 最密集的突发 —— 免费源限流看的是瞬时并发,不是日总量。
 
 # 读已固定的节点名。文件损坏/缺列一律当「没固定」,不能让半行数据把检查项卡死。
 preferred_node_leaf() {

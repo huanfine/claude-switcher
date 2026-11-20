@@ -179,7 +179,7 @@ esac''')
         第二次会直接命中上一次的结果,断言就永远拿第一次的数。这一条踩过:
         「连续扣分」用例五个 risk 全报 70,看起来像扣分没生效,其实是缓存。
         """
-        (self.home / ".claude-switcher" / "purity-cache.v7").unlink(missing_ok=True)
+        (self.home / ".claude-switcher" / "purity-cache.v8").unlink(missing_ok=True)
 
     def run_detail(self, cmd="checkdetail"):
         run = subprocess.run(["/bin/bash", str(SOURCE), cmd], text=True,
@@ -433,7 +433,7 @@ esac''')
         """查不到就不写缓存 —— 否则一次网络抖动会把「未知」钉住一整天。"""
         self.stub_net("", "", "", "")
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v7"
+        cache = self.home / ".claude-switcher" / "purity-cache.v8"
         if cache.exists():
             self.assertNotIn("203.0.113.10", cache.read_text(encoding="utf-8"))
 
@@ -546,8 +546,8 @@ esac''')
         """两源都在,但 ipquery 没给 risk_score:封顶 85,不能当「0 风险」白拿满分。
 
         缺数据的形态是最阴的一种:字段为空 → 罚分算 0 → 100 分 ok,
-        和「验过且干净」的 100 完全一样。现在 85 + 「风险未验证」,并按
-        PURITY_RETRY_TTL 提前重查,不钉满 24h。
+        和「验过且干净」的 100 完全一样。现在 85 + 「风险未验证」,封顶和文案都诚实,
+        缓存时长则和完整结论一致(都是 24h,不单独开短过期)。
         """
         no_risk = ('{"ip":"203.0.113.10","isp":{"asn":"AS7922",'
                    '"org":"Comcast Cable Communications, LLC",'
@@ -595,15 +595,51 @@ esac''')
 
     # ---- 与门禁、缓存的一致性 ----
 
-    def test_cache_avoids_second_lookup(self):
-        """同一出口 24h 内只查一次 —— 这是单次检查能塞进 45 秒预算的前提。"""
+    def test_checkdetail_always_reasks_even_with_a_fresh_cache(self):
+        """给人看的检查必须是新结论:缓存再新鲜也要重问。
+
+        这条是「结果只讲现在对不对」的硬约束。反过来也成立 —— 一旦允许
+        checkdetail 吃缓存,用户点「重新检查」拿到的就可能是几小时前的数字,
+        而他没有任何办法知道。省下的那 4 个请求,不值得换这个不确定性。
+        """
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID, calls="calls.log")
         self.run_detail()
-        first = (self.root / "calls.log").read_text(encoding="utf-8").count("api.ipquery.io")
+        log = self.root / "calls.log"
+        first = log.read_text(encoding="utf-8").count("api.ipquery.io")
         self.assertGreaterEqual(first, 1)
+        # 缓存此刻是刚写好的、24h 有效 —— 但 checkdetail 仍然必须重问。
         self.run_detail()
-        total = (self.root / "calls.log").read_text(encoding="utf-8").count("api.ipquery.io")
-        self.assertEqual(total, first, "第二次检查又去打了一次网络")
+        total = log.read_text(encoding="utf-8").count("api.ipquery.io")
+        self.assertEqual(total, first * 2,
+                         "checkdetail 命中了缓存,返回的是旧结论")
+
+    def test_background_check_reads_cache_instead_of_reasking(self):
+        """后台 check 读缓存 —— 它每 60 秒跑一次,重问源就是污染的唯一来源。
+
+        巡检要回答的是「出口此刻还过不过门槛」,不是「这条出口的信誉有没有变」。
+        同一 IP 的信誉一天内不会剧变,为它每分钟敲四家源,既是浪费,也是把
+        我们自己的 IP 反复送给第三方。
+
+        这个用例自带证伪:如果 check 根本没走到纯净度那一项,「0 次请求」只是
+        假阴性 —— 所以清掉缓存再跑一次,必须真的发出请求,否则视为用例不成立。
+        """
+        self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID, calls="calls.log")
+        log = self.root / "calls.log"
+        self.run_detail()
+        log.write_text("", encoding="utf-8")
+
+        subprocess.run(["/bin/bash", str(SOURCE), "check"], text=True,
+                       capture_output=True, env=self.env, timeout=180)
+        self.assertEqual(log.read_text(encoding="utf-8").count("api.ipquery.io"), 0,
+                         "后台 check 又去打了一次纯净度源")
+
+        # 证伪对照:没有缓存时 check 必须问源,否则上一条的 0 是假阴性。
+        self.drop_cache()
+        log.write_text("", encoding="utf-8")
+        subprocess.run(["/bin/bash", str(SOURCE), "check"], text=True,
+                       capture_output=True, env=self.env, timeout=180)
+        self.assertGreater(log.read_text(encoding="utf-8").count("api.ipquery.io"), 0,
+                           "对照失败:check 没走到纯净度项,本用例不成立")
 
     def test_cache_keeps_country_code_for_node_hard_gate(self):
         """国家代码要落进缓存,离线给候选节点排名时才有硬门槛可依。
@@ -612,44 +648,42 @@ esac''')
         """
         self.stub_net(RESIDENTIAL, _ipapi("Denver", countryCode="US"), IPINFO_RESID)
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v7"
+        cache = self.home / ".claude-switcher" / "purity-cache.v8"
         self.assertTrue(cache.exists(), "没写 v4 缓存")
         fields = cache.read_text(encoding="utf-8").strip().split("|")
         self.assertEqual(len(fields), 7, "v4 应是 7 列,实际 %d: %s" % (len(fields), fields))
         self.assertEqual(fields[6], "US")
 
-    def test_degraded_result_expires_quickly_instead_of_a_full_day(self):
-        """风险源全挂那次的 70 分不能被钉住 24 小时。
+    def test_provisional_result_is_cached_like_any_other(self):
+        """证据不全的结果也按 24h 缓存 —— 它不该有自己的过期时间。
 
-        实测过:两家源同时超时后,缓存里一直留着「风险源不可达」,
-        之后整整一天每次检查都拿这个降级结论当真,哪怕源早就恢复了。
-        现在给这类结果一个「提前过期」的时间戳,读侧逻辑不用分叉。
+        这里原来断言「只留几分钟」,理由是「一次网络抖动不能把不确定钉一整天」。
+        那个担心本身没错,但解法错了:给这类结果单独设一个短过期,等于把
+        「这次没查全」变成「每 N 分钟必须再问一次」的定时任务,而问的那一方
+        是每分钟都在跑 check 的巡检 —— 实测那条路径一天能打出 1152 个请求。
 
-        这个提前量原来是 5 分钟,2026-11-20 改成 15 分钟(PURITY_RETRY_TTL=900):
-        巡检每 60 秒跑一次 check,5 分钟一失效等于每 5 分钟打一轮四源并发,
-        288 轮/天落到免费源上,还会形成「越限流越查」的负反馈。
+        现在的分工是:证据不齐只影响**文案与封顶**,不影响缓存时长;要新结论,
+        由 checkdetail 显式传 force 去要。所以这里断言的就是 24h。
         """
         self.stub_net("", "", IPINFO_RESID)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("风险源不可达", detail)
-        cache = self.home / ".claude-switcher" / "purity-cache.v7"
+        cache = self.home / ".claude-switcher" / "purity-cache.v8"
         line = cache.read_text(encoding="utf-8").strip()
         fields = line.split("|")
         self.assertEqual(len(fields), 7, fields)
         import time
         remaining = 86400 - (int(time.time()) - int(fields[1]))
-        self.assertGreater(remaining, 0, "降级结果不该已经过期")
-        # 双向钉住:上界防止「提前量被写回 24h」,下界防止「又退回 5 分钟」。
-        self.assertLessEqual(remaining, 1200, "降级结果最多只该留一刻钟,实际还剩 %d 秒" % remaining)
-        self.assertGreater(remaining, 600, "提前量又缩回 5 分钟了,实际还剩 %d 秒" % remaining)
+        self.assertGreater(remaining, 80000,
+                           "降级结果被提前作废了,实际只剩 %d 秒" % remaining)
 
-        # 负例:证据齐全的结果仍按 24h 缓存,别为了修降级把正常缓存也打短。
-        # 先清掉降级那条,否则它会命中缓存、根本走不到「重新打分」这一步。
+        # 负例:证据齐全的结果同样是 24h —— 两类结果在缓存时长上没有区别,
+        # 区别只在文案与封顶。谁要是又给降级结果开了个短过期,上面那条会红。
         cache.unlink()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        fresh = (self.home / ".claude-switcher" / "purity-cache.v7").read_text(encoding="utf-8")
+        fresh = (self.home / ".claude-switcher" / "purity-cache.v8").read_text(encoding="utf-8")
         rows = [r for r in fresh.strip().splitlines() if r.startswith("203.0.113.10|")]
         self.assertEqual(len(rows), 1, "同一个 IP 不该留下两条缓存")
         remaining = 86400 - (int(time.time()) - int(rows[0].split("|")[1]))
@@ -695,7 +729,7 @@ esac''')
         self.assertEqual(state, "ok", detail)
         self.assertNotIn("硬门槛:", detail)
         # 两次跑的是同一个夹具 IP,不删缓存第二次会直接读到住宅那条结果。
-        (self.home / ".claude-switcher/purity-cache.v7").unlink(missing_ok=True)
+        (self.home / ".claude-switcher/purity-cache.v8").unlink(missing_ok=True)
         self.stub_net(HOSTING, _ipapi("Ogden", hosting=True), IPINFO_HOSTING)
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
@@ -775,7 +809,7 @@ esac''')
         lock.mkdir()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v7"
+        cache = base / "purity-cache.v8"
         self.assertTrue(cache.exists(), "陈旧锁之后仍应写入缓存")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertFalse(lock.exists(), "陈旧锁应被回收")
@@ -789,7 +823,7 @@ esac''')
         (lock / "owner").write_text(str(int(time.time())), encoding="utf-8")
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v7"
+        cache = base / "purity-cache.v8"
         self.assertTrue(cache.exists(), "抢不到锁也要落盘,不能丢掉结果")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertTrue(lock.exists(), "活锁不该被别人抢走")
