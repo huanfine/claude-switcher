@@ -1,6 +1,6 @@
 #!/bin/bash
 # Claude 账号切换器 - 核心脚本 (通用版)
-# 用法: claude-switch.sh check | status | switch A|B|C|D | checkdetail | fix | set-region | update [--check|--auto] | diagnose-proxy
+# 用法: claude-switch.sh check | status | switch A–H | checkdetail | fix | set-region | update [--check|--auto] | diagnose-proxy
 set -u
 export LC_ALL=en_US.UTF-8
 
@@ -3748,8 +3748,45 @@ tun_set() {
 # fail-closed 演练:平时检查只能证明"流量走了代理",证明不了"代理挂了会不会直连"。
 # 默认 auto —— 通过内核接口关掉 TUN,效果等价于核死时路由被撤销,但可以精确恢复,
 # 不需要 sudo,也不会把用户留在断网状态。--manual 保留原来的手动停核路径。
+# 把 TUN 拉回来,并确认「网真的通了」。
+#
+# 只把 tun_state 改回 true 是不够的,实测是这样坏掉的(2026-11-19):
+# 面板显示 TUN 已开、curl 和浏览器却连不上 —— 因为 TUN 断开期间那几轮失败的
+# 域名解析留在了 DNS 缓存里(fake-ip 模式下尤其明显)。用户看到的现象就是
+# 「演练结束后网坏了」。所以恢复分三步,少一步都不能说「已恢复」:
+#   1) 拉起 TUN,并等它真的起来(最多 10s)
+#   2) 清掉 DNS 缓存(这条不需要 sudo)
+#   3) 真的发一次请求,最多等 20s;每 6 秒补拉一次 TUN —— 内核可能自己把它关了
+drill_restore_tun() {
+    local waited=0 retry=0
+    tun_set true >/dev/null 2>&1 || true
+    while [ "$waited" -lt 10 ]; do
+        [ "$(tun_state)" = "true" ] && break
+        sleep 1; waited=$((waited + 1))
+    done
+    if [ "$(tun_state)" != "true" ]; then
+        echo "WARN:TUN 没能拉起来(内核可能已经退出了)"
+        return 1
+    fi
+    dscacheutil -flushcache 2>/dev/null || true
+    waited=0
+    while :; do
+        probe_egress 3 || true
+        [ "$PROBE_STATUS" = "ok" ] && return 0
+        [ "$waited" -ge 20 ] && break
+        sleep 2; waited=$((waited + 2))
+        if [ $((waited % 6)) -eq 0 ] && [ "$retry" -lt 2 ]; then
+            retry=$((retry + 1))
+            tun_set true >/dev/null 2>&1 || true
+            dscacheutil -flushcache 2>/dev/null || true
+        fi
+    done
+    return 1
+}
+
+# 演练:关掉代理链路,看本机是否还能直连外网(即 fail-closed 是否成立)。
 drill() {
-    local mode="auto" answer="" baseline after leaked out code result waited i arg
+    local mode="auto" answer="" baseline after leaked out code result waited i arg restore_ok=0
     local tcp_ok=0 tcp_fail=0 tcp_status=unknown tcp_start tcp_ms=0
     local dns_ok=0 dns_fail=0 dns_status=unknown dns_start dns_ms=0
     local wr_ok=0 wr_fail=0 wr_status=unknown wr_start wr_ms=0 wr_out
@@ -3882,13 +3919,8 @@ drill() {
     fi
 
     if [ "$mode" = "auto" ]; then
-        echo "INFO:恢复 TUN"
-        tun_set true || { echo "FAIL:恢复 TUN 失败,请在 Clash Verge 里手动开启"; return 1; }
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            [ "$(tun_state)" = "true" ] && break
-            sleep 1
-        done
-        [ "$(tun_state)" = "true" ] || { echo "FAIL:恢复 TUN 失败,请在 Clash Verge 里手动开启"; return 1; }
+        echo "INFO:恢复 TUN,并确认出口真的回来了(最多 30 秒)"
+        drill_restore_tun && restore_ok=1
     else
         printf '重新启动内核并开启 TUN 后回车: '
         read -r answer
@@ -3901,11 +3933,15 @@ drill() {
             fi
             sleep 3; waited=$((waited + 3))
         done
+        drill_restore_tun && restore_ok=1
     fi
-    probe_egress 3
-    [ "$PROBE_STATUS" = "ok" ] || echo "WARN:内核已起但出口未恢复采样($PROBE_STATUS),请人工确认"
-    if [ -n "$PROBE_IP" ] && [ "$PROBE_IP" != "$baseline" ]; then
-        echo "WARN:恢复后出口与基准不同($baseline -> $PROBE_IP),节点可能已切换"
+    if [ "$restore_ok" = "1" ]; then
+        echo "OK:已恢复出口 ${PROBE_IP:-未知}"
+        if [ -n "$PROBE_IP" ] && [ -n "$baseline" ] && [ "$PROBE_IP" != "$baseline" ]; then
+            echo "WARN:出口与演练前不同($baseline -> $PROBE_IP),换过节点;Claude 要重启才会走新线路"
+        fi
+    else
+        echo "FAIL:恢复后出口仍未通 —— 在 Clash Verge 里确认 TUN 已开启、节点已选好,再点「重新检查」"
     fi
     trap - EXIT INT TERM
 
@@ -3917,6 +3953,9 @@ drill() {
             "$wr_status" "$wr_ok" "$wr_fail" "$wr_ms" >/dev/null 2>&1 || true
         echo "$(date +%s) baseline=$baseline after=${PROBE_IP:-none} result=$result tcp=$tcp_ok/$tcp_fail dns=$dns_ok/$dns_fail webrtc=$wr_ok/$wr_fail" >> "$BASE/drill.log"
     fi
+    # 恢复失败要当成失败退出:结论记下来了,但「网没回来」比结论更要紧,
+    # 退出码不能是 0 —— 否则界面上会显示「演练完成、一切正常」。
+    [ "$restore_ok" = "1" ] || return 1
     [ "${result%%:*}" = "established" ]
 }
 
@@ -4116,7 +4155,7 @@ checkdetail() {
         # 用户只会看到「修好了又坏了」。这一条以前从来没检查过。
         wt=$(tz_watchdog_target)
         if [ -n "$wt" ] && [ "$wt" != "$TZ_TARGET" ]; then
-            echo "时区=warn:当前值正确,但看门狗仍守着 $wt · 会自己改回去,点「一键修复」同步"
+            echo "时区=warn:当前值正确,但时区巡检仍守着 $wt · 会自己改回去,点「一键修复」同步"
         else
             echo '时区=ok'
         fi
@@ -4338,7 +4377,7 @@ checkdetail() {
 }
 
 # ---------- 节点扫描(只读) ----------
-# 边界写在前头:不切节点、不重启客户端、不动看门狗、不写 iphistory。
+# 边界写在前头:不切节点、不重启客户端、不动巡检、不写 iphistory。
 # ip_purity() 按 IP 打分、按 IP 缓存,和「当前出口」无关 —— 这正是离线扫描
 # 不会污染 48h IP 漂移记录的原因。逐个切节点在线实测那条路会写 N 条漂移,
 # 反而把「IP 与上次一致」扣分,绝不能走。
@@ -4395,7 +4434,7 @@ node_gate() {
     fi
     pid=$(awk -F'\t' '{print $1; exit}' "$BASE/watch.pid" 2>/dev/null)
     if [ -n "$pid" ] && watch_pid_is_watchdog "$pid"; then
-        reasons="${reasons:+${reasons}、}看门狗驻守中"
+        reasons="${reasons:+${reasons}、}巡检驻守中"
     fi
     if [ -n "$reasons" ]; then
         printf 'report-only|%s\n' "$reasons"
@@ -4637,7 +4676,7 @@ node_apply_gate() {
         fi
         sleep 0.5
     done
-    printf 'denied|看门狗仍在驻守,请先停止守护(或退出应用)\n'
+    printf 'denied|巡检仍在驻守,请先停止守护(或退出应用)\n'
 }
 
 node_apply() {
@@ -5269,7 +5308,7 @@ ASEOF
     fi
     # 看门狗目标同步兜底(可写的老版本安装直接 sed;失败则提示运行安装器刷新)
     if [ -f "$WD" ] && [ "$wdsync" -eq 0 ]; then
-        sed -i '' "s|^TARGET=.*|TARGET=$ntz|" "$WD" 2>/dev/null || echo "WARN:看门狗目标未同步,请运行安装器刷新"
+        sed -i '' "s|^TARGET=.*|TARGET=$ntz|" "$WD" 2>/dev/null || echo "WARN:巡检目标未同步,请运行安装器刷新"
     fi
 
     echo "OK:region=$ctry tz=$ntz locale=$nlocale source=$src"
@@ -5607,7 +5646,7 @@ snapshot_export() {
     # 生产环境给足时间(账号数据可能很大);测试用
     # CLAUDE_SWITCHER_SNAPSHOT_TIMEOUT 压到秒级。
     local tmo="${CLAUDE_SWITCHER_SNAPSHOT_TIMEOUT:-180}"
-    case "$target" in A|B|C|D) ;; *) echo "FAIL:账号必须是 A、B、C 或 D"; return 1 ;; esac
+    valid_account "$target" || return 1
     [ -d "$BASE/accounts/$target" ] || { echo "FAIL:账号$target 没有已归档快照(先切换一次让它归档)"; return 1; }
     [ -n "$out" ] || { echo "FAIL:请指定导出文件路径"; return 1; }
     case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
@@ -5749,7 +5788,7 @@ EOF
 
 snapshot_import() {
     file="${1:-}"; target="${2:-}"; mode="${3:-}"
-    case "$target" in A|B|C|D) ;; *) echo "FAIL:账号必须是 A、B、C 或 D"; return 1 ;; esac
+    valid_account "$target" || return 1
     [ -f "$file" ] || { echo "FAIL:找不到镜像文件: $file"; return 1; }
     [ -e "$BASE/accounts/$target" ] && { echo "FAIL:账号$target 已有快照,请先导出或删除后再导入"; return 1; }
 
@@ -5850,28 +5889,30 @@ PY
 }
 
 status() {
-    local cur="none" hasA=0 hasB=0 hasC=0 hasD=0 a dir size stamp accounts="" extras=""
+    local cur="none" a dir size stamp csize cstamp accounts="" extras="" has=""
     [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
-    [ -d "$BASE/accounts/A" ] && hasA=1
-    [ -d "$BASE/accounts/B" ] && hasB=1
-    [ -d "$BASE/accounts/C" ] && hasC=1
-    [ -d "$BASE/accounts/D" ] && hasD=1
-    for a in A B C D; do
+    # hasX 对每个槽位都输出 0/1:旧版界面读 hasA..hasD,新版读 accounts 列表,
+    # 两边都不能断。多出来的 hasE..hasH 对旧界面是未知字段,直接忽略。
+    for a in $(slots); do
         dir="$BASE/accounts/$a"
-        [ -d "$dir" ] || continue
-        accounts="${accounts:+$accounts,}$a"
-        size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
-        stamp=$(date -r "$dir" '+%Y-%m-%d' 2>/dev/null)
-        extras="$extras acc$a=${size:-?}@${stamp:-?}"
-        # Claude Code 那半边单独报:它不在 accounts/ 里,体积也不小(实测 151M),
-        # 混进 acc 会让「这个槽位多大」对不上磁盘。
-        if cli_slot_has_payload "$a"; then
-            csize=$(du -sh "$CLI_BASE/$a" 2>/dev/null | awk '{print $1}')
-            cstamp=$(date -r "$CLI_BASE/$a" '+%Y-%m-%d' 2>/dev/null)
-            extras="$extras cli$a=${csize:-?}@${cstamp:-?}"
+        if [ -d "$dir" ]; then
+            has="$has has$a=1"
+            accounts="${accounts:+$accounts,}$a"
+            size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+            stamp=$(date -r "$dir" '+%Y-%m-%d' 2>/dev/null)
+            extras="$extras acc$a=${size:-?}@${stamp:-?}"
+            # Claude Code 那半边单独报:它不在 accounts/ 里,体积也不小(实测 151M),
+            # 混进 acc 会让「这个槽位多大」对不上磁盘。
+            if cli_slot_has_payload "$a"; then
+                csize=$(du -sh "$CLI_BASE/$a" 2>/dev/null | awk '{print $1}')
+                cstamp=$(date -r "$CLI_BASE/$a" '+%Y-%m-%d' 2>/dev/null)
+                extras="$extras cli$a=${csize:-?}@${cstamp:-?}"
+            fi
+        else
+            has="$has has$a=0"
         fi
     done
-    echo "current=$cur hasA=$hasA hasB=$hasB hasC=$hasC hasD=$hasD accounts=${accounts:-none}$extras"
+    echo "current=$cur$has accounts=${accounts:-none}$extras"
 }
 
 quit_claude() {
@@ -6244,10 +6285,21 @@ copy_tree() {
 }
 
 # 只接受 A-D 四个账号槽位
+# 槽位名 = 一个大写字母,上限 8 个(A–H)。
+#
+# 原来写死 A|B|C|D:四个槽位是"够用"不是"必须"。实际用起来是
+# 工作号 + 私人号 + 两个客户的,第五个就得先删一个才有位置 —— 而槽位是
+# 一份几百兆的归档,删掉就是真丢。字母表本来就够用,没必要设这个上限。
+# 用函数而不是全局变量:槽位列表被 status 和校验各用一次,写成全局的话
+# 单测只抽函数会漏掉赋值,status 在 set -u 下直接报未绑定变量。
+slots() {
+    printf 'A B C D E F G H\n'
+}
+
 valid_account() {
     case "${1:-}" in
-        A|B|C|D) return 0 ;;
-        *) echo "FAIL:账号必须是 A、B、C 或 D"; return 1 ;;
+        [A-H]) return 0 ;;
+        *) echo "FAIL:不是有效槽位(可用 A–H)"; return 1 ;;
     esac
 }
 
@@ -6471,13 +6523,13 @@ help() {
   checkdetail          逐项检查 16 项环境,每项给出原因和下一步
   check                只输出一行 OK / FAIL,给 App 当启动前的硬性门禁
   watch [间隔] [整轮周期]
-                       运行期看门狗:出口一变或任一项不合格,立刻关掉 Claude
+                       运行期巡检:出口一变或任一项不合格,立刻关掉 Claude
   fix                  一键修复能自动处理的问题(规则、时区、地区、保镖)
   node-scan            只读扫描当前代理组里的候选节点,按纯净度排名并出报告
-                       不切节点 / 不动看门狗 / 不写 IP 漂移;已有实例时只出报告
+                       不切节点 / 不动巡检 / 不写 IP 漂移;已有实例时只出报告
   node-apply           把报告里的最优节点切上去并固定(仅门禁允许时)
                        切前须已停守护、切后复查出口国家,不达标自动回滚
-  switch A|B|C|D       切换到某个账号并启动 Claude
+  switch A–H           切换到某个账号并启动 Claude
   status               当前账号、出口、代理状态的摘要
 
 出问题时
@@ -6504,16 +6556,16 @@ help() {
 
 槽位与出口
   切换账号会连同 Claude Code 的 ~/.claude 一起换;出口可以单独声明:
-  slot-node list                   列出 A-D 各自绑定的出口节点
-  slot-node get <A|B|C|D>          查看某个槽位的绑定(没绑输出 NONE)
-  slot-node set <A|B|C|D> <节点名> 声明固定出口(须先 node-scan,切到该槽位时生效)
-  slot-node clear <A|B|C|D>        解除绑定,切过去时改由本次扫描决定
+  slot-node list                   列出 A–H 各自绑定的出口节点
+  slot-node get <A–H>              查看某个槽位的绑定(没绑输出 NONE)
+  slot-node set <A–H> <节点名>     声明固定出口(须先 node-scan,切到该槽位时生效)
+  slot-node clear <A–H>            解除绑定,切过去时改由本次扫描决定
 
 维护
   update               更新核心脚本(校验 SHA256,自检失败自动回滚)
   update-check         只检查有没有新版本,不写入
-  snapshot-export <A|B|C|D> <file>    导出某个账号的快照
-  snapshot-import <file> <A|B|C|D>    导入快照到某个账号
+  snapshot-export <A–H> <file>        导出某个账号的快照
+  snapshot-import <file> <A–H>        导入快照到某个账号
   export-diagnostics <file>           导出脱敏诊断包(不含 IP、凭据、账号内容)
   get-check-config                    读取检查项开关
   set-check-config <json>             修改检查项开关
@@ -6618,7 +6670,7 @@ case "$operation" in
             get)   slot_node_show "${3:-}" ;;
             set)   slot_node_set "${3:-}" "${4:-}" "${5:-}" ;;
             clear) slot_node_clear "${3:-}" ;;
-            *) echo "FAIL:slot-node 支持 list | get <A-D> | set <A-D> <节点名> | clear <A-D>"; return 1 ;;
+            *) echo "FAIL:slot-node 支持 list | get <A–H> | set <A–H> <节点名> | clear <A–H>"; return 1 ;;
         esac ;;
     watch) watch "${2:-10}" "${3:-6}" ;;
     status) status ;;

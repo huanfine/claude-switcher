@@ -190,6 +190,34 @@ class FailClosedWiringTests(unittest.TestCase):
         self.assertIn("stopWatch()", body)
         self.assertLess(body.index("stopWatch()"), body.index('"drill", "--auto"'))
 
+    def test_drill_restore_confirms_network_before_claiming_success(self):
+        """恢复 TUN 不等于「网回来了」。
+
+        实测故障(2026-11-19):演练结束后 TUN 已经是开的,curl 和浏览器却连不上
+        —— 断开期间那几轮失败的域名解析还留在 DNS 缓存里(fake-ip 模式尤其明显)。
+        用户看到的就是「演练把网搞坏了」。所以恢复必须是三步,少一步都不许说
+        「已恢复」:拉 TUN → 清 DNS 缓存 → 真发一次请求。
+        """
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("drill_restore_tun() {", text)
+        start = text.index("drill_restore_tun() {")
+        body = text[start:text.index("\n}\n", start)]
+        self.assertIn("tun_set true", body)
+        self.assertIn("dscacheutil -flushcache", body)
+        self.assertIn("probe_egress", body)
+        self.assertLess(body.index("tun_set true"), body.index("dscacheutil -flushcache"),
+                        "先拉 TUN 再清缓存,顺序反了清的是旧链路")
+        self.assertLess(body.index("dscacheutil -flushcache"), body.index("probe_egress"),
+                        "清完缓存才发请求,否则考的还是旧解析")
+
+    def test_drill_restore_failure_is_a_failure(self):
+        """网没恢复时退出码不能是 0 —— 否则界面显示「演练完成、一切正常」。"""
+        text = SCRIPT.read_text(encoding="utf-8")
+        drill = text[text.index("\ndrill() {"):]
+        drill = drill[:drill.index("\n}\n")]
+        self.assertIn("drill_restore_tun && restore_ok=1", drill)
+        self.assertIn('[ "$restore_ok" = "1" ] || return 1', drill)
+
     def test_announcement_does_not_overclaim(self):
         """演练可能不通过,公告不能再写「任何场景下零暴露」。"""
         text = APP.read_text(encoding="utf-8")

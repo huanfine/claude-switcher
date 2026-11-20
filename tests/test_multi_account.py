@@ -17,6 +17,9 @@ SOURCE = PROJECT / "core" / "claude-switch.sh"
 TRASH = PROJECT / "_trash"
 
 FUNCTIONS = (
+    # 槽位列表是函数不是全局变量:单测只抽函数,全局赋值抽不到,
+    # status 在 set -u 下会直接报未绑定变量。
+    "slots",
     "valid_account",
     "status",
     "keep_path_safe",
@@ -159,6 +162,25 @@ ditto() {
             self.assertEqual(size, expected_size)
             self.assertEqual(date, expected_date)
 
+    def test_status_lists_slots_beyond_d(self):
+        """槽位不是四个。
+
+        核心和界面都写死过 A|B|C|D:想加第五个就得先删一个,而删掉的是一份
+        几百兆的归档。现在上限是 A–H,status 要把 hasE..hasH 一起报出来,
+        否则界面永远只画四张卡。
+        """
+        for name in ("A", "E", "H"):
+            self.account(name).joinpath("marker").write_text(name, encoding="utf-8")
+        (self.base / "current").write_text("E", encoding="utf-8")
+        result = self.run_shell("status")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = self.fields(result)
+        self.assertEqual(values["accounts"], "A,E,H")
+        self.assertEqual(values["hasE"], "1")
+        self.assertEqual(values["hasH"], "1")
+        self.assertEqual(values["hasF"], "0")
+        self.assertIsNone(values.get("accF"), "没归档的槽位不该有体积字段")
+
     def test_switch_creates_and_uses_new_account_c(self):
         self.account("A").joinpath("marker").write_text("old-A", encoding="utf-8")
         self.account("B").joinpath("marker").write_text("saved-B", encoding="utf-8")
@@ -184,12 +206,13 @@ ditto() {
         (self.base / "current").write_text("A", encoding="utf-8")
         (self.data / "marker").write_text("live-A", encoding="utf-8")
 
-        result = self.run_shell("switch_to E")
+        # 用 Z 而不是 E:E 现在是合法槽位(A–H),拿它当反面用例会静默失效。
+        result = self.run_shell("switch_to Z")
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(result.stdout.startswith("FAIL:"), result.stdout)
         self.assertEqual((self.base / "current").read_text().strip(), "A")
         self.assertEqual((self.data / "marker").read_text(), "live-A")
-        self.assertFalse((self.base / "accounts" / "E").exists())
+        self.assertFalse((self.base / "accounts" / "Z").exists())
         self.assertFalse((self.fixture / "launched").exists())
 
     def test_keep_file_carries_only_listed_files_across_accounts(self):
@@ -363,6 +386,29 @@ ditto() {
             "first-run",
         )
         self.assertFalse((self.base / "keep-stage").exists())
+
+
+class SlotWiringTests(unittest.TestCase):
+    """界面那半边:槽位列表跟着核心走,不能写死四张卡。"""
+
+    def test_app_derives_slots_from_status(self):
+        app = (PROJECT / "app" / "main.swift").read_text(encoding="utf-8")
+        self.assertIn('static let allSlots = ["A", "B", "C", "D", "E", "F", "G", "H"]', app)
+        self.assertIn("letters = visible.sorted()", app)
+        self.assertNotIn("static let accountLetters", app, "槽位列表不能再写死 A–D")
+        # 超过四个要换行,而且换行后的卡宽度要和第一行一致(LazyVGrid 算列宽,
+        # HStack 会把落单的第五张拉成整行)。
+        self.assertIn("LazyVGrid(", app)
+
+    def test_cards_do_not_use_outlines_or_shadows(self):
+        """整屏不画线框、不投影 —— 分层只靠三档底色。
+
+        这两样在浅灰底上都会发灰:阴影晕出一圈过渡带,1pt 描边把每张卡圈起来,
+        线比内容还密。要恢复它们,先改这条测试,别偷偷加回去。
+        """
+        app = (PROJECT / "app" / "main.swift").read_text(encoding="utf-8")
+        self.assertNotIn(".shadow(", app)
+        self.assertNotIn("strokeBorder", app)
 
 
 if __name__ == "__main__":

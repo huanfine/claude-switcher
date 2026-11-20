@@ -88,8 +88,11 @@ esac
         result = subprocess.run(["/bin/bash", str(SCRIPT), "status"], env=self.env,
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0)
+        # 槽位上限是 A–H:hasA..hasH 每个槽位都要报 0/1。
+        # 旧版界面只读 hasA..hasD,多出来的是未知字段,不影响兼容。
         self.assertEqual(result.stdout.strip(),
-                         "current=none hasA=0 hasB=0 hasC=0 hasD=0 accounts=none")
+                         "current=none hasA=0 hasB=0 hasC=0 hasD=0 "
+                         "hasE=0 hasF=0 hasG=0 hasH=0 accounts=none")
         self.assertTrue((self.home / ".claude-switcher/accounts").is_dir())
 
     def test_private_config_and_credentials_do_not_enter_output_or_argv(self):

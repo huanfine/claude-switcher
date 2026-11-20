@@ -517,7 +517,7 @@ final class VM: ObservableObject {
     @Published var loggingEnabled = true
     @Published var settingsMessage = ""
     @Published private(set) var settingsBusy = false
-    /// 只读节点扫描的结果。不放进 isBusy:扫描期间看门狗照常驻守,界面也
+    /// 只读节点扫描的结果。不放进 isBusy:扫描期间巡检照常驻守,界面也
     /// 不该把「重新检查 / 修复 / 切换」全锁住 —— 这一路本来就没有副作用。
     @Published private(set) var nodeScanBusy = false
     @Published var nodeScanReport = ""
@@ -547,7 +547,7 @@ final class VM: ObservableObject {
         nodeScanInfo["GATE"] == "auto-ok" && !(nodeScanInfo["BEST"] ?? "").isEmpty
     }
     @Published var showSettingsSheet = false
-    /// 运行期看门狗已经动手停了 Claude。与「检查没过」不是一回事:
+    /// 运行期巡检已经动手停了 Claude。与「检查没过」不是一回事:
     /// 后者是拉起前的门禁,前者是已经放行之后又被抓回来,必须显眼到不可能忽略。
     @Published private(set) var intercepted = false
     /// 最近一次熔断的真实结果，由脚本的 KILLSTATE 行给出。
@@ -570,14 +570,14 @@ final class VM: ObservableObject {
     /// 已经有落定过的一轮。首轮没有任何旧值可显示,行是一条条落下来的;
     /// 之后每轮保留旧值就地更新 —— 让整列推倒重来会闪,那才是抽搐。
     @Published private(set) var hasSettledOnce = false
-    /// 看门狗是不是正守着。界面上的「驻守中」呼吸动画只看这一个开关。
+    /// 巡检是不是正守着。界面上的「驻守中」呼吸动画只看这一个开关。
     @Published private(set) var guarding = false
     /// 本次驻守从什么时候开始。用来显示「已驻守 2 小时 14 分」。
     @Published private(set) var guardSince: Date?
     /// 最近一次心跳。脚本每跑完一轮巡逻吐一行 `BEAT:<epoch>` ——
     /// 动画必须由它驱动:守护断了心跳就停,动画跟着停,用户才知道出事了。
     @Published private(set) var lastBeat: Date?
-    /// 心跳停了多久算失联。看门狗每 10s 一轮,连丢两轮就该报。
+    /// 心跳停了多久算失联。巡检每 10s 一轮,连丢两轮就该报。
     let beatTimeout: TimeInterval = 26
     /// 记录文件位置。生产是固定路径,测试注入到夹具目录 —— 否则跑测试会读到
     /// 本机真实的拦截历史,断言全凭运气。
@@ -643,7 +643,7 @@ final class VM: ObservableObject {
         refresh()
     }
 
-    /// App 被强杀或崩溃时,它起的看门狗走不到 applicationWillTerminate,会留成孤儿。
+    /// App 被强杀或崩溃时,它起的巡检走不到 applicationWillTerminate,会留成孤儿。
     /// 这些孤儿拿着上一轮的基线继续判,既可能误伤也可能和新的守护打架。
     /// 启动时收掉;脚本那边还有 pidfile 单实例锁兜底,两层都留着。
     ///
@@ -681,7 +681,7 @@ final class VM: ObservableObject {
     /// onLine:每产出一行就回调一次,用于「边查边显示」。它只影响观感,
     /// 判定仍然由 done 里的完整输出决定 —— 流式预览不参与任何通过/失败计算,
     /// 否则半行、重复行都会变成判定输入。
-    /// timeout <= 0 表示不设超时(看门狗是常驻进程,给它一个截止时间等于定时自杀)。
+    /// timeout <= 0 表示不设超时(巡检是常驻进程,给它一个截止时间等于定时自杀)。
     /// onStart: 进程真正起来之后把 Process 交出去,好让调用方持有引用自己收尾 ——
     /// 用 pkill -f 全局匹配去杀,会连别的实例(比如 LaunchAgent 那份)一起带走。
     private func run(_ args: [String], timeout: TimeInterval = 45,
@@ -862,7 +862,7 @@ final class VM: ObservableObject {
         checkEnvironment { _ in self.isBusy = false }
     }
 
-    // ---- 运行期看门狗 ----
+    // ---- 运行期巡检 ----
     // 启动门禁只覆盖「拉起那一刻」。用着用着出口被切、代理掉线,Claude 不会自己停,
     // 会拿着错误的出口继续发请求。watch 补的就是这一段:脚本负责判定和关进程,
     // 界面只负责把原因显示出来。
@@ -894,7 +894,7 @@ final class VM: ObservableObject {
             // 就意味着从现在起没人盯着出口,界面不能还挂着「通过」。
             guard !self.watchStopping else { return }
             self.phase = .failed
-            if self.banner.isEmpty { self.banner = "看门狗已停止，请重新检查" }
+            if self.banner.isEmpty { self.banner = "巡检已停止，请重新检查" }
         }
     }
 
@@ -920,7 +920,7 @@ final class VM: ObservableObject {
         stopReason = reason
         watchStopping = true
         watchActive = false
-        // 不动 isBusy:看门狗停 Claude 与界面上的修复/切换是两条线,
+        // 不动 isBusy:巡检停 Claude 与界面上的修复/切换是两条线,
         // 清掉忙碌标记会让 refresh 的互斥失效,可能并发跑出两个检查。
         phase = .failed
         intercepted = true
@@ -1017,7 +1017,7 @@ final class VM: ObservableObject {
         guard !drilling else { return }
         drilling = true
         drillNote = ""
-        // **必须先把看门狗停掉**。演练就是主动让出口消失,TUN 一断,看门狗那 10 秒
+        // **必须先把巡检停掉**。演练就是主动让出口消失,TUN 一断,巡检那 10 秒
         // 一轮的探测会连丢三次,按它自己的规则就该「连续失败 = 直接停 Claude」——
         // 用户点一下「复验」,结果 Claude 被自己人杀掉,这是最坏的一种副作用。
         // 演练结束后的 refresh() 会按检查结果重新把守护拉起来。
@@ -1042,7 +1042,7 @@ final class VM: ObservableObject {
         return r.succeeded ? "已完成" : "没能完成"
     }
 
-    /// 启动时清理上一个实例留下的看门狗。
+    /// 启动时清理上一个实例留下的巡检。
     ///
     /// 实测(2026-11-19):App 被 SIGTERM 杀掉(比如重新打包前的 pkill)时,
     /// 它起的 `claude-switch.sh watch` 子进程会被 init 收养继续跑 —— 每启动一次
@@ -1061,7 +1061,7 @@ final class VM: ObservableObject {
         let head = raw.split(whereSeparator: { $0 == "\t" || $0 == " " || $0 == "\n" })
             .first.map(String.init) ?? ""
         guard let pid = pid_t(head), pid > 1 else { return }
-        // pid 会被复用。杀之前先确认它确实是看门狗,而不是恰好拿到同一个号的进程。
+        // pid 会被复用。杀之前先确认它确实是巡检,而不是恰好拿到同一个号的进程。
         guard isWatchProcess(pid) else { return }
         kill(pid, SIGKILL)
     }
@@ -1361,7 +1361,7 @@ final class VM: ObservableObject {
                     reportBacked: false, done: done)
     }
 
-    /// 两条解析路径汇合后的共用收尾:看门狗、摘要、账号状态。
+    /// 两条解析路径汇合后的共用收尾:巡检、摘要、账号状态。
     private func finishCheck(passed: Bool, configRows: [String], failedRows: [String],
                              reportBacked: Bool, done: @escaping (Bool) -> Void) {
         // 通过之后才开守护;不通过时把旧的撤掉,免得它拿旧结论继续放行。
@@ -1429,7 +1429,7 @@ final class VM: ObservableObject {
             return false
         }
         guard result.succeeded, let account = fields["current"],
-              ["A", "B", "C", "D", "none"].contains(account) else {
+              account == "none" || Self.allSlots.contains(account) else {
             return reset()
         }
         var known = Set<String>()
@@ -1437,7 +1437,7 @@ final class VM: ObservableObject {
             if list != "none" {
                 for piece in list.split(separator: ",", omittingEmptySubsequences: true) {
                     let letter = String(piece)
-                    guard Self.accountLetters.contains(letter) else { return reset() }
+                    guard Self.allSlots.contains(letter) else { return reset() }
                     known.insert(letter)
                 }
             }
@@ -1449,7 +1449,7 @@ final class VM: ObservableObject {
             }
         }
         var parsed: [String: AccountStamp] = [:]
-        for letter in Self.accountLetters {
+        for letter in Self.allSlots {
             guard let raw = fields["acc\(letter)"] else { continue }
             let parts = raw.split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
             guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return reset() }
@@ -1457,7 +1457,7 @@ final class VM: ObservableObject {
         }
         // CLI 存档是可选字段：老脚本不输出，缺了就当没有，不能因此判 status 失败。
         var cli: [String: AccountStamp] = [:]
-        for letter in Self.accountLetters {
+        for letter in Self.allSlots {
             guard let raw = fields["cli\(letter)"] else { continue }
             let parts = raw.split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
             guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { continue }
@@ -1467,6 +1467,13 @@ final class VM: ObservableObject {
         stamps = parsed
         cliStamps = cli
         archived = known
+        // 卡片列表跟着归档状态走:已有的每个槽位一张卡,再加一张空位卡。
+        // 空位取「第一个没用过的字母」—— 用户按顺序建,不会出现 B 空着却先建 D。
+        var visible = Self.allSlots.filter { known.contains($0) || $0 == account }
+        if let free = Self.allSlots.first(where: { !visible.contains($0) }) {
+            visible.append(free)
+        }
+        letters = visible.sorted()
         // 登录态要跟着切槽位/归档变化重算：切完之后实时档案换了一份，
         // 「当前槽位」的会话有效性也就换了。
         refreshSlotLogin()
@@ -1476,7 +1483,15 @@ final class VM: ObservableObject {
         return true
     }
 
-    static let accountLetters = ["A", "B", "C", "D"]
+    /// 槽位上限由核心脚本决定:A–H 共 8 个(见 core/claude-switch.sh 的 SLOTS)。
+    /// 原来这里和核心都写死四个 —— 槽位是一份几百兆的归档,想加第五个就得先删一个。
+    static let allSlots = ["A", "B", "C", "D", "E", "F", "G", "H"]
+
+    /// 界面上摆出来的卡 = 已归档的槽位 + 一个空位。
+    ///
+    /// 只列已归档的,看不到「还能再加一个」;把 A–H 八张全铺出来,又变成一屏空卡。
+    /// 所以永远只多给一个空位:点它就在那个字母上开新槽,建完自然出现下一个空位。
+    @Published private(set) var letters: [String] = ["A", "B", "C", "D"]
 
     // MARK: - 槽位登录态
     //
@@ -1545,7 +1560,7 @@ final class VM: ObservableObject {
         guard current != "?" else { return }
         DispatchQueue.global(qos: .utility).async {
             var map: [String: SlotLogin] = [:]
-            for letter in Self.accountLetters {
+            for letter in Self.allSlots {
                 map[letter] = Self.probeSlotLogin(letter, current: current)
             }
             DispatchQueue.main.async { self.slotLogin = map }
@@ -1663,7 +1678,7 @@ final class VM: ObservableObject {
     /// 由核心脚本写；这里只取第二个字段，坏行/半行直接跳过。
     func loadSlotNodes() {
         var found: [String: String] = [:]
-        for letter in Self.accountLetters {
+        for letter in Self.allSlots {
             let path = "\(slotNodeRoot)/\(letter)"
             guard let text = try? String(contentsOfFile: path, encoding: .utf8),
                   let line = text.split(separator: "\n").first else { continue }
@@ -1676,7 +1691,7 @@ final class VM: ObservableObject {
     /// 给槽位声明「就走这条线」。不改当前出口，也不切账号 ——
     /// 真正换线路发生在下次切到这个槽位时（optimizeNodeForSwitch）。
     func bindSlotNode(_ slot: String, leaf: String) {
-        guard !isBusy, !leaf.isEmpty, Self.accountLetters.contains(slot), coreAvailable() else { return }
+        guard !isBusy, !leaf.isEmpty, Self.allSlots.contains(slot), coreAvailable() else { return }
         run(["slot-node", "set", slot, leaf], timeout: 15) { [weak self] result in
             guard let self else { return }
             guard result.succeeded, !result.output.contains("FAIL:") else {
@@ -1689,7 +1704,7 @@ final class VM: ObservableObject {
     }
 
     func clearSlotNode(_ slot: String) {
-        guard !isBusy, Self.accountLetters.contains(slot), coreAvailable() else { return }
+        guard !isBusy, Self.allSlots.contains(slot), coreAvailable() else { return }
         run(["slot-node", "clear", slot], timeout: 15) { [weak self] result in
             guard let self else { return }
             guard result.succeeded, !result.output.contains("FAIL:") else {
@@ -1732,7 +1747,7 @@ final class VM: ObservableObject {
     }
 
     /// 扫描完就地更新「更优节点」这一行,不做整轮 refresh。
-    /// refresh() 会先撤掉看门狗再检查 —— 那是「重新检查」的代价,不该让
+    /// refresh() 会先撤掉巡检再检查 —— 那是「重新检查」的代价,不该让
     /// 一个只读扫描顺手把守护停掉。
     func applyNodeScan(_ info: [String: String]) {
         guard let idx = rows.firstIndex(where: { $0.name == "更优节点" }) else { return }
@@ -2155,7 +2170,7 @@ final class VM: ObservableObject {
     }
 
     func switchTo(_ target: String) {
-        guard !isBusy, Self.accountLetters.contains(target) else { return }
+        guard !isBusy, Self.allSlots.contains(target) else { return }
         hideAfterSwitch?.cancel()
         isBusy = true
         switchRequested = true
@@ -2341,13 +2356,15 @@ enum ClaudeTheme {
     // 的暖灰(用户原话:「颜色不太好,想更干净」)—— 暖灰一旦铺满整屏,白卡看起来
     // 像浮在一块旧纸上;而且它和陶土色同属暖色系,语义色(橙、琥珀)压在里面
     // 分不出「是底色还是告警」。
-    // 现在三个面(bg 246 / card 255 / inset 239)都是同一支中性的冷灰,
+    // 现在三个面(bg 239 / card 255 / inset 230)都是同一支中性的冷灰,
     // 只靠明度分层;暖色只剩品牌橙和语义色,一出现就明确是「有话说」。
-    // 明度梯度仍是 9 级 / 16 级:卡与底色差得够开,不必再靠阴影找边界。
-    static let bg = dual((0.965, 0.969, 0.973), (0.075, 0.082, 0.090))          // #F6F7F8 / #131517
+    //
+    // 底色从 246 压到 239:卡片不再描边、不投阴影,白卡要能从页面上「起来」,
+    // 只能靠页面比它暗一档。246 那档差 9 级,不加线时白卡几乎是浮在雾里。
+    static let bg = dual((0.937, 0.945, 0.953), (0.075, 0.082, 0.090))          // #EFF1F3 / #131517
     static let card = dual((1.000, 1.000, 1.000), (0.114, 0.125, 0.137))        // #FFFFFF / #1D2023
     /// 卡内凹槽:空槽位、图标块、输入框。比卡片低一档,不描边。
-    static let inset = dual((0.937, 0.945, 0.953), (0.090, 0.098, 0.106))       // #EFF1F3 / #17191B
+    static let inset = dual((0.937, 0.945, 0.953), (0.098, 0.106, 0.114))       // #EFF1F3 / #191C1E
     /// 唯一的分隔线颜色。用得越少越好 —— 分组靠间距,不靠线。
     static let hairline = dual((0.886, 0.898, 0.910), (0.169, 0.184, 0.200))    // #E2E5E8 / #2B2F33
 
@@ -2691,28 +2708,26 @@ private struct GhostTextButton: View {
 private struct CardSurface: ViewModifier {
     var radius: CGFloat = Geo.cardRadius
     var fill: Color = ClaudeTheme.card
-    // 阴影收了一圈:半径 20 / 下移 12 / 5% 黑,在浅底上是一圈发灰的光晕 ——
-    // 大卡勉强撑得住,小卡(槽位那四张)顶着它就整片发糊,像没对准焦。
-    // 现在是小半径贴边阴影:只负责把卡片从底色上抬起一点点,不画光晕。
-    var shadowRadius: CGFloat = 13
-    var shadowY: CGFloat = 5
-    var shadowAlpha: Double = 0.04
 
     func body(content: Content) -> some View {
         content
             .background(RoundedRectangle(cornerRadius: radius, style: .continuous).fill(fill))
-            .shadow(color: .black.opacity(shadowAlpha), radius: shadowRadius, x: 0, y: shadowY)
     }
 }
 
+// 卡片**不投影、不描边**。
+//
+// 这两样都是「把卡片框出来」的老办法,而它们在这套配色上都会发灰:
+// 阴影是 #F6F7F8 上晕开的一圈过渡带,大卡像没对准焦,小卡各自的影子还会叠进
+// 邻卡的边;1pt 描边则把整屏变成图纸 —— 每张卡、每个内凹面外圈一根线,
+// 线比内容还密,眼睛先看到的是框。
+//
+// 分层改用**底色**:页面(bg) / 卡面(card) / 内凹面(inset) 三档,靠明度分开。
+// 这也是为什么 bg 比原来沉了一档:卡面是纯白,页面要是也接近白,不加线就分不开。
 extension View {
     func cardSurface(radius: CGFloat = Geo.cardRadius,
-                     fill: Color = ClaudeTheme.card,
-                     shadowRadius: CGFloat = 20,
-                     shadowY: CGFloat = 12,
-                     shadowAlpha: Double = 0.05) -> some View {
-        modifier(CardSurface(radius: radius, fill: fill,
-                             shadowRadius: shadowRadius, shadowY: shadowY, shadowAlpha: shadowAlpha))
+                     fill: Color = ClaudeTheme.card) -> some View {
+        modifier(CardSurface(radius: radius, fill: fill))
     }
 }
 
@@ -2818,10 +2833,15 @@ private struct ClaudeBurst: Shape {
 /// 星标画在盾牌内腔偏上:盾牌是上宽下尖的梨形,几何中点在视觉上偏低。
 private struct GuardMark: View {
     var box: CGFloat
+    /// 盾牌本体色。默认墨色（工具栏 / 菜单栏那两处），
+    /// 守护条要跟着状态变色，所以留成参数。
+    var color: Color = ClaudeTheme.ink
+    /// 挖空用的底色。必须等于它**所在的那一层**底色，否则星芒周围会露出一圈异色。
+    var knockout: Color = ClaudeTheme.bg
     /// 盾牌在图标里是 424×530（宽高比 0.8），拉成正方形会变胖，所以按比例给宽度。
     var body: some View {
         ZStack {
-            GuardShield().fill(ClaudeTheme.ink)
+            GuardShield().fill(color)
             // 星芒改成实心形状之后不能再「描边挖空」——它本来就是一整块。
             // 用底色去填,坐在墨色盾牌上就等于挖出了一个洞:和图标那边
             // (拿渐变当裁切区重画一遍)是同一个做法,只是这里底色是纯色。
@@ -2831,11 +2851,11 @@ private struct GuardMark: View {
             // 深色小洞(20pt 上就是一个黑点,像标中间被打了个洞)。
             // 同一个底色填两次,视觉上就是并集,不吃绕数规则的亏。
             Circle()
-                .fill(ClaudeTheme.bg)
+                .fill(knockout)
                 .frame(width: box * 0.52 * 0.30, height: box * 0.52 * 0.30)
                 .offset(y: -box * 0.04)
             ClaudeBurst()
-                .fill(ClaudeTheme.bg)
+                .fill(knockout)
                 .frame(width: box * 0.52, height: box * 0.52)
                 .offset(y: -box * 0.04)
         }
@@ -2895,7 +2915,7 @@ private struct SpinRing: View {
     }
 }
 
-/// 看门狗驻守条。
+/// 巡检驻守条。
 ///
 /// 「它还在盯着」这件事必须看得见 —— 一个静止的「保镖在线」和一张截图没区别。
 /// 但凭据不是循环动画,是右侧那行**每秒自己走字**的「心跳 N 秒前」:
@@ -2912,7 +2932,7 @@ private struct GuardBand: View {
 
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
-    /// 心跳是否新鲜。看门狗 10s 一轮,连丢两轮(26s)才算失联 ——
+    /// 心跳是否新鲜。巡检 10s 一轮,连丢两轮(26s)才算失联 ——
     /// 一次 curl 抖动不该让界面闪红。
     private var fresh: Bool {
         guard vm.guarding else { return false }
@@ -2927,12 +2947,12 @@ private struct GuardBand: View {
     }
 
     private var title: String {
-        // 演练期间看门狗是**我们主动停的**,不是它自己掉了 —— 不区分的话,
-        // 用户点完「复验」会看到带子翻成「看门狗未驻守」,以为演练把守护弄坏了。
-        if vm.drilling { return "看门狗已暂停" }
+        // 演练期间巡检是**我们主动停的**,不是它自己掉了 —— 不区分的话,
+        // 用户点完「复验」会看到带子翻成「巡检未启动」,以为演练把守护弄坏了。
+        if vm.drilling { return "巡检已暂停" }
         if vm.intercepted { return vm.interceptionShortTitle }
-        if !vm.guarding { return "看门狗未驻守" }
-        return fresh ? "运行期看门狗驻守中" : "看门狗失联"
+        if !vm.guarding { return "巡检未启动" }
+        return fresh ? "运行巡检中" : "巡检失联"
     }
 
     private var subtitle: String {
@@ -2995,10 +3015,19 @@ private struct GuardBand: View {
         // 上一版底下还垫着一个 30pt 同色圆盘,两团糊在一起,这就是那条带子
         // 看起来脏的全部原因。线框在同样尺寸下还是「一个图形」,
         // 不会变成一块污渍。
-        Image(systemName: vm.intercepted ? "hand.raised" : "shield")
-            .font(.system(size: 15, weight: .regular))
-            .foregroundColor(tone)
-            .frame(width: 22, height: 22)
+        // 用**自绘品牌标**（和窗口标题、菜单栏图标同一组控制点），不用系统盾牌符号:
+        // 系统那枚是线性图标,整屏已经不画线了,只剩它是几根细线。
+        // 挖空底色取 inset —— 它就坐在那块内凹面上。
+        Group {
+            if vm.intercepted {
+                Image(systemName: "hand.raised.fill")
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundColor(tone)
+            } else {
+                GuardMark(box: 15, color: tone, knockout: ClaudeTheme.inset)
+            }
+        }
+        .frame(width: 22, height: 22)
     }
 
     // MARK: 文案
@@ -3099,7 +3128,9 @@ struct ContentView: View {
             // 两列而不是一列:16 行竖着堆,窗口要么高到离谱,要么矮到要滚动。
             // 等宽由 checkCard 末尾的 maxWidth: .infinity 保证（实测两卡均 464.5pt、间隙 10.5pt）,
             // 这里不要再包一层 frame —— 同一件事说两遍,量高时反而会改到提案高度。
-            HStack(alignment: .top, spacing: Geo.inline) {
+            // 两张清单卡之间 14:它们各自带着 8 行字,hairline 已经没有了,
+            // 只靠 10pt 的缝分家会糊成一张大卡。
+            HStack(alignment: .top, spacing: 14) {
                 checkCard("核心安全基线", note: "不可关闭 · 每次启动都校验", rows: hardRows)
                 checkCard("加固与提示", note: "可关闭 · 关闭后不参与拦截", rows: softRows)
             }
@@ -3238,7 +3269,7 @@ struct ContentView: View {
             // 一屏里每多一条 1pt 的线，界面就多一分图纸感。内凹面本身就是一个
             // 已经存在的表面色（inset），不新增颜色，只是把「换了一件事」写成
             // 「换了一层」。
-            // 这里**只有**看门狗。演练曾经也挂在这块面里 —— 那条「断开演练没通过」
+            // 这里**只有**巡检。演练曾经也挂在这块面里 —— 那条「断开演练没通过」
             // 会一直占着首屏第二行,而它能做的事只有一件:把网断掉一次。
             // 一个只在「主动断网」时才有意义的高危动作,不该靠首屏提示去催;
             // 现在它退到「检查设置 · 高级」里,首屏不再有第二行。
@@ -3382,8 +3413,10 @@ struct ContentView: View {
 
     /// 环径与描边。92 / 3 是「环是边框、数字是主体」的那一档；
     /// 再粗就会盖过环里的字，再细在小尺寸下会断续。
-    private static let ringSize: CGFloat = 94
-    private static let ringStroke: CGFloat = 4
+    private static let ringSize: CGFloat = 96
+    // 4 → 5.5:圆环是这一屏唯一的图形结论,4pt 在 Retina 上细得像一根装饰线,
+    // 和右边 17pt 的标题不成比例。描边加粗后「16/16」才像是被这一圈框住的。
+    private static let ringStroke: CGFloat = 5.5
 
     /// 走多少圈。仍是「通过项数 / 总项数」，不是分数。
     private var ringProgress: CGFloat {
@@ -3603,7 +3636,7 @@ struct ContentView: View {
     // MARK: 账号
 
     private var accountSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 // 分区标题必须比内容更重。之前这里 11pt、行名 12.5pt ——
                 // 标题比正文还小,读者找不到「这一块在讲什么」。
@@ -3631,8 +3664,15 @@ struct ContentView: View {
                 }
             }
 
-            HStack(spacing: 10) {
-                ForEach(VM.accountLetters, id: \.self) { t in
+            // 一行最多四张,超过就换行。
+            //
+            // 用 LazyVGrid 而不是 HStack:LazyVGrid 的列宽是**算出来的**,
+            // 第五张卡落在下一行时仍是四分之一宽;HStack 会把它拉成整行,
+            // 一张卡横在那儿像条广告。
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 200, maximum: 236),
+                                         spacing: 14, alignment: .leading)],
+                      alignment: .leading, spacing: 14) {
+                ForEach(vm.letters, id: \.self) { t in
                     accountCard(t)
                 }
             }
@@ -3755,27 +3795,31 @@ struct ContentView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
-            // 四张卡高度必须一样:空槽位只有一行字,不锁高度就会比邻卡矮一截,
+            // 一排里的卡高度必须一样:空槽位只有一行字,不锁高度就会比邻卡矮一截,
             // 一排里凹下去一块。
             .frame(maxWidth: .infinity, minHeight: 58)
-            // 当前槽位不铺陶土色底 —— 橙色是「需要你注意」的信号,选中不是异常。
-            // 选中态交给字母块:四张卡里唯一的墨底白字,一眼就能找到「是它」。
+            // 当前槽位不铺陶土色底 —— 橙色是「需要你注意」的信号,选中不是异常;
+            // 也不描边(整屏都不描边,这里描一条等于把它从版面上抠出来)。
             //
-            // 槽位卡不投阴影,改成一条发丝描边:四张卡的空隙只有 10pt,
-            // 各自的影子正好叠进邻卡的边上,整排看着灰蒙蒙的。小卡本来就该
-            // 「贴着页面」,不是浮在上面。
-            .cardSurface(radius: Geo.cardRadius, fill: ClaudeTheme.card,
-                         shadowRadius: 0, shadowY: 0, shadowAlpha: 0)
-            .overlay(
-                RoundedRectangle(cornerRadius: Geo.cardRadius, style: .continuous)
-                    // hover 只提亮这条边,不换整张卡的底色。
-                    // 之前 hover 是把整块白底刷成灰底(255→246),
-                    // 指针扫过一排卡,像有人在上面抹了一遍脏手印。
-                    .strokeBorder(hovered ? ClaudeTheme.muted.opacity(0.45) : ClaudeTheme.hairline,
-                                  lineWidth: 1)
-            )
+            // 「哪个在用」改成**一块实心竖条**:贴在卡内左侧 3pt,圆角跟卡走。
+            // 它不是线,是一块颜色;四张卡并排时,扫一眼先看到的就是这条
+            // —— 不用读状态词。
+            // 四张卡统一白面。试过「在用的纯白、其余沉成 inset 灰」——
+            // 灰的那三张读起来像「不可用」,而它们只是没在用。层级交给左边那条
+            // 实心竖条:它是这一排唯一的深色块,眼睛先看到的就是它。
+            .cardSurface(radius: Geo.cardRadius, fill: ClaudeTheme.card)
+            .overlay(alignment: .leading) {
+                if isCurrent {
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(ClaudeTheme.ink)
+                        .frame(width: 3)
+                        .padding(.vertical, 12)
+                        .padding(.leading, 3)
+                }
+            }
             .contentShape(RoundedRectangle(cornerRadius: Geo.cardRadius, style: .continuous))
             .animation(.easeOut(duration: Motion.micro), value: hovered)
+            .animation(.easeOut(duration: Motion.micro), value: isCurrent)
         }
         .buttonStyle(.plain)
         .disabled(vm.isBusy)
@@ -3815,23 +3859,27 @@ struct ContentView: View {
     /// 于是四张卡里再也找不到当前账号。现在补回来,换成 28pt 的一小格:
     /// 一屏最响的仍然是 hero 的环,这一格只负责回答「我在哪个槽位」。
     private func slotLetter(_ t: String, isCurrent: Bool, archived: Bool) -> some View {
-        Text(t)
-            .font(Type.slotLetterFont)
-            .foregroundColor(isCurrent ? ClaudeTheme.card
-                                       : (archived ? ClaudeTheme.ink : ClaudeTheme.faint))
-            .frame(width: 28, height: 28)
-            .background(isCurrent ? ClaudeTheme.ink
-                                  : (archived ? ClaudeTheme.inset : ClaudeTheme.card),
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            // 空槽位用「白底 + 描边」而不是「更浅的灰块」:灰块坐在白卡上
-            // 只剩一团没有边缘的雾,四个字母里就它看不出形状。
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(archived || isCurrent ? Color.clear : ClaudeTheme.hairline,
-                                  lineWidth: 1)
-            )
-            .help(archived ? "账号 \(t) · 独立指纹（环境与凭据独立沙盒）"
-                           : "账号 \(t) · 还没初始化")
+        // 空槽位不画方块,直接放一个「＋」——
+        // 原来它是「白底 + 描边」的小方块,和旁边三个实心字母块并排时,
+        // 整排第四格看着像个没填完的输入框。加号本身就是「这里能加」,
+        // 不需要再给它一个框。
+        Group {
+            if archived || isCurrent {
+                Text(t)
+                    .font(Type.slotLetterFont)
+                    .foregroundColor(isCurrent ? ClaudeTheme.card : ClaudeTheme.ink)
+            } else {
+                Image(systemName: "plus")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(ClaudeTheme.faint)
+            }
+        }
+        .frame(width: 28, height: 28)
+        .background(isCurrent ? ClaudeTheme.ink
+                              : (archived ? ClaudeTheme.inset : Color.clear),
+                    in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .help(archived ? "账号 \(t) · 独立指纹（环境与凭据独立沙盒）"
+                       : "账号 \(t) · 还没初始化,点一下就在这里新建")
     }
 
     /// 槽位 → 出口的绑定菜单。选项只来自最近一次扫描报告，
@@ -3892,16 +3940,23 @@ struct ContentView: View {
 
     private func loginBadge(_ symbol: String, _ text: String,
                             _ tint: Color, _ help: String) -> some View {
-        HStack(spacing: 3) {
-            Image(systemName: symbol)
-                .font(.system(size: 10, weight: .semibold))
+        HStack(spacing: 5) {
+            // 图标 → 5pt 实心点。
+            //
+            // 原来这里是一枚带颜色的 SF 图标 + 同色文字,和左边 13pt 的状态词
+            // 一样响 —— 于是「已登录」和「当前 · 运行中」读起来像同一类结论。
+            // 现在点只负责给颜色(绿/橙),文字退回灰:一眼看到的是状态,
+            // 需要细看时才读到登录态。两个轴靠**字号+颜色**分开,不靠位置。
+            Circle()
+                .fill(tint)
+                .frame(width: 5, height: 5)
             // 12 号 + medium。它回答的是「切过去能不能直接用」，比体积日期重要,
             // 但不该和状态词(13 semibold)抢同一行的第一眼 —— 之前是 13 semibold,
             // 四张卡里那句绿色的「已登录」比「已保存」还响,主次是反的。
             Text(text)
-                .font(Type.microLabelFont)
+                .font(Type.microFont)
+                .foregroundColor(ClaudeTheme.muted)
         }
-        .foregroundColor(tint)
         .lineLimit(1)
         .fixedSize()
         .help(help)
@@ -3909,11 +3964,14 @@ struct ContentView: View {
 
     func accountStateLabel(_ t: String) -> String {
         if vm.current == t {
-            // 直接回答「Claude 这个程序现在开着没有」，不用「上次使用」这种绕的说法：
-            // 「上次使用」说的是历史，用户问的是现在 —— 关着就是关着。
-            // 「使用中 / 未运行」也是四张卡里唯一在描述进程状态的，其余三张
-            // 描述的是档案状态（已保存 / 未初始化），两类信息不会混。
-            return vm.claudeRunning ? "使用中" : "未运行"
+            // 这一行说的是**这个槽位现在是什么**，不是「登录了没有」。
+            // 原来写「使用中 / 未运行」：前者像在说登录态，后者像在说这个槽位坏了,
+            // 而右边的「已登录」又是另一个轴 —— 两个词摆在一行里，谁也说不清
+            // 哪个说的是「我在用它」。现在加「当前」前缀，把轴说清楚：
+            //   当前 · 运行中 = 这个槽位在用，Claude 开着
+            //   当前 · 未启动 = 这个槽位在用，但 Claude 没开
+            // 登录态是右边那一条，和这个轴无关。
+            return vm.claudeRunning ? "当前 · 运行中" : "当前 · 未启动"
         }
         return vm.archived.contains(t) ? "已保存" : "未初始化"
     }
@@ -4121,7 +4179,7 @@ struct ContentView: View {
         let fixMark = fix?.noteMark ?? ("", ClaudeTheme.muted, "")
         // 「保镖在线」的 detail 只有「待命」两个字时,单看像「还没上岗」。
         // 实际含义是「launchd 守护在线、还没拦过任何东西」—— 补上「在线」,
-        // 免得和上面那条「运行期看门狗驻守中」看起来互相矛盾。
+        // 免得和上面那条「运行巡检中」看起来互相矛盾。
         let value = (row.name == "保镖在线" && row.detail == "待命")
             ? "在线 · 待命"
             : (row.detail.isEmpty ? stateWord(row.state) : row.detail)
@@ -4606,7 +4664,7 @@ struct IncidentHistorySheet: View {
                         Text("拦截记录")
                             .font(Type.titleFont)
                             .foregroundColor(ClaudeTheme.ink)
-                        Text("看门狗真的动手停过 Claude 的事件，最多保留 50 条")
+                        Text("巡检真的动手停过 Claude 的事件，最多保留 50 条")
                             .font(Type.microFont)
                             .foregroundColor(ClaudeTheme.muted)
                     }
@@ -4796,7 +4854,7 @@ struct CheckSettingsView: View {
             Button("开始演练") { vm.runDrill() }
         } message: {
             Text("""
-            演练会关掉 TUN 大约 20–60 秒，这期间本机上不了网；结束后自动恢复，看门狗也会重新驻守。
+            演练会关掉 TUN 大约 20–60 秒，这期间本机上不了网；结束后自动恢复，巡检也会重新驻守。
             如果断开后本机仍能连上外网，说明代理一挂就会漏 —— 那正是要查出来的事。
             """)
         }
@@ -4804,7 +4862,7 @@ struct CheckSettingsView: View {
 
     // MARK: 代理断开演练
 
-    /// 这块原来在首屏 hero 卡的「守护面」里,和看门狗并排。
+    /// 这块原来在首屏 hero 卡的「守护面」里,和巡检并排。
     ///
     /// 摆在那里的问题是它的**唯一动作是把本机的网断掉一次**:一条常驻在首屏
     /// 第二行的提示,会一直催人去点一个高危动作;而它真正需要的恰恰相反 ——
@@ -4830,7 +4888,7 @@ struct CheckSettingsView: View {
                     Button(vm.drilling ? "演练中…" : "开始演练") { showDrillConfirm = true }
                         .disabled(vm.drilling || vm.isBusy)
                 }
-                Text("会主动关掉 TUN 约 20–60 秒:这段时间本机真的上不了网,正在跑的下载、通话、命令都会断。结束后自动恢复 TUN、重新检查并恢复看门狗。只在这台机器当下可以断网时做。")
+                Text("会主动关掉 TUN 约 20–60 秒:这段时间本机真的上不了网,正在跑的下载、通话、命令都会断。结束后自动恢复 TUN、重新检查并恢复巡检。只在这台机器当下可以断网时做。")
                     .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.faint)
                     .fixedSize(horizontal: false, vertical: true)
@@ -4893,7 +4951,7 @@ struct CheckSettingsView: View {
 ///
 /// 门禁原来还看「存过几个槽位」—— 那是死条件,槽位是常驻资产,存过一次就
 /// 永远为真,于是这个按钮对任何用过本工具的人都不出现。现在只看「Claude 在
-/// 不在跑」和「看门狗在不在驻守」这两个瞬时事实。
+/// 不在跑」和「巡检在不在驻守」这两个瞬时事实。
 ///
 /// 换槽位时这条链会自己走一遍(见 VM.optimizeNodeForSwitch),不必等用户点。
 /// 切换动作归 VM.applyBestNode / 脚本 node-apply,面板不自己改线路。
@@ -4947,7 +5005,7 @@ struct NodeScanSheet: View {
                     Text("门禁允许自动应用 · 停守护、只切一次、复查出口")
                         .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
                 } else {
-                    Text("Claude 在跑或看门狗仍驻守时只生成报告,不会自动切换节点")
+                    Text("Claude 在跑或巡检仍驻守时只生成报告,不会自动切换节点")
                         .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
                 }
                 Spacer()
@@ -5137,7 +5195,7 @@ struct NoticeView: View {
     let sections: [(String, String)] = [
         ("Full-Tunnel 全流量接管", "基于 TUN 虚拟网卡的内核级流量劫持，配合 Fake-IP DNS 解析机制，包括 UDP 在内的全部出站流量在网络栈底层被强制路由至加密隧道，应用层无法旁路。"),
         ("Environment Audit 环境一致性审计", "每次启动前执行 16 项环境指纹审计：Egress IP 归属地与 ASN 属性、时区与 Geo-location 一致性、Locale、IPv6 双栈旁路、DNS Leak、WebRTC/STUN 多节点交叉探测等。硬性安全项失败即 Block-on-Fail；仅显式配置的非关键项可跳过或降级，skip 不表示通过。"),
-        ("Kill-Switch 断网急停", "常驻守护进程以 10 秒周期巡检隧道健康度，隧道中断即刻终止受保护进程，将裸连窗口压缩到秒级。进程级急停，非防火墙级保证，边界详见 SECURITY.md。"),
+        ("Kill-Switch 断网急停", "常驻守护进程每 10 秒复查一次隧道健康度，中断即刻终止受保护进程，把裸连窗口压到秒级。进程级急停，非防火墙级保证，边界详见 SECURITY.md。"),
         ("Pinned Routing 域名置顶路由", "目标服务全家族域名及其生态依赖（Turnstile 人机验证、Telemetry 遥测、Payment 支付、Support 组件）置顶锁定代理路由，优先级高于任何第三方分流规则集，免疫规则库误判。"),
         ("Session Isolation 会话隔离快照", "多账号采用完整快照隔离：各账号持有独立的 Device Fingerprint、OAuth Credential 与本地状态，切换即物理交换数据卷，账号间零交叉污染。"),
         ("Drift Self-Healing 配置漂移自愈", "针对系统时区漂移、代理组件升级导致的配置重置等常见问题，内置 Watchdog 周期性校验并自动回滚至基线状态，全程留痕、可审计。"),
@@ -5328,7 +5386,7 @@ struct LatencyInsightSheet: View {
                      note: peak.map { clockText($0.at) } ?? "暂无采样",
                      tint: ClaudeTheme.warning, symbol: "exclamationmark.triangle.fill")
             statTile("累计拦截", "\(vm.incidents.count)", unit: "次",
-                     note: vm.incidents.isEmpty ? "无记录" : "看门狗实际动手过",
+                     note: vm.incidents.isEmpty ? "无记录" : "巡检实际动手过",
                      tint: ClaudeTheme.error, symbol: "shield.lefthalf.filled")
         }
     }
@@ -5462,7 +5520,7 @@ struct LatencyInsightSheet: View {
                     .foregroundColor(ClaudeTheme.faint)
             }
             if vm.incidents.isEmpty {
-                Text("还没有拦截记录。看门狗没有动过手，就是最好的状态。")
+                Text("还没有拦截记录。巡检没有动过手，就是最好的状态。")
                     .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.muted)
                     .padding(.vertical, 6)
@@ -5893,10 +5951,15 @@ private struct ToastCard: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(ClaudeTheme.card)
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(ClaudeTheme.hairline, lineWidth: 1)
-        )
+        // 浮层不描边(整屏都不描边),改在左边压一条实心色条 ——
+        // 它浮在任意背景上,需要一点「边缘」,而一块颜色比一根线干净得多。
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(ClaudeTheme.bad)
+                .frame(width: 4)
+                .padding(.vertical, 14)
+                .padding(.leading, 1)
+        }
     }
 }
 
@@ -5946,7 +6009,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DockPreference.apply()
-        // 先收掉上一个实例的看门狗,再起自己的 —— 顺序反了就会留下孤儿。
+        // 先收掉上一个实例的巡检,再起自己的 —— 顺序反了就会留下孤儿。
         VM.killStaleWatcherAtLaunch()
         installSignalHandlers()
         // `--dark` 强制深色外观。主题是深浅两套成对的颜色值,不实际渲一遍就看不出
@@ -6084,7 +6147,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 SnapshotWriter.write(ContentView(vm: self.vm, measureOnly: true,
                                                  measureWidth: width), width: width, to: path)
             }
-            // 截完就走,但看门狗是我们起的子进程 —— 直接 exit 会把它留成孤儿,
+            // 截完就走,但巡检是我们起的子进程 —— 直接 exit 会把它留成孤儿,
             // 之后它继续按自己的规则停 Claude。先收掉再退。
             self.vm.stopWatch()
             exit(0)
@@ -6149,7 +6212,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return false
     }
 
-    /// 被信号杀掉时也要把看门狗带走。
+    /// 被信号杀掉时也要把巡检带走。
     ///
     /// `.accessory` 应用没有「退出前询问」的机会:重新打包、`pkill`、注销,
     /// 进程说没就没,而 watch 是这个进程的**子进程**,不会跟着消失 ——

@@ -249,19 +249,21 @@ struct MenuBarModelTests {
                 // 卡片是两行:第一行状态,第二行体积和日期。两行都要断言,
                 // 否则状态和它的存档信息对不上也发现不了。
                 //
-                // 状态词描述的是**槽位此刻的事实**,不是「你在用哪个账号」:
-                // Claude 关着就是「未运行」,开着才是「使用中」。
-                // 之前这里断言的是「当前账号」—— 那只是切换器的指针,
-                // 用户没登录、没打开 Claude 也会看到「当前账号」,会误以为在用它。
-                // 再之前断言的是「上次使用」—— 那是历史,用户问的是现在。
-                try expect(card.accountStateLabel("A") == "未运行" && card.accountSubtitle("A") == "1.2G · 10-20",
-                           "Claude 未运行时,当前槽位应写「未运行」")
+                // 状态词描述的是**槽位此刻的事实**,不是「你在用哪个账号」,
+                // 也不是「登录了没有」—— 登录态是右边那条独立的小字。
+                // 所以它带「当前」前缀把轴说明白:
+                //   当前 · 运行中 = 这个槽位在用,Claude 开着
+                //   当前 · 未启动 = 这个槽位在用,但 Claude 没开
+                // 原来写「使用中 / 未运行」:前者和右边的「已登录」读起来像同一类
+                // 结论,后者又像在说这个槽位坏了。
+                try expect(card.accountStateLabel("A") == "当前 · 未启动" && card.accountSubtitle("A") == "1.2G · 10-20",
+                           "Claude 未启动时,当前槽位应写「当前 · 未启动」")
                 #if CLAUDE_SWITCHER_TESTS
                 vm.setClaudeRunningForTest(true)
-                try expect(card.accountStateLabel("A") == "使用中",
-                           "Claude 在运行时,当前槽位应写「使用中」")
+                try expect(card.accountStateLabel("A") == "当前 · 运行中",
+                           "Claude 在运行时,当前槽位应写「当前 · 运行中」")
                 try expect(card.accountStateLabel("B") == "已保存",
-                           "非当前槽位不应跟着变成「使用中」")
+                           "非当前槽位不该跟着变成「当前 · 运行中」")
                 vm.setClaudeRunningForTest(false)
                 #endif
                 try expect(card.accountStateLabel("B") == "已保存" && card.accountSubtitle("B") == "900M · 10-19",
@@ -287,7 +289,8 @@ struct MenuBarModelTests {
                 vm.start(); try f.idle(vm)
                 try expect(vm.current == "B" && vm.archived == Set(["A", "B"]), "旧版 status 应回退为 A/B")
             case "invalid_multi_account_status":
-                try f.write("status", "current=A hasA=1 hasB=0 hasC=0 hasD=0 accounts=A,E\n")
+                // 用 Z 当非法值:E 现在是合法槽位(A–H),拿它当反例会静默失效。
+                try f.write("status", "current=A hasA=1 hasB=0 hasC=0 hasD=0 accounts=A,Z\n")
                 let vm = f.vm()
                 try f.deniedSwitch(vm)
                 try expect(vm.current == "未知", "非法账号列表不可进入界面")

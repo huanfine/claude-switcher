@@ -80,6 +80,21 @@ class CliSlotTests(unittest.TestCase):
         (self.cli_dir / "session").write_text(tag, encoding="utf-8")
         self.cli_json.write_text('{"account":"%s"}' % tag, encoding="utf-8")
 
+    def test_slots_go_past_d(self):
+        """槽位上限是 A–H,不是 A–D。
+
+        这条原来不成立:核心与界面两头都写死四个字母,想加第五个得先删掉
+        一个已有归档。删的是几百兆账号数据,不是改个配置。
+        """
+        allow = self.run_shell(
+            'for s in A D E H; do valid_account "$s" || echo "REJECT-$s"; done',
+            functions=[self.valid])
+        self.assertEqual(allow.stdout.strip(), "")
+        deny = self.run_shell(
+            'for s in I Z 1 ""; do valid_account "$s" >/dev/null || echo "DENY-$s"; done',
+            functions=[self.valid])
+        self.assertEqual(deny.stdout.strip().splitlines(), ["DENY-I", "DENY-Z", "DENY-1", "DENY-"])
+
     # ---- 归档 ----
 
     def test_archive_moves_both_paths_into_the_slot(self):
@@ -221,7 +236,7 @@ class SlotNodeBindingTests(unittest.TestCase):
         self.assertIn("还没有扫描报告", run.stdout)
         self.scan_file.write_text("SELECTOR=🧠 AI·干净IP\n", encoding="utf-8")
         run = self.shell('slot_node_set Z "鱼9" || true')
-        self.assertIn("账号必须是 A、B、C 或 D", run.stdout)
+        self.assertIn("不是有效槽位", run.stdout)
         self.assertFalse((self.slot_node_dir / "Z").exists())
 
     def test_app_reads_the_same_directory_the_core_writes(self):
