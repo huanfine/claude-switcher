@@ -2505,9 +2505,9 @@ enum Rhythm {
     static let cardH: CGFloat = 14         // 卡头左右
     static let rowH: CGFloat = 8           // 行左右(悬停底色用)
     static let listInset: CGFloat = 6      // 行容器相对卡片的内缩
-    static let rowV: CGFloat = 10          // 行上下 —— 呼吸感主要来源
-    static let cardTop: CGFloat = 18
-    static let cardBottom: CGFloat = 14
+    static let rowV: CGFloat = 12          // 行上下 —— 呼吸感主要来源
+    static let cardTop: CGFloat = 20
+    static let cardBottom: CGFloat = 16
     // 文字轴 = cardH + icon + gap = 50。上面那行关系式就是它,不再单列常量 ——
     // 原来这里有个没人用的 `textAxis = 48`,和真值差 2:一个不参与布局的常量
     // 写着「文字轴 = 48」,是账本和真源不一致,已删。
@@ -2940,10 +2940,11 @@ private struct GuardBand: View {
         if vm.intercepted { return "下一次重新检查通过后才会继续守护" }
         if !vm.guarding { return "检查通过后自动开始守护 · 点「重新检查」" }
         if !fresh { return "超过 \(Int(vm.beatTimeout)) 秒没收到心跳 · 守护可能已中断" }
-        // 「保镖在线」那一行说的是 root 装的 launchd 守护,这里说的是 App 自己
-        // 起的运行期看门狗 —— 两套机制,名字必须在文案里分清,否则用户会以为
-        // 同一件事被报了两次,还一好一坏。
-        return "随 App 常驻 · 每 10 秒巡逻一轮，出口变化立刻停掉 Claude"
+        // 正常态**不写字**。原来这里常驻一句「随 App 常驻 · 每 10 秒巡逻一轮,
+        // 出口变化立刻停掉 Claude」—— 它解释的是机制,不是状态:一个每屏都写着
+        // 「我在正常工作」的注脚,读三次之后就只是背景噪点,还占掉一行呼吸。
+        // 标题「驻守中」+ 右边自己走字的心跳已经说完了。机制留在 tooltip 里。
+        return ""
     }
 
     var body: some View {
@@ -2954,10 +2955,12 @@ private struct GuardBand: View {
                 Text(title)
                     .font(Type.bodyStrongFont)
                     .foregroundColor(fresh ? ClaudeTheme.ink : tone)
-                Text(subtitle)
-                    .font(Type.microFont)
-                    .foregroundColor(ClaudeTheme.faint)
-                    .lineLimit(1)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(Type.microFont)
+                        .foregroundColor(ClaudeTheme.faint)
+                        .lineLimit(1)
+                }
             }
 
             Spacer(minLength: 10)
@@ -2976,6 +2979,9 @@ private struct GuardBand: View {
         // 否则这枚图标会比上面那枚圆环左边缺 18pt，两张卡的左边缘对不上）。
         .frame(maxWidth: .infinity, alignment: .leading)
         .onReceive(tick) { now = $0 }
+        // 正常态那句机制说明（「随 App 常驻 · 每 10 秒巡逻一轮」）不在版面上,
+        // 但也不能丢 —— 想知道「它到底在盯什么」的人,悬停就能读到。
+        .help("随 App 常驻 · 每 10 秒巡逻一轮，出口变化立刻停掉 Claude")
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title)，\(subtitle)，\(metaText)")
     }
@@ -3036,9 +3042,6 @@ struct ContentView: View {
     @State private var showHistory = false
     /// `--latency` 直接打开洞察窗,只为了截图/回归时不用手点。
     @State private var showLatency = CommandLine.arguments.contains("--latency")
-    // `--drill-test` 直接把确认框打开,用来核对文案和按钮(和 --notify-test 同款):
-    // 真点一次会断网 20–60 秒,不适合每次改文案都跑一遍。
-    @State private var showDrillConfirm = CommandLine.arguments.contains("--drill-test")
     @State private var hoveredRow: String?
     @State private var hoveredAccount: String?
 
@@ -3083,17 +3086,6 @@ struct ContentView: View {
         .sheet(isPresented: $showHistory) { IncidentHistorySheet(vm: vm) }
         .sheet(isPresented: $showLatency) { LatencyInsightSheet(vm: vm) }
         .sheet(isPresented: $vm.showNodeScan) { NodeScanSheet(vm: vm) }
-        // 演练会真的断网,不能一点就走。说清楚「断多久、断的是什么、结束后会怎样」,
-        // 再让人决定 —— 这个动作的全部价值就是「真的断一次」,所以也不能悄悄做。
-        .alert("做一次代理断开演练？", isPresented: $showDrillConfirm) {
-            Button("取消", role: .cancel) {}
-            Button("开始演练") { vm.runDrill() }
-        } message: {
-            Text("""
-            演练会关掉 TUN 大约 20–60 秒，这期间本机上不了网；结束后自动恢复，看门狗也会重新驻守。
-            如果断开后本机仍能连上外网，说明代理一挂就会漏 —— 那正是要查出来的事。
-            """)
-        }
     }
 
     /// 主区内容。窗口高度就是按它量出来的,所以量高模式下必须和滚动模式
@@ -3108,8 +3100,8 @@ struct ContentView: View {
             // 等宽由 checkCard 末尾的 maxWidth: .infinity 保证（实测两卡均 464.5pt、间隙 10.5pt）,
             // 这里不要再包一层 frame —— 同一件事说两遍,量高时反而会改到提案高度。
             HStack(alignment: .top, spacing: Geo.inline) {
-                checkCard("核心安全基线", subtitle: "不可关闭 · 每次启动都校验", rows: hardRows)
-                checkCard("加固与提示", subtitle: "可关闭 · 关闭后不参与拦截", rows: softRows)
+                checkCard("核心安全基线", note: "不可关闭 · 每次启动都校验", rows: hardRows)
+                checkCard("加固与提示", note: "可关闭 · 关闭后不参与拦截", rows: softRows)
             }
         }
         .padding(.horizontal, Geo.gutter + 2)
@@ -3246,14 +3238,11 @@ struct ContentView: View {
             // 一屏里每多一条 1pt 的线，界面就多一分图纸感。内凹面本身就是一个
             // 已经存在的表面色（inset），不新增颜色，只是把「换了一件事」写成
             // 「换了一层」。
-            VStack(spacing: 10) {
-                GuardBand(vm: vm)
-                // 守护的第二条凭据:代理断开演练。两行同一个内凹面里 ——
-                // 「现在守着」和「断了也守得住」本来就是一件事的两句。
-                if let drill = drillState {
-                    drillRow(drill)
-                }
-            }
+            // 这里**只有**看门狗。演练曾经也挂在这块面里 —— 那条「断开演练没通过」
+            // 会一直占着首屏第二行,而它能做的事只有一件:把网断掉一次。
+            // 一个只在「主动断网」时才有意义的高危动作,不该靠首屏提示去催;
+            // 现在它退到「检查设置 · 高级」里,首屏不再有第二行。
+            GuardBand(vm: vm)
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
             .background(
@@ -3572,101 +3561,6 @@ struct ContentView: View {
 
     // MARK: 提示条
 
-    /// 演练结果的**一句话**。它不再是屏幕顶上那条横贯整窗的米色带子 ——
-    /// 那条带子没有动作、没有日期层级、还占掉整屏最贵的一行,用户读完只能焦虑。
-    /// 现在它降级成 hero 卡里「守护面」的第二行,和看门狗并排,右边带一个能点的
-    /// 「复验」。文案只回答两件事:上次什么时候测的、结论要不要现在处理。
-    private var drillState: (title: String, detail: String, tone: Color, action: String)? {
-        if vm.drilling {
-            return ("正在做代理断开演练", "代理已断开，正在测直连通路 · 结束后自动恢复", ClaudeTheme.brand, "演练中")
-        }
-        if !vm.drillNote.isEmpty {
-            return ("演练结果：\(vm.drillNote)", "跑完会重新检查一遍环境", ClaudeTheme.muted, "再演练")
-        }
-        switch vm.failClosedStatus {
-        case "violated":
-            let age = failClosedAgeText
-            let stale = (failClosedAgeDays ?? 0) > 7
-            // 日期放在括号里,不要写成「断开演练 11 月 1 日，18 天前没通过」——
-            // 那样读起来像「11 月 1 日那天没通过」,而括号才是注脚该有的位置。
-            return ("断开演练没通过\(age.isEmpty ? "" : "（\(age)）")",
-                    "断掉代理后本机仍能直连外网\(stale ? " · 这条证据已过期" : "")",
-                    ClaudeTheme.warning, "复验")
-        case "stale":
-            let age = failClosedAgeText
-            return ("断开演练证据已过期\(age.isEmpty ? "" : "（\(age)）")",
-                    "超过 7 天的结论不算数，网络环境可能已经变了", ClaudeTheme.warning, "复验")
-        case "unverified":
-            return ("还没做过断开演练",
-                    "16 项全绿只说明此刻走了代理，证不了代理一断会不会直连", ClaudeTheme.muted, "开始演练")
-        default:
-            return nil
-        }
-    }
-
-    /// 守护面的第二行:演练结论 + 入口。
-    /// 排版和上面那条看门狗带子严格对齐(图标列 22 + 10 间距 + 两行字),
-    /// 否则同一个内凹面里两条带子的文字轴会差 2~3pt,一看就是两个人拼的。
-    private func drillRow(_ state: (title: String, detail: String, tone: Color, action: String)) -> some View {
-        HStack(spacing: Geo.inline) {
-            Image(systemName: "bolt.horizontal.circle")
-                .font(.system(size: 15, weight: .regular))
-                .foregroundColor(state.tone)
-                .frame(width: 22, height: 22)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(state.title)
-                    .font(Type.bodyStrongFont)
-                    .foregroundColor(ClaudeTheme.ink)
-                    .lineLimit(1)
-                Text(state.detail)
-                    .font(Type.microFont)
-                    .foregroundColor(ClaudeTheme.faint)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 10)
-
-            Button { showDrillConfirm = true } label: {
-                HStack(spacing: 4) {
-                    if vm.drilling { SpinRing(size: 10, lineWidth: 1.5, duration: 0.9, trimEnd: 0.3,
-                                              color: ClaudeTheme.muted) }
-                    Text(state.action)
-                        .font(Type.labelFont)
-                }
-                .foregroundColor(vm.drilling ? ClaudeTheme.faint : ClaudeTheme.brandText)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
-                        .fill(ClaudeTheme.card)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
-                        .strokeBorder(ClaudeTheme.hairline, lineWidth: 1)
-                )
-                .contentShape(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .disabled(vm.drilling || vm.isBusy)
-            .help("断开代理，实测本机还能不能直连外网；结束后自动恢复")
-        }
-    }
-
-    /// 那条演练证据离今天几天。报告里没带时间就是 nil —— 界面不猜日期。
-    private var failClosedAgeDays: Int? {
-        guard let at = vm.failClosedAt else { return nil }
-        return Calendar.current.dateComponents([.day], from: at, to: Date()).day
-    }
-
-    private var failClosedAgeText: String {
-        guard let at = vm.failClosedAt, let days = failClosedAgeDays else { return "" }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "M 月 d 日"
-        return days <= 0 ? f.string(from: at) : "\(f.string(from: at))，\(days) 天前"
-    }
-
     private var noticeStrip: AnyView? {
         if vm.isBusy && !vm.banner.isEmpty && (vm.phase == .fixing || vm.phase == .switching) {
             return nil   // hero 已经把这句说清楚了,不重复
@@ -3718,10 +3612,7 @@ struct ContentView: View {
                 Text("隔离实例槽位")
                     .font(Type.titleFont)
                     .foregroundColor(ClaudeTheme.ink)
-                Text("每个账号独立的环境与凭据")
-                    .font(Type.bodyFont)
-                    .foregroundColor(ClaudeTheme.faint)
-                    .lineLimit(1)
+                    .help("每个账号一套独立的环境与凭据，切换时整包换掉")
                 Spacer(minLength: 6)
                 if !vm.incidents.isEmpty {
                     Button { showHistory = true } label: {
@@ -4046,33 +3937,23 @@ struct ContentView: View {
     private var hardRows: [CheckRow] { vm.rows.filter { !$0.canDisable } }
     private var softRows: [CheckRow] { vm.rows.filter { $0.canDisable } }
 
-    private func checkCard(_ title: String, subtitle: String,
+    private func checkCard(_ title: String, note: String,
                            rows: [CheckRow]) -> some View {
         let checking = rows.contains(where: { vm.rechecking.contains($0.name) })
         return Card {
             VStack(alignment: .leading, spacing: 0) {
-                // 头:标题、副标题、计数。**前面不放图标块**。
+                // 头:标题、计数。**副标题删掉了**。
                 //
-                // 卡头原来挂着一枚 28×28 的浅灰图标块,理由是「章节标题要有指路牌」。
-                // 可这一屏上「块」已经三种了:hero 是大圆环、四张槽位卡是字母块、
-                // 行是裸符号 —— 再加上块,整屏第一列的形态太多,读者说不出哪里乱,
-                // 只看见一排方块大小不一。标题本身就是指路牌:17pt semibold 已经是
-                // 这一屏最大的字,不需要再加一个图形替它喊。
-                //
-                // 去掉块之后卡头从 cardH 起排,和行图标同一条起始边;
-                // 行名在 50(icon + gap),标题在 14 —— 这是「标题挂左、行缩进」的
-                // 常规做法,不是错位。
+                // 「不可关闭 · 每次启动都校验」这句话是对的,但它不是这一屏该说的话 ——
+                // 一张卡的表头只需要回答「这块是什么」,而这句话回答的是「这块的规则」。
+                // 两张卡并排各挂一行 12pt 灰字,读者第一眼看到的是两行小字,
+                // 不是两组结论。规则留在 tooltip 和设置里,表头只留标题。
                 HStack(alignment: .center, spacing: Rhythm.gap) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(title)
-                            .font(Type.titleFont)
-                            .foregroundColor(ClaudeTheme.ink)
-                            .lineLimit(1)
-                        Text(subtitle)
-                            .font(Type.microFont)
-                            .foregroundColor(ClaudeTheme.faint)
-                            .lineLimit(1)
-                    }
+                    Text(title)
+                        .font(Type.titleFont)
+                        .foregroundColor(ClaudeTheme.ink)
+                        .lineLimit(1)
+                        .help(note)
 
                     Spacer(minLength: 8)
 
@@ -4248,7 +4129,14 @@ struct ContentView: View {
         // 行尾一行放不下就截断,而截掉的往往正好是结论 —— 「api:401 · ap…」
         // 后面到底是哪个域挂了、首包多少毫秒,全没了。超过 24 字的详情改放
         // 第二行:宁可这一行高一点,也不能把检查结果吞掉。
-        let detailNeedsOwnLine = !row.detail.isEmpty && (needsAttention || row.detail.count > 24)
+        // 第二行**只给「要你动手」的行**。
+        //
+        // 原来还有一条 `detail.count > 24` 也走第二行:于是「IP 纯净度」「ASN 属性」
+        // 「WebRTC」这些已经通过的行,各自在行下再挂一句 12pt 灰字解释。
+        // 两张卡并排,读者看到的不是十六个结论,是十六行结论加七八行注脚 ——
+        // 满屏小字,而真正该被读的只有失败那两行。
+        // 现在:通过的项一行说完(行名 + 读数/通过),长说明进 tooltip。
+        let detailNeedsOwnLine = needsAttention && !row.detail.isEmpty
         // 重查中的行不清空旧值,只在行尾挂个小转圈。用户能看到「这一项正在核对」,
         // 而不用面对一整屏突然变灰。
         let isRechecking = vm.rechecking.contains(row.name)
@@ -4259,7 +4147,11 @@ struct ContentView: View {
         let confirmOnly = row.state == .ok && ContentView.confirmationWords.contains(row.detail)
         // 右列能不能放「读数」：短详情、且这一项不需要处理。
         // 需要处理的行右端留给动作（修复）或状态词，读数已经写在第二行原因里了。
-        let showsReading = !confirmOnly && !needsAttention && !detailNeedsOwnLine
+        // 长详情（>24 字）右端不塞读数：塞进去只能截断成「api:401 · ap…」,
+        // 一个带着省略号的结论比一个「通过」更让人不安。通过的项就写「通过」,
+        // 完整读数留在 tooltip 里,想查的人悬停即可。
+        let showsReading = !confirmOnly && !needsAttention
+            && !detailNeedsOwnLine && row.detail.count <= 24
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: Rhythm.gap) {
@@ -4626,7 +4518,12 @@ struct ContentView: View {
 
             // 检查中时状态点后面写「检查中」,这里再挂一个「· 检查中」就是
             // 一行里说两遍同一件事。内容一样就不画。
-            if vm.lastCheckSummary != "尚未检查" && vm.lastCheckSummary != footerStatusText {
+            // 「通过」同理:左边已经写着「已就绪」,后面再接一个「· 通过」
+            // 是同一句话说两遍,而且都是小字。「通过(含跳过)」要留 ——
+            // 它多带了「跳过」这个事实。
+            if vm.lastCheckSummary != "尚未检查"
+                && vm.lastCheckSummary != footerStatusText
+                && vm.lastCheckSummary != "通过" {
                 Text("· \(vm.lastCheckSummary)")
                     .font(Type.microFont)
                     .foregroundColor(ClaudeTheme.faint)
@@ -4776,6 +4673,9 @@ struct IncidentHistorySheet: View {
 struct CheckSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var vm: VM
+    // `--drill-test` 直接把确认框打开,用来核对文案和按钮(和 --notify-test 同款):
+    // 真点一次会断网 20–60 秒,不适合每次改文案都跑一遍。
+    @State private var showDrillConfirm = CommandLine.arguments.contains("--drill-test")
 
     var body: some View {
         ZStack {
@@ -4867,6 +4767,8 @@ struct CheckSettingsView: View {
                             }
                             .padding(.vertical, 6)
                         }
+
+                        drillSection
                     }
                 }
 
@@ -4887,6 +4789,98 @@ struct CheckSettingsView: View {
         }
         .frame(width: 520, height: 610)
         .onAppear { vm.loadCheckConfig() }
+    }
+
+    // MARK: 代理断开演练
+
+    /// 这块原来在首屏 hero 卡的「守护面」里,和看门狗并排。
+    ///
+    /// 摆在那里的问题是它的**唯一动作是把本机的网断掉一次**:一条常驻在首屏
+    /// 第二行的提示,会一直催人去点一个高危动作;而它真正需要的恰恰相反 ——
+    /// 人自己挑一个「现在断网也无所谓」的时刻。所以它归「高级」,不归首屏。
+    /// 结论仍然看得见(下面第一句就是结论),只是不再占最贵的那一行。
+    private var drillSection: some View {
+        GroupBox("代理断开演练（高级）") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .foregroundColor(drillTone)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(drillTitle)
+                            .font(Type.bodyFont)
+                            .foregroundColor(ClaudeTheme.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(drillDetail)
+                            .font(Type.microFont)
+                            .foregroundColor(ClaudeTheme.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button(vm.drilling ? "演练中…" : "开始演练") { showDrillConfirm = true }
+                        .disabled(vm.drilling || vm.isBusy)
+                }
+                Text("会主动关掉 TUN 约 20–60 秒:这段时间本机真的上不了网,正在跑的下载、通话、命令都会断。结束后自动恢复 TUN、重新检查并恢复看门狗。只在这台机器当下可以断网时做。")
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.vertical, 6)
+        }
+        .alert("做一次代理断开演练？", isPresented: $showDrillConfirm) {
+            Button("取消", role: .cancel) {}
+            Button("开始演练") { vm.runDrill() }
+        } message: {
+            Text("""
+            演练会关掉 TUN 大约 20–60 秒，这期间本机上不了网；结束后自动恢复，看门狗也会重新驻守。
+            如果断开后本机仍能连上外网，说明代理一挂就会漏 —— 那正是要查出来的事。
+            """)
+        }
+    }
+
+    private var drillTitle: String {
+        if vm.drilling { return "正在演练:代理已断开,正在测直连通路" }
+        if !vm.drillNote.isEmpty { return "刚才的结果:\(vm.drillNote)" }
+        switch vm.failClosedStatus {
+        case "violated": return "上次演练没通过\(failClosedAgeSuffix)"
+        case "stale": return "上次演练的证据已过期\(failClosedAgeSuffix)"
+        default: return "还没做过断开演练"
+        }
+    }
+
+    private var drillDetail: String {
+        if vm.drilling { return "跑完自动恢复,并重新检查一遍环境" }
+        switch vm.failClosedStatus {
+        case "violated":
+            return (failClosedAgeDays ?? 0) > 7
+                ? "断掉代理后本机仍能直连外网 · 这条证据已过期"
+                : "断掉代理后本机仍能直连外网"
+        case "stale":
+            return "超过 7 天的结论不算数,网络环境可能已经变了"
+        default:
+            return "16 项全绿只说明此刻走了代理,证不了代理一断会不会直连"
+        }
+    }
+
+    private var drillTone: Color {
+        if vm.drilling { return ClaudeTheme.brand }
+        return vm.failClosedStatus == "established" || vm.failClosedStatus.isEmpty
+            ? ClaudeTheme.muted
+            : ClaudeTheme.warning
+    }
+
+    /// 那条证据离今天几天。报告里没带时间就是 nil —— 界面不猜日期。
+    private var failClosedAgeDays: Int? {
+        guard let at = vm.failClosedAt else { return nil }
+        return Calendar.current.dateComponents([.day], from: at, to: Date()).day
+    }
+
+    private var failClosedAgeSuffix: String {
+        guard let at = vm.failClosedAt, let days = failClosedAgeDays else { return "" }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "M 月 d 日"
+        let day = days <= 0 ? f.string(from: at) : "\(f.string(from: at)),\(days) 天前"
+        return "(\(day))"
     }
 }
 
@@ -5904,6 +5898,30 @@ private struct ToastCard: View {
     }
 }
 
+/// 把一屏界面离屏渲染成 PNG。
+///
+/// 存在的理由很具体:系统锁屏时 `screencapture -l <window>` 拿不到窗口
+/// (报 could not create image from window),而改配色、调间距这类事情
+/// 不看一眼是没法确认的。离屏渲染走的是本进程自己的绘制,不读屏幕,
+/// 所以锁屏也照画 —— 需要的是「有人把屏幕解锁」之外的核对手段。
+enum SnapshotWriter {
+    static func write(_ content: some View, width: CGFloat, to path: String) {
+        let host = NSHostingView(rootView: content)
+        host.appearance = NSAppearance(named: CommandLine.arguments.contains("--dark")
+                                       ? .darkAqua : .aqua)
+        host.frame = NSRect(x: 0, y: 0, width: width, height: 1200)
+        host.layoutSubtreeIfNeeded()
+        let ideal = host.fittingSize.height
+        host.frame = NSRect(x: 0, y: 0, width: width, height: max(ideal, 320))
+        host.layoutSubtreeIfNeeded()
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let vm: VM
     private(set) var mainWindow: NSWindow?
@@ -5929,6 +5947,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 先收掉上一个实例的看门狗,再起自己的 —— 顺序反了就会留下孤儿。
         VM.killStaleWatcherAtLaunch()
         installSignalHandlers()
+        // `--dark` 强制深色外观。主题是深浅两套成对的颜色值,不实际渲一遍就看不出
+        // 深色那半套的对比度够不够;系统外观不适合为了看一眼去改全局设置。
+        if CommandLine.arguments.contains("--dark") {
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
         // 点拦截通知要能回到这个窗口 —— 这正是它存在的意义。
         Notifier.shared.onActivate = { [weak self] in self?.showMainWindow() }
         Notifier.shared.prepare()
@@ -5954,6 +5977,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.requestUserAttention(.criticalRequest)
         }
         showMainWindow()
+        // 演练现在归「检查设置 · 高级」,`--drill-test` 得先把那张设置打开,
+        // 否则确认框没有落脚的父视图,等于什么都没发生。
+        if CommandLine.arguments.contains("--drill-test") {
+            vm.showSettingsSheet = true
+        }
+        // `--snapshot=<路径>` 把主界面离屏渲染成 PNG 再退出。锁屏时用不了
+        // screencapture,这是唯一还能看到自己画了什么的办法。等 6 秒是为了
+        // 让首轮检查跑完 —— 否则截到的是「正在检查」那半屏。
+        if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--snapshot=") }) {
+            let path = String(arg.dropFirst("--snapshot=".count))
+            // 加 `--snapshot-settings` 就改画「检查设置」那张表 —— 新加的区块
+            // 在 sheet 里,不这么截一遍等于没看过。
+            let settings = CommandLine.arguments.contains("--snapshot-settings")
+            scheduleSnapshot(path: path, width: settings ? 520 : ContentView.width,
+                             settings: settings)
+        }
         vm.start()
         vm.trackClaudeProcess()
         // 检查结果一变,内容高度就变,窗口跟着收放。debounce 是因为一次检查
@@ -6022,6 +6061,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 只要 Dock 里有图标,不要键盘焦点。
     /// 拦截那一刻用的就是这个:图标出现 + 弹跳 = 有地方可点,
     /// 但用户正在别的 App 里打字,不该被我们打断。
+    /// 等首轮检查落定再截。定死一个秒数是不行的:16 项里有一半要跑网络探测,
+    /// 机器慢的时候 6 秒还停在「正在逐项核对」—— 截出来是一屏空卡片。
+    private func scheduleSnapshot(path: String, width: CGFloat, settings: Bool = false,
+                                  waited: Int = 0) {
+        let settled = vm.hasSettledOnce && !vm.isBusy
+        guard settled || waited >= 80 else {            // 最多等 40 秒
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.scheduleSnapshot(path: path, width: width, settings: settings,
+                                      waited: waited + 1)
+            }
+            return
+        }
+        // 落定后行是一条条淡入的,0.35s 后才全部到位。设置面板还要等它自己
+        // 把 checks.json 读回来,否则截到的是「正在读取设置…」。
+        DispatchQueue.main.asyncAfter(deadline: .now() + (settings ? 2.0 : 0.4)) {
+            if settings {
+                SnapshotWriter.write(CheckSettingsView(vm: self.vm), width: 520, to: path)
+            } else {
+                SnapshotWriter.write(ContentView(vm: self.vm, measureOnly: true,
+                                                 measureWidth: width), width: width, to: path)
+            }
+            // 截完就走,但看门狗是我们起的子进程 —— 直接 exit 会把它留成孤儿,
+            // 之后它继续按自己的规则停 Claude。先收掉再退。
+            self.vm.stopWatch()
+            exit(0)
+        }
+    }
+
     private func appearInDockWithoutStealingFocus() {
         if NSApplication.shared.activationPolicy() != .regular {
             NSApplication.shared.setActivationPolicy(.regular)

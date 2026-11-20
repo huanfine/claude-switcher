@@ -168,10 +168,15 @@ class FailClosedWiringTests(unittest.TestCase):
         self.assertIn('case failClosed = "fail_closed"', text)
         # 缺字段按未验证处理,不能因为读不到就当成通过
         self.assertIn('report.failClosed?.status ?? "unverified"', text)
-        # 这条没通过时它必须还看得见。形态变过:从「顶部横贯整窗的一条横幅」
-        # 收成 hero 卡守护面里的第二行,但「看得见」这件事没变。
-        self.assertIn("private var drillState", text)
-        self.assertIn("private func drillRow", text)
+        # 这条结论必须还看得见。形态变过三次:顶部横贯整窗的横幅 → hero 卡守护面
+        # 里的第二行 → 「检查设置 · 高级」。第三次降级的原因是它的唯一动作是
+        # **把本机的网断掉一次**:一条常驻首屏的提示等于一直催人去点一个高危动作,
+        # 而它需要的恰恰是人自己挑一个「现在断网也无所谓」的时刻。
+        self.assertIn('GroupBox("代理断开演练（高级）")', text)
+        self.assertIn("private var drillTitle", text)
+        # 首屏不该再有这条提示行。留着即在催,删掉即看不见 —— 两者都不能接受,
+        # 所以这里同时钉住「首屏没有」和「设置里有」。
+        self.assertNotIn("private var drillState", text)
 
     def test_drill_entry_pauses_watchdog_first(self):
         """演练会主动让出口消失 —— 先停看门狗,否则它自己就把 Claude 停了。
