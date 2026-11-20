@@ -168,8 +168,22 @@ class FailClosedWiringTests(unittest.TestCase):
         self.assertIn('case failClosed = "fail_closed"', text)
         # 缺字段按未验证处理,不能因为读不到就当成通过
         self.assertIn('report.failClosed?.status ?? "unverified"', text)
-        self.assertIn("private var failClosedNotice: String?", text)
-        self.assertIn("failClosedStrip", text)
+        # 这条没通过时它必须还看得见。形态变过:从「顶部横贯整窗的一条横幅」
+        # 收成 hero 卡守护面里的第二行,但「看得见」这件事没变。
+        self.assertIn("private var drillState", text)
+        self.assertIn("private func drillRow", text)
+
+    def test_drill_entry_pauses_watchdog_first(self):
+        """演练会主动让出口消失 —— 先停看门狗,否则它自己就把 Claude 停了。
+
+        漏掉这一步的后果不是「少提醒一次」:看门狗 10 秒一轮、连丢三次就
+        执行 stop_claude_now,用户点一下「复验」等于亲手杀掉自己的会话。
+        """
+        text = APP.read_text(encoding="utf-8")
+        start = text.index("func runDrill()")
+        body = text[start:text.index("\n    }\n", start)]
+        self.assertIn("stopWatch()", body)
+        self.assertLess(body.index("stopWatch()"), body.index('"drill", "--auto"'))
 
     def test_announcement_does_not_overclaim(self):
         """演练可能不通过,公告不能再写「任何场景下零暴露」。"""

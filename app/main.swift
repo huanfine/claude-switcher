@@ -490,7 +490,16 @@ final class VM: ObservableObject {
         f.formatOptions = [.withInternetDateTime]
         if let d = f.date(from: raw) { return d }
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f.date(from: raw)
+        if let d = f.date(from: raw) { return d }
+        // 第二种形状:`2026-11-01 02:27:06`。这不是 ISO —— 它来自
+        // `drill-record` 那一侧,是 `date '+%F %T'` 的本地时间、不带时区。
+        // 只按 ISO 解的话,演练计数器在的时候日期就永远读不出来(表现为
+        // 有时显示「11 月 1 日，18 天前」、有时只剩一句「没通过」)。
+        let local = DateFormatter()
+        local.locale = Locale(identifier: "en_US_POSIX")
+        local.timeZone = TimeZone.current
+        local.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return local.date(from: raw)
     }
 
     /// fail-closed 证据状态。空 = 还没检查过；旧核心不报这个字段，按「未验证」处理。
@@ -992,6 +1001,57 @@ final class VM: ObservableObject {
             #endif
         }
         watchProcess = nil
+    }
+
+    // ---- 代理断开演练 ----
+    //
+    // 这是**唯一**能证明「代理一断就真的上不了网」的动作。16 项全绿只说明此刻
+    // 流量走了代理:代理一旦挂了,请求是走代理失败还是直接裸奔,只有断开才知道。
+    // 所以它不能只是一句话 —— 顶上挂一条「没做过演练」的横幅,除了让人焦虑之外
+    // 什么也没解决;入口就在这里。
+    @Published private(set) var drilling = false
+    /// 跑完之后的一句话结果。空串 = 这次会话还没跑过。
+    @Published private(set) var drillNote = ""
+
+    func runDrill() {
+        guard !drilling else { return }
+        drilling = true
+        drillNote = ""
+        // **必须先把看门狗停掉**。演练就是主动让出口消失,TUN 一断,看门狗那 10 秒
+        // 一轮的探测会连丢三次,按它自己的规则就该「连续失败 = 直接停 Claude」——
+        // 用户点一下「复验」,结果 Claude 被自己人杀掉,这是最坏的一种副作用。
+        // 演练结束后的 refresh() 会按检查结果重新把守护拉起来。
+        stopWatch()
+        run(["drill", "--auto", "--yes"], timeout: 240) { [weak self] r in
+            guard let self else { return }
+            self.drilling = false
+            self.drillNote = Self.drillSummary(r)
+            self.refresh()
+        }
+    }
+
+    /// 演练输出的第一句人话。脚本的结论行是 `OK:fail-closed 成立——…` /
+    /// `FAIL:fail-closed 不成立——…`,前置条件不满足则是别的 `FAIL:`。
+    private static func drillSummary(_ r: CoreResult) -> String {
+        if r.output.contains("fail-closed 成立") { return "通过 · 断开后没有任何直连出口" }
+        if r.output.contains("fail-closed 不成立") { return "没通过 · 断开后仍有直连出口" }
+        for line in r.output.split(separator: "\n") {
+            if line.hasPrefix("FAIL:") { return String(line.dropFirst(5)) }
+        }
+        if r.output.contains("已取消") { return "已取消" }
+        return r.succeeded ? "已完成" : "没能完成"
+    }
+
+    /// 启动时清理上一个实例留下的看门狗。
+    ///
+    /// 实测(2026-11-19):App 被 SIGTERM 杀掉(比如重新打包前的 pkill)时,
+    /// 它起的 `claude-switch.sh watch` 子进程会被 init 收养继续跑 —— 每启动一次
+    /// 就多一个守护,三份各自判出口,还会互相把对方当「出口变了」。
+    /// 本进程刚起来,pidfile 里那个 pid 只可能来自上一个实例,直接收掉。
+    static func killStaleWatcherAtLaunch() {
+        #if !CLAUDE_SWITCHER_TESTS
+        killWatchByPidfile()
+        #endif
     }
 
     private static func killWatchByPidfile() {
@@ -2277,17 +2337,19 @@ enum ClaudeTheme {
     // 工具界面是平的 —— 一层 linear 渐变加一层 radial 光晕,是「展示页」的手法,
     // 每天看一百遍的人只会觉得脏。
     //
-    // 底色的亮度是按参照图实测定的,不是凭感觉:参照图整页背景的区域中位数是
-    // (249,248,246)。上一版 #F4F2EE 是 244,比它深 5 级 —— 一整屏铺开之后,
-    // 白卡像是浮在一块米色的板子上,而不是浮在「纸白」上,所以整体偏重。
-    // 抬到 249 之后白卡与底色的差从 11 级降到 6 级,卡片之间的分离改由阴影承担
-    // （这也是参照图的做法:它的底 249 / 卡 251 只差 2 级,全靠影子分层）。
-    static let bg = dual((0.976, 0.973, 0.965), (0.106, 0.102, 0.094))          // #F9F8F6 / #1B1A18
-    static let card = dual((1.000, 1.000, 1.000), (0.176, 0.169, 0.157))        // #FFFFFF / #2D2B28
+    // 整屏是**中性灰**,不是暖米色。上一版底色 #F9F8F6 / 凹槽 #F6F4F1 是带黄调
+    // 的暖灰(用户原话:「颜色不太好,想更干净」)—— 暖灰一旦铺满整屏,白卡看起来
+    // 像浮在一块旧纸上;而且它和陶土色同属暖色系,语义色(橙、琥珀)压在里面
+    // 分不出「是底色还是告警」。
+    // 现在三个面(bg 246 / card 255 / inset 239)都是同一支中性的冷灰,
+    // 只靠明度分层;暖色只剩品牌橙和语义色,一出现就明确是「有话说」。
+    // 明度梯度仍是 9 级 / 16 级:卡与底色差得够开,不必再靠阴影找边界。
+    static let bg = dual((0.965, 0.969, 0.973), (0.075, 0.082, 0.090))          // #F6F7F8 / #131517
+    static let card = dual((1.000, 1.000, 1.000), (0.114, 0.125, 0.137))        // #FFFFFF / #1D2023
     /// 卡内凹槽:空槽位、图标块、输入框。比卡片低一档,不描边。
-    static let inset = dual((0.965, 0.957, 0.945), (0.137, 0.132, 0.122))       // #F6F4F1 / #23211F
+    static let inset = dual((0.937, 0.945, 0.953), (0.090, 0.098, 0.106))       // #EFF1F3 / #17191B
     /// 唯一的分隔线颜色。用得越少越好 —— 分组靠间距,不靠线。
-    static let hairline = dual((0.910, 0.898, 0.882), (0.216, 0.208, 0.196))    // #E8E5E1 / #373532
+    static let hairline = dual((0.886, 0.898, 0.910), (0.169, 0.184, 0.200))    // #E2E5E8 / #2B2F33
 
     // MARK: 三级灰(每一档都过 WCAG AA 4.5:1)
     //
@@ -2306,20 +2368,20 @@ enum ClaudeTheme {
     //
     // faint 不能更浅:它是 12–13pt 的注脚,4.6:1 已经是 AA 小字的下限。
     // 所以能动的只有中间那一档,这也是它必须动的原因。
-    static let ink = dual((0.122, 0.114, 0.102), (0.949, 0.937, 0.914))         // #1F1D1A / #F2EFE9 16.8:1
-    static let muted = dual((0.310, 0.290, 0.267), (0.769, 0.737, 0.702))       // #4F4A44 / #C4BCB3  8.8:1
-    static let faint = dual((0.478, 0.455, 0.424), (0.604, 0.576, 0.541))       // #7A746C / #9A938A  4.6:1
+    static let ink = dual((0.090, 0.098, 0.106), (0.945, 0.953, 0.961))         // #17191B / #F1F3F5 17.8:1
+    static let muted = dual((0.290, 0.314, 0.329), (0.714, 0.741, 0.765))       // #4A5054 / #B6BDC3  8.6:1
+    static let faint = dual((0.431, 0.459, 0.478), (0.529, 0.561, 0.584))       // #6E757A / #878F95  4.7:1
 
     // MARK: 语义色
     //
     // 只落在小号文字和图标上,**不铺底、不做彩色 pill**。
     // 铺底的彩色块是最典型的「AI 感」:颜色被当成装饰,一屏五六个色块,
     // 真正异常的那条反而淹在里面。
-    static let brand = dual((0.847, 0.447, 0.329), (0.878, 0.541, 0.424))       // #D87254 / #E08A6C 图标/圆环
-    static let brandText = dual((0.706, 0.325, 0.184), (0.910, 0.631, 0.514))   // #B4532F / #E8A183 4.98:1
-    static let ok = dual((0.180, 0.490, 0.322), (0.435, 0.749, 0.557))          // #2E7D52 / #6FBF8E 5.2:1
-    static let warn = dual((0.651, 0.373, 0.055), (0.878, 0.643, 0.361))        // #A65F0E / #E0A45C 5.0:1
-    static let bad = dual((0.761, 0.282, 0.212), (0.878, 0.439, 0.361))         // #C24836 / #E0705C 4.9:1
+    static let brand = dual((0.808, 0.416, 0.282), (0.886, 0.541, 0.416))       // #CE6A48 / #E28A6A 图标/圆环
+    static let brandText = dual((0.690, 0.314, 0.173), (0.922, 0.659, 0.549))   // #B0502C / #EBA88C 5.4:1
+    static let ok = dual((0.173, 0.478, 0.329), (0.435, 0.749, 0.557))          // #2C7A54 / #6FBF8E 5.2:1
+    static let warn = dual((0.588, 0.376, 0.102), (0.878, 0.643, 0.361))        // #96601A / #E0A45C 5.3:1
+    static let bad = dual((0.737, 0.267, 0.212), (0.878, 0.439, 0.361))         // #BC4436 / #E0705C 5.0:1
 
     // 旧名字保留,只为不惊动尚未迁到的角落;新代码不要再引用。
     static let bgTop = bg
@@ -2859,17 +2921,22 @@ private struct GuardBand: View {
     }
 
     private var tone: Color {
+        if vm.drilling { return ClaudeTheme.muted }
         if !vm.guarding { return ClaudeTheme.muted }
         return fresh ? ClaudeTheme.success : ClaudeTheme.warning
     }
 
     private var title: String {
+        // 演练期间看门狗是**我们主动停的**,不是它自己掉了 —— 不区分的话,
+        // 用户点完「复验」会看到带子翻成「看门狗未驻守」,以为演练把守护弄坏了。
+        if vm.drilling { return "看门狗已暂停" }
         if vm.intercepted { return vm.interceptionShortTitle }
         if !vm.guarding { return "看门狗未驻守" }
         return fresh ? "运行期看门狗驻守中" : "看门狗失联"
     }
 
     private var subtitle: String {
+        if vm.drilling { return "正在做断开演练，跑完自动恢复守护" }
         if vm.intercepted { return "下一次重新检查通过后才会继续守护" }
         if !vm.guarding { return "检查通过后自动开始守护 · 点「重新检查」" }
         if !fresh { return "超过 \(Int(vm.beatTimeout)) 秒没收到心跳 · 守护可能已中断" }
@@ -2969,6 +3036,9 @@ struct ContentView: View {
     @State private var showHistory = false
     /// `--latency` 直接打开洞察窗,只为了截图/回归时不用手点。
     @State private var showLatency = CommandLine.arguments.contains("--latency")
+    // `--drill-test` 直接把确认框打开,用来核对文案和按钮(和 --notify-test 同款):
+    // 真点一次会断网 20–60 秒,不适合每次改文案都跑一遍。
+    @State private var showDrillConfirm = CommandLine.arguments.contains("--drill-test")
     @State private var hoveredRow: String?
     @State private var hoveredAccount: String?
 
@@ -3013,6 +3083,17 @@ struct ContentView: View {
         .sheet(isPresented: $showHistory) { IncidentHistorySheet(vm: vm) }
         .sheet(isPresented: $showLatency) { LatencyInsightSheet(vm: vm) }
         .sheet(isPresented: $vm.showNodeScan) { NodeScanSheet(vm: vm) }
+        // 演练会真的断网,不能一点就走。说清楚「断多久、断的是什么、结束后会怎样」,
+        // 再让人决定 —— 这个动作的全部价值就是「真的断一次」,所以也不能悄悄做。
+        .alert("做一次代理断开演练？", isPresented: $showDrillConfirm) {
+            Button("取消", role: .cancel) {}
+            Button("开始演练") { vm.runDrill() }
+        } message: {
+            Text("""
+            演练会关掉 TUN 大约 20–60 秒，这期间本机上不了网；结束后自动恢复，看门狗也会重新驻守。
+            如果断开后本机仍能连上外网，说明代理一挂就会漏 —— 那正是要查出来的事。
+            """)
+        }
     }
 
     /// 主区内容。窗口高度就是按它量出来的,所以量高模式下必须和滚动模式
@@ -3165,15 +3246,22 @@ struct ContentView: View {
             // 一屏里每多一条 1pt 的线，界面就多一分图纸感。内凹面本身就是一个
             // 已经存在的表面色（inset），不新增颜色，只是把「换了一件事」写成
             // 「换了一层」。
-            GuardBand(vm: vm)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-                .background(
-                    RoundedRectangle(cornerRadius: Geo.innerRadius, style: .continuous)
-                        .fill(ClaudeTheme.inset)
-                )
-                .padding(.horizontal, Geo.group)
-                .padding(.bottom, Geo.group - 10)
+            VStack(spacing: 10) {
+                GuardBand(vm: vm)
+                // 守护的第二条凭据:代理断开演练。两行同一个内凹面里 ——
+                // 「现在守着」和「断了也守得住」本来就是一件事的两句。
+                if let drill = drillState {
+                    drillRow(drill)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(
+                RoundedRectangle(cornerRadius: Geo.innerRadius, style: .continuous)
+                    .fill(ClaudeTheme.inset)
+            )
+            .padding(.horizontal, Geo.group)
+            .padding(.bottom, Geo.group - 10)
             }
         }
     }
@@ -3305,8 +3393,8 @@ struct ContentView: View {
 
     /// 环径与描边。92 / 3 是「环是边框、数字是主体」的那一档；
     /// 再粗就会盖过环里的字，再细在小尺寸下会断续。
-    private static let ringSize: CGFloat = 92
-    private static let ringStroke: CGFloat = 3
+    private static let ringSize: CGFloat = 94
+    private static let ringStroke: CGFloat = 4
 
     /// 走多少圈。仍是「通过项数 / 总项数」，不是分数。
     private var ringProgress: CGFloat {
@@ -3484,30 +3572,84 @@ struct ContentView: View {
 
     // MARK: 提示条
 
-    /// fail-closed 证据的常驻提示。检查全绿恰恰是最需要它的时候:
-    /// 那一屏只证明「流量此刻走了代理」，不证明「代理挂了不会直连」。
-    /// 演练已通过且证据新鲜时不出现，避免变成天天都在的噪声。
-    private var failClosedNotice: String? {
+    /// 演练结果的**一句话**。它不再是屏幕顶上那条横贯整窗的米色带子 ——
+    /// 那条带子没有动作、没有日期层级、还占掉整屏最贵的一行,用户读完只能焦虑。
+    /// 现在它降级成 hero 卡里「守护面」的第二行,和看门狗并排,右边带一个能点的
+    /// 「复验」。文案只回答两件事:上次什么时候测的、结论要不要现在处理。
+    private var drillState: (title: String, detail: String, tone: Color, action: String)? {
+        if vm.drilling {
+            return ("正在做代理断开演练", "代理已断开，正在测直连通路 · 结束后自动恢复", ClaudeTheme.brand, "演练中")
+        }
+        if !vm.drillNote.isEmpty {
+            return ("演练结果：\(vm.drillNote)", "跑完会重新检查一遍环境", ClaudeTheme.muted, "再演练")
+        }
         switch vm.failClosedStatus {
-        // 三条文案原来都以「fail-closed」开头 —— 那是代码里的叫法,用户读到的
-        // 只是一个没头没尾的英文词,既不知道在说哪件事,也不知道要不要管。
-        // 现在每条只说两件事:演练测的是什么、结论对当下意味着什么。
-        //
-        // 还要带上**证据日期**。这条当前对应的记录是 11-01 留下的,离今天 18 天,
-        // 而证据有效期是 7 天 —— 原来那句「演练没通过」读起来像刚刚发生,
-        // 用户会以为自己现在正在裸奔。日期一说出来,该不该现在处理就清楚了。
         case "violated":
             let age = failClosedAgeText
-            let head = age.isEmpty ? "代理断开演练没通过" : "上次代理断开演练（\(age)）没通过"
-            let stale = (failClosedAgeDays ?? 0) > 7 ? " · 这条证据已过期" : ""
-            return "\(head)：断掉代理后本机仍能直连外网\(stale) · 跑 drill 复验，看现在是否还漏"
+            let stale = (failClosedAgeDays ?? 0) > 7
+            // 日期放在括号里,不要写成「断开演练 11 月 1 日，18 天前没通过」——
+            // 那样读起来像「11 月 1 日那天没通过」,而括号才是注脚该有的位置。
+            return ("断开演练没通过\(age.isEmpty ? "" : "（\(age)）")",
+                    "断掉代理后本机仍能直连外网\(stale ? " · 这条证据已过期" : "")",
+                    ClaudeTheme.warning, "复验")
         case "stale":
             let age = failClosedAgeText
-            return "代理断开演练证据已过期\(age.isEmpty ? "" : "（\(age)）") · 跑 drill 复验"
+            return ("断开演练证据已过期\(age.isEmpty ? "" : "（\(age)）")",
+                    "超过 7 天的结论不算数，网络环境可能已经变了", ClaudeTheme.warning, "复验")
         case "unverified":
-            return "还没做过代理断开演练：16 项全绿只说明此刻流量走了代理 · 跑 drill 验证断开后不会直连"
+            return ("还没做过断开演练",
+                    "16 项全绿只说明此刻走了代理，证不了代理一断会不会直连", ClaudeTheme.muted, "开始演练")
         default:
             return nil
+        }
+    }
+
+    /// 守护面的第二行:演练结论 + 入口。
+    /// 排版和上面那条看门狗带子严格对齐(图标列 22 + 10 间距 + 两行字),
+    /// 否则同一个内凹面里两条带子的文字轴会差 2~3pt,一看就是两个人拼的。
+    private func drillRow(_ state: (title: String, detail: String, tone: Color, action: String)) -> some View {
+        HStack(spacing: Geo.inline) {
+            Image(systemName: "bolt.horizontal.circle")
+                .font(.system(size: 15, weight: .regular))
+                .foregroundColor(state.tone)
+                .frame(width: 22, height: 22)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(state.title)
+                    .font(Type.bodyStrongFont)
+                    .foregroundColor(ClaudeTheme.ink)
+                    .lineLimit(1)
+                Text(state.detail)
+                    .font(Type.microFont)
+                    .foregroundColor(ClaudeTheme.faint)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 10)
+
+            Button { showDrillConfirm = true } label: {
+                HStack(spacing: 4) {
+                    if vm.drilling { SpinRing(size: 10, lineWidth: 1.5, duration: 0.9, trimEnd: 0.3,
+                                              color: ClaudeTheme.muted) }
+                    Text(state.action)
+                        .font(Type.labelFont)
+                }
+                .foregroundColor(vm.drilling ? ClaudeTheme.faint : ClaudeTheme.brandText)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
+                        .fill(ClaudeTheme.card)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous)
+                        .strokeBorder(ClaudeTheme.hairline, lineWidth: 1)
+                )
+                .contentShape(RoundedRectangle(cornerRadius: Geo.controlRadius, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .disabled(vm.drilling || vm.isBusy)
+            .help("断开代理，实测本机还能不能直连外网；结束后自动恢复")
         }
     }
 
@@ -3528,10 +3670,6 @@ struct ContentView: View {
     private var noticeStrip: AnyView? {
         if vm.isBusy && !vm.banner.isEmpty && (vm.phase == .fixing || vm.phase == .switching) {
             return nil   // hero 已经把这句说清楚了,不重复
-        }
-        // 演练未通过是最重的一条,不能被「修了几项」的回执挤掉。
-        if vm.phase == .ready, vm.failClosedStatus == "violated", let text = failClosedNotice {
-            return AnyView(failClosedStrip(text))
         }
         if !vm.fixNotice.isEmpty {
             return AnyView(
@@ -3559,26 +3697,7 @@ struct ContentView: View {
                 .background(ClaudeTheme.inset)
             )
         }
-        if vm.phase == .ready, let text = failClosedNotice {
-            return AnyView(failClosedStrip(text))
-        }
         return nil
-    }
-
-    /// 与修复回执同一种表面(中性底 + 着色图标),不引入第三种色块。
-    private func failClosedStrip(_ text: String) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.shield")
-                .font(Type.microLabelFont)
-                .foregroundColor(ClaudeTheme.warning)
-            Text(text)
-                .font(Type.bodyFont)
-                .foregroundColor(ClaudeTheme.ink)
-            Spacer(minLength: 8)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .background(ClaudeTheme.inset)
     }
 
     /// banner 里带「已自动停止 Claude：」前缀,hero 已经说了这件事,去掉免得念两遍。
@@ -5807,6 +5926,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DockPreference.apply()
+        // 先收掉上一个实例的看门狗,再起自己的 —— 顺序反了就会留下孤儿。
+        VM.killStaleWatcherAtLaunch()
+        installSignalHandlers()
         // 点拦截通知要能回到这个窗口 —— 这正是它存在的意义。
         Notifier.shared.onActivate = { [weak self] in self?.showMainWindow() }
         Notifier.shared.prepare()
@@ -5956,6 +6078,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 的人,不会因为弹过一次窗口就永久多出一个图标。
         DockPreference.apply()
         return false
+    }
+
+    /// 被信号杀掉时也要把看门狗带走。
+    ///
+    /// `.accessory` 应用没有「退出前询问」的机会:重新打包、`pkill`、注销,
+    /// 进程说没就没,而 watch 是这个进程的**子进程**,不会跟着消失 ——
+    /// 孤儿守护之后会继续按自己的规则停 Claude,用户只看到「Claude 莫名其妙被停了」。
+    /// 所以 SIGTERM / SIGINT 由自己接:先停守护,再退出。
+    private var signalSources: [DispatchSourceSignal] = []
+
+    private func installSignalHandlers() {
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
+            signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { [weak self] in
+                self?.vm.stopWatch()
+                exit(0)
+            }
+            src.resume()
+            signalSources.append(src)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
