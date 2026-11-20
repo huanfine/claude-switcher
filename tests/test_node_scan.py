@@ -312,6 +312,21 @@ esac''')
         self.assertIn("只出报告", out)
         self.assertIn("自动回滚", out)
 
+    def test_scan_concurrency_stays_at_one_to_protect_free_sources(self):
+        """并发数是资源约束,不是性能旋钮。
+
+        ip_purity 内部已经是四源并行,外面再乘 N 就是 4N 个并发打到免费源上。
+        原来是 3(=12 并发),2026-11-20 实测把 ipinfo 打成 429 之后收成 1。
+        限流的后果不只是慢:源一旦限流就会把结果推进「证据不全」态,而那类结果的
+        重查间隔比正常缓存短得多 —— 越查越限、越限越查。
+        """
+        text = SOURCE.read_text(encoding="utf-8")
+        m = re.search(r"(?m)^NODE_SCAN_PARALLEL=(\d+)", text)
+        self.assertIsNotNone(m, "核心里的 NODE_SCAN_PARALLEL 定义没了")
+        self.assertEqual(int(m.group(1)), 1,
+                         "节点扫描并发被调回 %s:每个 ip_purity 内部已有 4 路并发"
+                         % m.group(1))
+
     # ---- node-apply 的执行门禁:必须**先于**任何内核写操作拦住 ----
 
     def test_apply_rejects_running_claude(self):

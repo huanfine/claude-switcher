@@ -546,7 +546,8 @@ esac''')
         """两源都在,但 ipquery 没给 risk_score:封顶 85,不能当「0 风险」白拿满分。
 
         缺数据的形态是最阴的一种:字段为空 → 罚分算 0 → 100 分 ok,
-        和「验过且干净」的 100 完全一样。现在 85 + 「风险未验证」,并只钉 5 分钟。
+        和「验过且干净」的 100 完全一样。现在 85 + 「风险未验证」,并按
+        PURITY_RETRY_TTL 提前重查,不钉满 24h。
         """
         no_risk = ('{"ip":"203.0.113.10","isp":{"asn":"AS7922",'
                    '"org":"Comcast Cable Communications, LLC",'
@@ -622,7 +623,11 @@ esac''')
 
         实测过:两家源同时超时后,缓存里一直留着「风险源不可达」,
         之后整整一天每次检查都拿这个降级结论当真,哪怕源早就恢复了。
-        现在给这类结果一个「五分钟后过期」的时间戳,读侧逻辑不用分叉。
+        现在给这类结果一个「提前过期」的时间戳,读侧逻辑不用分叉。
+
+        这个提前量原来是 5 分钟,2026-11-20 改成 15 分钟(PURITY_RETRY_TTL=900):
+        巡检每 60 秒跑一次 check,5 分钟一失效等于每 5 分钟打一轮四源并发,
+        288 轮/天落到免费源上,还会形成「越限流越查」的负反馈。
         """
         self.stub_net("", "", IPINFO_RESID)
         state, detail, _ = self.run_detail()
@@ -635,7 +640,9 @@ esac''')
         import time
         remaining = 86400 - (int(time.time()) - int(fields[1]))
         self.assertGreater(remaining, 0, "降级结果不该已经过期")
-        self.assertLessEqual(remaining, 600, "降级结果最多只该留几分钟,实际还剩 %d 秒" % remaining)
+        # 双向钉住:上界防止「提前量被写回 24h」,下界防止「又退回 5 分钟」。
+        self.assertLessEqual(remaining, 1200, "降级结果最多只该留一刻钟,实际还剩 %d 秒" % remaining)
+        self.assertGreater(remaining, 600, "提前量又缩回 5 分钟了,实际还剩 %d 秒" % remaining)
 
         # 负例:证据齐全的结果仍按 24h 缓存,别为了修降级把正常缓存也打短。
         # 先清掉降级那条,否则它会命中缓存、根本走不到「重新打分」这一步。

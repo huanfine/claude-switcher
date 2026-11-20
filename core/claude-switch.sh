@@ -2781,6 +2781,18 @@ ip_class() {
 #                  198.18.x,黑名单命中率全是假的,所以只能用 HTTP 接口。
 PURITY_CACHE_TTL=86400
 
+# 证据不全时的重查间隔。「证据不全」= 源全挂 / 只剩一个源 / risk 字段没取到。
+# 这类结果不能像完整结果那样复用 24 小时(一次网络抖动会把「不确定」钉一整天),
+# 但也不能像原来那样五分钟就作废 —— 2026-11-20 量到了那个代价:
+#   巡检(watch)默认每 60 秒跑一次完整 check,而 check 每次都进 ip_purity;
+#   降级态下缓存五分钟失效 → 每 5 分钟打一轮四源并发 = 288 轮/天 = 1152 个请求
+#   落到四家免费源上,是常态(4 个/天)的 288 倍。
+# 更要紧的是它构成负反馈:某个源限流 → 更可能进降级态 → 查得更勤 → 更容易继续
+# 限流,越限越查、越查越限。实测 ipinfo 已经回过 429(Rate limit hit)。
+# 900 秒把这条路径压到 384 个/天(按源分下来每家 96 个/天),仍是保守值;
+# 出口 IP 变了是新 key,照样立刻重查 —— 这个延迟只影响「同一 IP、源恢复」这一种。
+PURITY_RETRY_TTL=900
+
 # 从扁平 JSON 取标量字段。不引入 jq:检查链路得能在只装了 Xcode 命令行工具的机器上跑,
 # 多一个依赖就多一个装不上的理由。
 _ipfield() {
@@ -3241,12 +3253,12 @@ ip_purity() {
     # 证据不全的结果不能钉住 24h。实测:ipquery / ip-api 同时超时那次,分数被
     # 降级到 70 并写进缓存,之后整整一天每次检查都拿这句「风险源不可达」当结论,
     # 哪怕两家源早就恢复了。做法是给这类结果一个已经「快过期」的时间戳:
-    # 读侧仍按 now-epoch < TTL 判,300 秒后自动重查,逻辑不用分叉。
+    # 读侧仍按 now-epoch < TTL 判,PURITY_RETRY_TTL 秒后自动重查,逻辑不用分叉。
     # 单源可达同理 —— 代理特征可能被漏判,不该把那次的分数当定论。
-    # 「风险未验证」也同理:封顶 85 是保守估计,不是结论,风险源恢复后要立刻重算。
+    # 「风险未验证」也同理:封顶 85 是保守估计,不是结论,风险源恢复后要重算。
     local cache_epoch="$now" lock="$BASE/.purity-cache.lock" got=0 i owner tmp
     if [ -n "$degraded" ] || [ "$src_n" = "1" ] || [ -n "$unverified" ]; then
-        cache_epoch=$((now - PURITY_CACHE_TTL + 300))
+        cache_epoch=$((now - PURITY_CACHE_TTL + PURITY_RETRY_TTL))
     fi
     if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
         # 节点扫描会并发给多个 IP 打分,每个后台子 shell 都会落缓存;不锁的话
@@ -3269,7 +3281,7 @@ ip_purity() {
             sleep 1
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
-        # 本次结果会让「五分钟重查」「24h 复用」整套口径全部失效。
+        # 本次结果会让「证据不全就提前重查」「24h 复用」整套口径全部失效。
         tmp="$BASE/purity-cache.v7.$$"
         { grep -vF "$ip|" "$BASE/purity-cache.v7" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
@@ -4415,7 +4427,11 @@ NODE_SCAN_FILE="$BASE/node-scan.txt"
 PREFERRED_NODE_FILE="$BASE/preferred-node"   # selector<TAB>leaf<TAB>ip<TAB>epoch
 NODE_SCAN_TTL=86400
 NODE_SCAN_MARGIN=10       # 比当前高至少 10 分才值得建议换,免得天天让用户换线路
-NODE_SCAN_PARALLEL=3      # ip_purity 内部已经 4 路并发,再叠太多会打爆免费数据源
+NODE_SCAN_PARALLEL=1      # 每个 ip_purity 内部已经 4 路并发,再乘 N 就是 4N 个并发
+                          # 打四家免费源。原来是 3(12 并发),2026-11-20 收成 1(4 并发):
+                          # 本机 11 个叶子去重后只有 3 个出口 IP,一轮只差约 8 秒,
+                          # 换来的是不再把源打成限流 —— 而限流会反过来把结果推进
+                          # 降级态,触发 PURITY_RETRY_TTL 那条更勤的重查路径。
 
 # 读已固定的节点名。文件损坏/缺列一律当「没固定」,不能让半行数据把检查项卡死。
 preferred_node_leaf() {

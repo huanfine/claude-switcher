@@ -235,7 +235,7 @@ score, the risk dimension was not verified this round: either none of the risk
 sources answered (the number is a type-based baseline) or the type evidence
 arrived without a reputation score (capped at 85, never better than an
 advisory). Neither is a measured reputation, and both are retried after
-5 minutes.
+15 minutes.
 
 ## Exit IP score looks wrong
 
