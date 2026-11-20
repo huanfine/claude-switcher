@@ -4789,6 +4789,17 @@ struct CheckSettingsView: View {
         }
         .frame(width: 520, height: 610)
         .onAppear { vm.loadCheckConfig() }
+        // 确认框挂在面板根上,不挂在区块自己身上 —— 区块在 ScrollView 里,
+        // 滚出去之后它就不在视图树的可呈现路径上了。挂根上才有稳定的落脚点。
+        .alert("做一次代理断开演练？", isPresented: $showDrillConfirm) {
+            Button("取消", role: .cancel) {}
+            Button("开始演练") { vm.runDrill() }
+        } message: {
+            Text("""
+            演练会关掉 TUN 大约 20–60 秒，这期间本机上不了网；结束后自动恢复，看门狗也会重新驻守。
+            如果断开后本机仍能连上外网，说明代理一挂就会漏 —— 那正是要查出来的事。
+            """)
+        }
     }
 
     // MARK: 代理断开演练
@@ -4825,15 +4836,6 @@ struct CheckSettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.vertical, 6)
-        }
-        .alert("做一次代理断开演练？", isPresented: $showDrillConfirm) {
-            Button("取消", role: .cancel) {}
-            Button("开始演练") { vm.runDrill() }
-        } message: {
-            Text("""
-            演练会关掉 TUN 大约 20–60 秒，这期间本机上不了网；结束后自动恢复，看门狗也会重新驻守。
-            如果断开后本机仍能连上外网，说明代理一挂就会漏 —— 那正是要查出来的事。
-            """)
         }
     }
 
