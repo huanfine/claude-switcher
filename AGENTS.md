@@ -36,10 +36,10 @@
 2. **不要把环境值写进代码或安装器 sed**。历史上安装器、`set-client`、`set-region`、自动更新都在用 sed 回写脚本头部 5 个变量,导致安装产物 ≠ 发布产物、SHA256 校验要剔除 5 行、升级还要回注——这套已全部拆除,别再引入。
 3. **探测不到就明确报错,不要静默用默认值**。`load_env` 遇到损坏的 env.json 会 fail,因为环境值错会直接把规则写进错误的代理组。
 
-关于时区看门狗(踩过一次,代价是「修好了又坏了」):
+关于时区巡检(踩过一次,代价是「修好了又坏了」):
 
-- **看门狗的目标值只能来自 env.json**,脚本里那份 `TARGET=` 只是读不到 env.json 时的兜底。原来安装器把目标烧死进脚本,`set-region` / `fix` 只改 env.json 和系统时区,没人回来改这份副本——看门狗于是每 5 分钟（`StartInterval 300`）把系统时区改回旧值,用户每次点「一键修复」都以为没生效。
-- **改系统时区必须同时对齐看门狗**,两件事要落在同一次管理员授权里(`fix` 的 `adminCmds`),否则修完几分钟就被改回去。
+- **巡检的目标值只能来自 env.json**,脚本里那份 `TARGET=` 只是读不到 env.json 时的兜底。原来安装器把目标烧死进脚本,`set-region` / `fix` 只改 env.json 和系统时区,没人回来改这份副本——巡检于是每 5 分钟（`StartInterval 300`）把系统时区改回旧值,用户每次点「一键修复」都以为没生效。
+- **改系统时区必须同时对齐巡检**,两件事要落在同一次管理员授权里(`fix` 的 `adminCmds`),否则修完几分钟就被改回去。
 - **`TARGET=` 有两种写法**:安装器写 `TARGET="x"`,同步时写 `TARGET=x`。读的一律剥引号,不要匹配引号。
 
 
@@ -58,7 +58,7 @@
 2. 探测代理客户端，用 `claude-switch.sh _support env-set "proxy_mode=..."` 写进 `~/.claude-switcher/env.json`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/flclash/shadowrocket/sing-box/clashx/surge/auto 中选择
 3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名，同样用 `env-set "proxy_group=..."` 写入（其他客户端跳过）
 4. 按出口 IP 自动锁定地区目标：多源依次尝试 ipinfo.io（country/timezone）→ ipapi.co（country_code/timezone）→ ifconfig.co（country_iso/timezone）→ Cloudflare trace（loc，时区用国家默认映射），全失败时让用户在 US/JP/TW/HK/SG/GB/DE/FR/KR/AU/CA 中手动选，`FORCE=1` 按 US + America/New_York；country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ locale，然后用 `env-set "country=..." "timezone=..." "locale=..."` 写入 env.json
-5. 参照 `daemons/` 目录的模板，物化保镖与时区看门狗脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` / `__FAKE_PREFIX__` / `__LOG_DIR__` 替换为实际值；`__FAKE_PREFIX__` 由核心 `fake-prefix` 按 env.json 的 fake-ip 网段算出，不能退回写死 `198.18.`），用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher/`（chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon 安装到 `/Library/LaunchDaemons/`（plist 的 ProgramArguments 已写死指向系统目录，直接 cp 即可）。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto`）
+5. 参照 `daemons/` 目录的模板，物化保镖与时区巡检脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` / `__FAKE_PREFIX__` / `__LOG_DIR__` 替换为实际值；`__FAKE_PREFIX__` 由核心 `fake-prefix` 按 env.json 的 fake-ip 网段算出，不能退回写死 `198.18.`），用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher/`（chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon 安装到 `/Library/LaunchDaemons/`（plist 的 ProgramArguments 已写死指向系统目录，直接 cp 即可）。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto`）
 6. 现场编译界面 App（需要 Xcode 命令行工具，必须带 `-target` 否则新 SDK 产物在老系统拒启动）：
    ```bash
    swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o "Claude 环境检查器.app/Contents/MacOS/ClaudeSwitcher" -framework SwiftUI -framework AppKit
@@ -70,11 +70,11 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、对每个仍开启 IPv6 的网络服务执行 `networksetup -setv6off <服务名>`（需管理员；不能只关 Wi-Fi）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（16 项逐项；`checkdetail --json` 输出版本化报告并写 `last-report.json`）/ `report [报告]`（把已有文本报告转成稳定 ID / 证据 / 配置指纹 JSON，不重新探测）/ `lease`（从当前 established 报告签发 120 秒启动租约）/ `lease-check`（校验租约仍对应当前报告、环境与核心且未过期）/ `node-scan`（只读扫描当前控路 Selector 的候选节点，按纯净度排名出报告；不切节点、不动守护、不写 iphistory）/ `node-apply`（仅门禁允许时把最优节点切上去并固定；切前实时复核门禁、切后复查出口国家，不达标自动回滚）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
+日常维护命令：`help`（分组命令说明，含 ok/warn/config/fail/skip 五种结论的含义；未知命令直接指到这里）/ `check`（静默总检）/ `checkdetail`（16 项逐项；`checkdetail --json` 输出版本化报告并写 `last-report.json`）/ `report [报告]`（把已有文本报告转成稳定 ID / 证据 / 配置指纹 JSON，不重新探测）/ `lease`（从当前 established 报告签发 120 秒启动租约）/ `lease-check`（校验租约仍对应当前报告、环境与核心且未过期）/ `node-scan`（只读扫描当前控路 Selector 的候选节点，按纯净度排名出报告；不切节点、不动守护、不写 iphistory）/ `node-apply`（仅门禁允许时把最优节点切上去并固定；切前实时复核门禁、切后复查出口国家，不达标自动回滚）/ `fix`（一键修复）/ `switch A|B|…|H`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto，写 env.json）/ `env-set <key=value>...`（写环境层，键限 proxy_mode|proxy_group|country|timezone|locale|clash_dir|fake_ip_range；损坏的 env.json 会让核心脚本直接 fail，需用它重建）/ `drill [--auto|--manual] [--yes]`（fail-closed 演练：平时检查只能证明「流量走了代理」，证明不了「代理挂了会不会直连」。默认 auto 通过内核接口关 TUN——效果等价于核死时路由被撤销，但能精确恢复、不需要 sudo；`--manual` 走手动停核。结论写 `~/.claude-switcher/drill.log`。2026-11-01 实测本机为 `violated`：关掉 TUN 后域名探测直接从中国移动出口出去）/ `verdict [报告]`（只读复核 `last-check.txt`，输出 established|violated|incomplete 与 blockers/advisories/skipped；warn 与 skip 既不算 pass 也不算 fail；`config` 与 `fail` 一样计入 blockers；一项都没真正验证过是 incomplete——「没有失败」不等于「验过了」）/ `evidence <file>`（检查结果落 JSON：时间/主机/环境/逐项/判定，0600，只新建不覆盖）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|…|H> <file>` / `snapshot-import <file> <A|B|…|H>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto]` / `update-check`（自动更新：`update-check` 为只读检查入口，只下载并校验、比对配置行后报告是否为新版本，不备份不写入；旧版核心不识别该入口时会安全退出，不会误触发真实更新；`update --check` 在新版中等价；`--auto` 由用户态 LaunchAgent 每 12 小时调用、输出落 `~/.claude-switcher/update.log`；手动跑则直接打印。完整流程：拉取 main → 逐项 SHA256 校验工件（对照仓库 SHA256SUMS，不符即中止）→ 整份比对核心脚本去重 → 备份 .bak → 替换脚本并把老版本脚本头部里的环境值迁进 `env.json` → 守护脚本仅比对并提示 → 自检，含任何 `=fail` 自动回滚）
 
 检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`IP纯净度`、`生态可达性`、`更优节点`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 8 项的失败降为警告；`strict` 把其中某些项升成硬门槛——设了就不受 `allowOptionalFailures` 影响，失败直接拦启动（「生态可达性设为安全基线」就是这条）。`strict` 与 `disabled` 互斥，同时出现时核心拒收。App 保存设置时必须把 `strict` 原样带回，漏掉等于每保存一次就静默清空安全基线。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
-关于 IP 纯净度（第 14 项，`ip_purity`）：口径是**类型基线 − 扣分**，基线取 ip.net.coffee 实测区间的中位（住宅 100 / 移动 85 / VPN 65 / 机房 55 / Tor 46 / 类型不明 70），判定阈值比分数严。八条不能改回去的口径：
+关于 IP 纯净度（第 14 项，`ip_purity`）：口径是**类型基线 − 扣分**，基线取 ip.net.coffee 实测区间的中位（住宅 100 / 移动 85 / VPN 65 / 机房 55 / Tor 46 / 类型不明 70），判定阈值比分数严。**扣分连续、类型与信誉分离**（2026-11-20 改，见第 3、7、8 条）。八条不能改回去的口径：
 
 1. **不要改回单源。** 四个源交叉：`api.ipquery.io`（风险标志+风险分）、`ip-api.com`（proxy/hosting/mobile+城市，免费档只支持 http）、`ipinfo.io`（ASN+城市，顺带省掉一次请求）、`api.stopforumspam.org`（滥用频次）。
 
@@ -83,7 +83,7 @@
    这条是 2026-11-19 改的，原因是实测样本：AS14956 的三个出口里，ipquery 三份响应每个字段都一样（`is_datacenter:true`、`risk_score:85`、`is_proxy:false`、`is_vpn:false`），只有 `144.172.65.26` 被 ip-api 单独标了 `proxy:true` —— 结果同一台机器换个 IP 就从 「43 warn 可启动」变成「53 fail 拦启动」。一个来源的一个布尔不该有这种决定权。
    **代价要说清楚**：只有 ip-api 报的代理特征（例如 Cloudflare WARP 那种 `ipquery` 只报 datacenter 的情形）从此不再拦启动，降为「机房 + 单源标记」。补偿是 ipquery 的 `is_proxy`/`is_vpn` 单独就算硬证据，以及 PTR 自曝仍算一源。如果以后拿到 WARP 的反例实测，要么补 PTR/org 的第二证据，要么把 `px_src` 阈值改回 1——改之前先想清楚这会重新引入「同节点换 IP 结论翻脸」。
 2. **不要丢掉 `dig +short -x`。** PTR 是出口自己写下的身份（`tor-exit-read-me.dfri.se`、`…static.cloudzy.com`、`c-73-158-10-5.hsd1.ca.comcast.net`），比任何第三方评分都硬；实测 fake-ip 不劫持反向解析。但也**不要加 DNSBL**：fake-ip 劫持所有 A 查询统一回 `198.18.0.x`，黑名单结果全是假的。
-3. **风险分与滥用记录取较大者，不许相加。** 两者都是历史信誉信号且高度相关（Tor 出口天然两项都高），相加等于同一个事实罚两次，会让 51 分和 49 分的机房得到相反结论。
+3. **风险分与滥用记录取较大者，不许相加，且各自都是连续函数。** 两者都是历史信誉信号且高度相关（Tor 出口天然两项都高），相加等于同一个事实罚两次，会让 51 分和 49 分的机房得到相反结论。各自档位也不许改回阶梯：风险分 `(risk×12+30)/60`（每 5 分风险 1 分信誉，60 以上封顶 12），滥用 `5+频次/5`（1 次 5 分，45 次以上封顶 14）。旧的阶梯档（1-10→3 / 11-25→7 / 26-50→9 / ≥51→12）有两个后果：同档内 1 和 10 同分、11 和 25 同分，数字看着精确其实只表达「在第几档」；档口还会跳，risk 10→11 一次掉 4 分。实测枚举下来旧口径只有 36 个可达分值，连续化后 32–100 每个整数都取得到。
 4. **地理那一维只标记、不扣分。** 先查三源城市是否一致。实测 RouterHosting `144.172.103.106` 被 ipquery/ipinfo 报犹他、被 ip-api 报内华达，跨了州；这时拿任一源的时区去要求用户对齐就是冤枉人，只能标「地理模糊」。住宅整段跳过（家宽注册地≠接入地不是风险，且另有时区项在管）；**Tor 与代理也必须跳过**——它们的「城市」是数据中心位置，三源按各自出口点库去标必然不一致（实测两个随机 Tor 出口全部命中），挂这个标记是纯噪声。
    **这些标记不再进分数**：地理维度和「时区」检查项说的是同一件事，扣一次分等于重复计费；而且 ip.net.coffee 的 Trust Score 不含这一维，我们多扣 4~6 分，用户拿两边一比就以为我们算错（2026-11-06 实测）。
 
@@ -91,7 +91,9 @@
 
 6. **分数与判定是两个轴，不要在文案里让用户互相反推。** 分数是 IP 信誉（宽口径，对齐 ip.net.coffee 的 Trust Score），判定回答「这次能不能开」。实测用户会拿「这个 53 分、那个 43 分」推断「53 更安全」，而 53 那个其实是 `fail`（VPN 基线 65 高于机房 55，越危险的类型基线反而越高）。做法：纯度文案末尾显式写 `判定:拦启动 / 判定:仅提示`；判定表本身按类型与证据走，机房只在分数掉到 30 以下（转租段）才拦。不要再把分数当判定的代理。
 
-7. **「没查到问题」不是「住宅」的证据。** `clean_residential`（两源都答、标志全否、risk≤10、无滥用、名字里无机房词）只能说明没有负面信号。实测 AS3257 GTT 的 `66.17.65.38` 靠这条拿到 `100/100 · 住宅宽带`，而它是骨干网地址。现在的口径：类型保留住宅（与参考站一致，不硬说成机房），**分数封顶 70** 并标 `·无正面住宅证据`；正面住宅证据只有两种——运营商名命中住宅白名单，或 PTR 自曝 `hsd/dynamic/dhcp/broadband/adsl/ppp/dial/dsl/fiber/cable`。
+7. **「没查到问题」不是「住宅」的证据；信誉维度也不许参与类型判定。** `clean_residential` 只说明没有负面结构信号（两源都答、`asn_org` 非空、运营商名不属机房、`dc`/`host_hint`/`px`/`tor`/`mob` 全空）。2026-11-20 之前它把「risk≤10 且无滥用」也写进条件，后果是同一个出口 `risk_score` 从 10 变 11，类型就从「住宅宽带」翻成「类型不明」、分数 67→63、还多一句「建议换住宅」——一个 1 分的信誉抖动改了三处结论。现在类型只由结构证据决定，`risk_score` / 滥用只进分数。
+   **分数封顶 70 的条件不变**：类型是住宅、但没有正面证据（运营商名命中住宅白名单，或 PTR 自曝 `hsd/dynamic/dhcp/broadband/adsl/ppp/dial/dsl/fiber/cable`）时封顶 70 并标 `·无正面住宅证据`。实测 AS3257 GTT 的 `66.17.65.38` 就停在这里：三家源都说干净，但拿不到正面证据。
+   **另有一条封顶 85**（第 8 条）：风险维度没验成时，分数最多 85、判定最多 `warn`，标 `·风险未验证·封顶`。70 和 85 含义不同，不要合并成一个数：70 是「类型对但没证据」，85 是「类型有证据但风险没验」。
 
 8. **「数据源认识这个地址吗」与「拿到几个风险信号」必须分开判（`known` 与 `src_n`），不要合并成一个布尔。** 前者回答地址是否真实存在，用来挡空壳响应（ipquery 对 `192.0.2.55` 会回结构完整、标志全 false、风险分 0 的空壳，和「住宅且毫无风险」长得一模一样）；后者回答证据够不够。合并之后两侧都会错：空壳拿到 100 分，或者在有运营商名、有 PTR 的情况下只回一句没有信息量的「未评级」。
 
@@ -99,16 +101,17 @@
 
    | 情形 | 结论 |
    |---|---|
-   | `src_n == 2` | 正常评分 |
-   | `src_n == 1` | 正常评分 + 标 `·仅一家风险源可达`（缺一家就可能漏判代理特征，但不改判定） |
+   | `src_n == 2` 且拿到 `risk_score` | 正常评分 |
+   | `src_n == 1` | 类型照判，**分数封顶 85、判定最多 warn**，标 `·仅一家风险源可达`（缺一家就可能漏判代理特征） |
+   | `src_n == 2` 但 ipquery 没给 `risk_score` | 同上，标 `·风险未验证·封顶`（分数标签写「风险未验证」） |
    | `src_n == 0` 且 `known` | **降级判型**：按运营商名 / PTR 定类型，`base` 封顶 70、判定封顶 warn，标 `·风险源不可达`，下一句换成「仅按运营商名或反向解析判型,稍后重查」 |
    | `known` 为空 | 「未评级」+ warn，且不写缓存 |
 
-   降级判型的两个封顶都不能拆：报 100 分是用「没查」冒充「查干净了」；把 warn 升成 fail 是拿我们自己的网络抖动去堵用户（IP 纯净度是可关闭的软信号，不是 Kill-Switch）。另外 PTR 能解出来本身就证明地址存在，所以 `rdns` 非空也算 `known` —— 三家 HTTP 源全挂时它是最后一根线索。
+   三个封顶都不能拆：报 100 分是用「没查」冒充「查干净了」（2026-11-20 之前 `src_n == 1` 确实会报 100/ok，实测 ipquery 挂掉时 Comcast 出口照样满分）；把 warn 升成 fail 是拿我们自己的网络抖动去堵用户（IP 纯净度是可关闭的软信号，不是 Kill-Switch）；降级的 70 与未验证的 85 是两档不同的证据状态，合并就分不出「类型不明」和「类型对但风险没验」。另外 PTR 能解出来本身就证明地址存在，所以 `rdns` 非空也算 `known` —— 三家 HTTP 源全挂时它是最后一根线索。
 
 机房出口只给 warn 不拦启动（大量用户就用机房节点），代理特征与 Tor 才拦；机房只有掉到 30 分以下（转租段+滥用记录）才拦。
 
-结果缓存 24 小时（`~/.claude-switcher/purity-cache.v4`），**查不到不写缓存**，否则一次网络抖动会把「未知」钉住一整天。缓存七个字段的顺序是 `ip|时间戳|判定|分数|类型|detail|cc`，分隔符是 `|`：不要改回 tab，tab 属于 IFS 空白，`read` 会把前导空字段整个吞掉，导致 score 与 detail 静默错位。第 7 列 `cc` 是出口国家代码，从已有的 ip-api / ipquery / ipinfo 响应里顺带取出，不发额外请求，供节点扫描的国家硬门槛使用。文件名带 `v3` 是因为多了这一列（v2 的 6 列没有它，混读会让 detail 把 `|US` 吞进去，宁可让旧缓存整体作废）；带 `v4` 是因为 2026-11-06 的类型判定改成证据驱动 —— 列结构没变、**结论口径变了**，不换名字的话升级后 24 小时内还会读到「类型不明 / 机房」的旧结论，用户重装完以为又没修好。改判定必须顺手换缓存名。**降级判型与「仅一家风险源可达」这两类结果不能缓存满 24 小时**——写入时把时间戳往前拨成仅剩 5 分钟 TTL，否则一次数据源抖动会把「没查干净」钉住一整天。多个 IP 并发打分时各自写缓存会互相覆盖，用 `mkdir .purity-cache.lock` 串行化。
+结果缓存 24 小时（`~/.claude-switcher/purity-cache.v7`），**查不到不写缓存**，否则一次网络抖动会把「未知」钉住一整天。缓存七个字段的顺序是 `ip|时间戳|判定|分数|类型|detail|cc`，分隔符是 `|`：不要改回 tab，tab 属于 IFS 空白，`read` 会把前导空字段整个吞掉，导致 score 与 detail 静默错位。第 7 列 `cc` 是出口国家代码，从已有的 ip-api / ipquery / ipinfo 响应里顺带取出，不发额外请求，供节点扫描的国家硬门槛使用。文件名带 `v3` 是因为多了这一列；`v4` 是类型判定改成证据驱动；`v5` 是代理特征按源计数 + 判定词显式化；`v6` 是住宅档不再劝人换住宅；`v7` 是信誉维度改连续扣分 + 风险未验证封顶 85 —— **分数本身变了**，不换名字会让新旧口径的数字混在同一个列表里。列结构没变但**结论口径变了**时也必须换名字，否则升级后 24 小时内还会读到旧结论，用户重装完以为又没修好。**降级判型、「仅一家风险源可达」、「风险未验证」这三类结果不能缓存满 24 小时**——写入时把时间戳往前拨成仅剩 5 分钟 TTL，否则一次数据源抖动会把「没查干净」钉住一整天。多个 IP 并发打分时各自写缓存会互相覆盖，用 `mkdir .purity-cache.lock` 串行化（超过 60 秒的残留锁自动回收）。
 
 **不要把「可关闭」摆到主界面上**：16 项默认全部拦启动，按能不能关分组会让人以为「有些可以不拦」，等于把降级当选项推荐。主界面只列一份清单；关闭入口只在设置页的「降级防护（不推荐）」里。关掉之后必须持续可见——主界面常驻橙色「防护已降级：…」，`check` 输出追加 `|防护降级:…`，否则命令行、日志、自动化这些看不到界面的地方完全无从判断。
 
@@ -125,9 +128,9 @@
 
 出口身份归一：`IP一致` 不直接比原始地址，而是比归一身份——v4 原样，v6 取 `/64` 前缀。`lastip` 按协议族各存一行，两族互不覆盖，所以同一节点双栈交替（先报 v4 再报 v6、或 v6 在同一 /64 内换接口标识）不会被判成「IP 变了」。旧版写下的裸地址在读取时自动迁移，升级后第一次检查不会误报。
 
-`IP一致` 的判据是**固定基线**：`ipbaseline-<A-D>` 存一行「身份 + 确立时间」，结论只回答「现在用的是不是这条固定出口」。不数「窗口里出现过几个出口」——跳到别处 → 被熔断 → 又切回原出口，这条链路里基线从没变过，用户回来继续用就是正常的，不该背一条「IP 变过」的记录。第一次运行把当前出口记为基线且不告警；不一致时按 `ip_class` 分级措辞（机房/家宽/其它），并给出「已固定多久」与改法，改基线只能 `ip-baseline accept`（`ip-baseline show` 查当前值与天数）。**绝不自动采纳新出口**，否则「一周不变」当场作废。
+`IP一致` 的判据是**固定基线**：`ipbaseline-<A-H>` 存一行「身份 + 确立时间」，结论只回答「现在用的是不是这条固定出口」。不数「窗口里出现过几个出口」——跳到别处 → 被熔断 → 又切回原出口，这条链路里基线从没变过，用户回来继续用就是正常的，不该背一条「IP 变过」的记录。第一次运行把当前出口记为基线且不告警；不一致时按 `ip_class` 分级措辞（机房/家宽/其它），并给出「已固定多久」与改法，改基线只能 `ip-baseline accept`（`ip-baseline show` 查当前值与天数）。**绝不自动采纳新出口**，否则「一周不变」当场作废。
 
-出口历史（`iphistory-<A-D>.log`）只剩证据用途，不是判据：只在出口**变化**时追加一行，稳态零写入、零统计；只有已判定与基线不一致时才 `iphist_count` 一次，用来区分「第一次跳」和「老在跳」。这条设计是响应速度的关键——原来每次检查都要重写整个文件并逐行归一，实测 2000 行 1.3s / 20000 行 13s，而它对当次结论没有任何贡献。文件按实例分开，读不到槽位时退回单份旧文件。`出口IP` 走 v6 时**不再**额外标注「IPv6 出口」——冒号地址本身已说明协议族，补这一句反而容易让用户误以为自己开了本机 IPv6。三条相关行各说各的层，不要合并：`IPv6` 查本机网卡（出口是 v6 时写「本机已关闭 · 节点出口为 IPv6」）；`出口IP` 报节点侧对 Cloudflare 呈现的地址；`WebRTC` 的 STUN 探针只走 v4，无 v4 出口时写「节点无 IPv4 出口，STUN 只回 IPv4，无法比对(非泄漏)」。
+出口历史（`iphistory-<A-H>.log`）只剩证据用途，不是判据：只在出口**变化**时追加一行，稳态零写入、零统计；只有已判定与基线不一致时才 `iphist_count` 一次，用来区分「第一次跳」和「老在跳」。这条设计是响应速度的关键——原来每次检查都要重写整个文件并逐行归一，实测 2000 行 1.3s / 20000 行 13s，而它对当次结论没有任何贡献。文件按实例分开，读不到槽位时退回单份旧文件。`出口IP` 走 v6 时**不再**额外标注「IPv6 出口」——冒号地址本身已说明协议族，补这一句反而容易让用户误以为自己开了本机 IPv6。三条相关行各说各的层，不要合并：`IPv6` 查本机网卡（出口是 v6 时写「本机已关闭 · 节点出口为 IPv6」）；`出口IP` 报节点侧对 Cloudflare 呈现的地址；`WebRTC` 的 STUN 探针只走 v4，无 v4 出口时写「节点无 IPv4 出口，STUN 只回 IPv4，无法比对(非泄漏)」。
 
 客户端日志与诊断：默认在 `~/Library/Logs/claude-switcher/client.log` 记录脱敏命令元数据，512 KiB 后轮转为 `client.log.1`，可用配置中的 `logging` 关闭。`export-diagnostics <file>` 与 App「导出诊断日志」生成 zip，只含客户端日志、检查设置和脱敏环境/状态摘要。不得把公网/住宅/代理 IP、Bearer/token/session/cookie、账号内容、Clash 配置、`lastip`、`iphistory` 或原始 `last-check.txt` 写入日志或诊断包。
 
@@ -135,16 +138,16 @@
 
 ## 节点扫描与应用（第 16 项，只读优先）
 
-写这一层代码前先把边界记住：**扫描只读，应用只在门禁允许时切一次**。逐节点「切上去实测出口」那条路会写 N 条 `iphistory.log`，把「IP 与上次一致」凭空扣成分数，还会被看门狗当成出口变化直接停掉 Claude——不允许走。
+写这一层代码前先把边界记住：**扫描只读，应用只在门禁允许时切一次**。逐节点「切上去实测出口」那条路会写 N 条 `iphistory.log`，把「IP 与上次一致」凭空扣成分数，还会被巡检当成出口变化直接停掉 Claude——不允许走。
 
 - `node-scan` 从运行中内核的 `/proxies` 沿 `now` 链找到**最深一层含叶子的 Selector**，只列当前真正控路的组；递归列所有嵌套 Selector 会把「☑️ 手动切换」那 75 个无关节点也带进来。
 - 合并配置 `proxies:` 块只按白名单读 `name / server / servername / sni / host / type / udp / network` 八个字段，**不读 `uuid` / `password` / 证书**，不导出订阅原文，报告与诊断包都不含凭据。这与 FlClash 一键修复的「不读订阅节点与凭据」是两条独立边界：那条写规则数据库、不碰节点；这条只读节点名和入口地址、不写任何代理配置。
 - **硬门槛先于纯净度**：国家不符 / 国家取不到 / Tor 或代理判定 / UDP 未标注的节点都不参与推荐。带 `servername` / `Host` 的 CDN 前置节点 `server` 只是入口，标「出口未知」并排除，不能拿入口 IP 打分。多个叶子共用同一落地 IP 只查一次。
 - 差距不足 `NODE_SCAN_MARGIN`（10 分）不出 `BEST`，免得每次扫描都催用户改线路；清空 `BEST` 时必须连 `BEST_IP` / `BEST_SCORE` / `BEST_SELECTOR` 一起清，别留半截报告。
 - `checkdetail` 的第 16 项**只读报告文件**，绝不在 45 秒检查预算里发网络请求。没有报告 / 报告过期 → `skip`，不是 `ok`；`skip` 不扣分，用户关掉检查项不该反而掉分。有 `preferred-node` 时，`PREFERRED_MATCH=0` 优先于「还有更优节点」报「已偏离固定节点」。
-- 报告门禁 `node_gate()` 只看两个**瞬时**事实：Claude 进程 / CLI 在跑、看门狗仍在驻守，任一成立即 `report-only`。**不要**再把「任一 A–D 已建档槽位」算进去 —— 槽位是常驻资产，存过一次 `hasA=1` 就永远为真，那条判据会让 `node-apply` 对任何用过本工具的人永久拒绝，界面上「应用最优节点」从不出现。执行门禁 `node_apply_gate()` 必须**重新实时判定**，不信报告里的旧快照；看门狗那条从「pidfile 存在」升级为「进程确实已不在跑」的事实检查，残留 pidfile 不阻塞、真有守护仍拒绝。
+- 报告门禁 `node_gate()` 只看两个**瞬时**事实：Claude 进程 / CLI 在跑、巡检仍在驻守，任一成立即 `report-only`。**不要**再把「任一 A–H 已建档槽位」算进去 —— 槽位是常驻资产，存过一次 `hasA=1` 就永远为真，那条判据会让 `node-apply` 对任何用过本工具的人永久拒绝，界面上「应用最优节点」从不出现。执行门禁 `node_apply_gate()` 必须**重新实时判定**，不信报告里的旧快照；巡检那条从「pidfile 存在」升级为「进程确实已不在跑」的事实检查，残留 pidfile 不阻塞、真有守护仍拒绝。
 - 换槽位时这条链自己会走一遍（`VM.optimizeNodeForSwitch`）：审计通过 → `slot-node get <目标>` → `node-scan` → 有绑定就切绑定那条、否则报告里真有 `BEST` 才切 → `stopWatch()` + `node-apply <叶子>` → 重新审计 → 再切账号。三个例外都必须保留：扫描失败不阻断切换；`node-apply` 失败不阻断切换（只把原因写进回执）；换完线路重新审计没过就**不切账号**（fail-closed，新账号第一次连上的就是那条出口）。
-- **绑定优先于本次最优**：`BEST` 是「现在谁更干净」的比较结果，绑定是「这个身份就该走这条线」的声明，后者不能被一次扫描盖掉。所以 `node_apply` 支持显式叶子（`node-apply <leaf>`），无参时才取报告里的 `BEST`。绑定存 `$BASE/slot-node/<A-D>`，格式 `selector<TAB>leaf<TAB>epoch`，**不存分数**；命令族 `slot-node list|get|set|clear`。界面在槽位卡右上角给常驻的链接图标菜单，选项只来自最近一次报告的 `CURRENT` / `TOP1-3`，不让人手敲节点名。
+- **绑定优先于本次最优**：`BEST` 是「现在谁更干净」的比较结果，绑定是「这个身份就该走这条线」的声明，后者不能被一次扫描盖掉。所以 `node_apply` 支持显式叶子（`node-apply <leaf>`），无参时才取报告里的 `BEST`。绑定存 `$BASE/slot-node/<A-H>`，格式 `selector<TAB>leaf<TAB>epoch`，**不存分数**；命令族 `slot-node list|get|set|clear`。界面在槽位卡右上角给常驻的链接图标菜单，选项只来自最近一次报告的 `CURRENT` / `TOP1-3`，不让人手敲节点名。
 - 界面读绑定是直接读盘（`VM.loadSlotNodes`），核心脚本负责写。两处各自拼同一个路径，改动必须同步；`tests/test_cli_slot.py::SlotNodeBindingTests` 钉着这条契约。跟 `probeSlotLogin` 一样，读取属于显示需求，不塞进 `status` 的输出契约。
 - 守护归 App 管、切换归脚本管：App 先 `stopWatch()`，`node-apply` 不杀 App 持有的守护（否则 App 会误报「守护意外退出」），切完由 `checkEnvironment` 通过后自动 `startWatch()`。已建立的连接不会迁移；只对 `Selector` 生效，`URLTest` / `Fallback` 会被自动选路覆盖。
 
@@ -192,9 +195,9 @@ IP 纯净度那侧是独立的证据 bug，别和上面混：
 | 内容 | 桌面版 Claude | Claude Code |
 | --- | --- | --- |
 | 实时路径 | `~/Library/Application Support/Claude` | `~/.claude/`、`~/.claude.json` |
-| 槽内存档 | `$BASE/accounts/<A-D>/` | `$BASE/cli/<A-D>/home/`、`$BASE/cli/<A-D>/home.json` |
+| 槽内存档 | `$BASE/accounts/<A-H>/` | `$BASE/cli/<A-H>/home/`、`$BASE/cli/<A-H>/home.json` |
 
-- **不要**把 `~/.claude` 塞进 `accounts/<A-D>` 树：那棵树的语义是「桌面版数据目录的内容」，混入子目录会被原样复制回 `DATA`。并列放 `$BASE/cli` 也不动老快照，避免迁移几百 MB 历史目录。
+- **不要**把 `~/.claude` 塞进 `accounts/<A-H>` 树：那棵树的语义是「桌面版数据目录的内容」，混入子目录会被原样复制回 `DATA`。并列放 `$BASE/cli` 也不动老快照，避免迁移几百 MB 历史目录。
 - 归档用**移动语义**：`archive_cli` 先 `mv ~/.claude`，失败要能把已挪走的部分放回原位，不能留「目录没了、`~/.claude.json` 还在」的半截状态；`restore_cli` 会**先清空现场**再放回，目标槽位没存档时 `~/.claude` 和 `~/.claude.json` 一并删除 —— 否则没存过的槽位会接着用上一个账号的登录态，等于没隔离。
 - `switch_to` 开头用 `claude_cli_running` 挡住「终端里开着 claude 就切」：CLI 没有 osascript 那种优雅退出口子，直接把正在写的目录抽走会丢状态。进程判据三选一：`pgrep -x claude`（brew / `~/.local/bin` 的原生二进制，`argv[0]` 就是 `claude`）、`claude-code/cli.js`、`@anthropic-ai/claude-code`；大小写敏感，不能误伤桌面 App 的 `Claude`。
 - `status` 会把每个槽位的 CLI 存档体积报成 `cliA=151M@2026-11-04`，界面据此在卡片上加一个 `CLI` 角标；老脚本不输出这个字段，缺了就当没有，不能因此判 `status` 失败。
@@ -233,7 +236,7 @@ App 检查入口已改为 `checkdetail --json`：JSON 成功时按 `reportRowMap
 
 顺带修掉的既有缺陷：`build_report` 装配 `probes` 时取的是 `probes.get(...)`，条件却是 `if probes or drill`。**跑过一次 drill、又没有本轮 probes sidecar 时（离线 `report` 与 sidecar 失败两条路），对 None 取 `.get` 直接崩，整份 JSON 报告生成失败。**现在是 `(probes or {}).get(...)`。加可选字段时，判空条件要和取值对象对齐。
 
-## 运行期出口看门狗（watch）
+## 运行期出口巡检（watch）
 
 `check` 是拉起前的门禁，只管那一刻。`watch [间隔] [整轮周期]` 管「已经在用」的那段时间：出口变了就立刻停 Claude。四条纪律，改它之前先读完：
 
@@ -241,8 +244,8 @@ App 检查入口已改为 `checkdetail --json`：JSON 成功时按 `reportRowMap
 2. **v4/v6 分族记账，v6 只比 `/64` 前缀**。同一台机器在 v4 与 v6 之间来回切是代理正常行为，不是出口变化；v6 后缀轮换同理（隐私扩展地址天天换）。只有前缀变了才算换了网段。
 3. **一次失败不动手**。整轮审计失败先 `sleep 5` 复检，仍失败才停；出口探测连续 3 次拿不到地址才判定代理已断。一次 curl 抖动就杀进程，比漏判更让人受不了——这条是用户原话，别改。
 4. **停 Claude 必须落到 `pkill`**。`osascript quit` 对 Tauri/Electron 应用经常无响应，等 3 秒仍在就直接 `pkill`，同时清掉 `claude-code/cli.js` 与 `@anthropic-ai/claude-code` 两类 CLI 进程。少清一类，就会留下一个还在发请求的进程。
-5. **`TERM`/`INT` 的 trap 里必须 `exit`**。bash 的 trap 执行完会回到被中断的地方继续跑，只删 pidfile 不 `exit` 的话，App 的 `terminate()` 压根停不下看门狗——实测就是这样每重启一次 App 就多一个孤儿守护，各自拿一份基线判出口。`EXIT` 分支只做清理，不要 `exit`（会递归）。
-6. **定位看门狗只认 pidfile，不用 `pkill -f "claude-switch.sh watch"`**。`-f` 匹配整条命令行，任何命令行里含这串字的进程都会被误杀——包括用户自己的 `grep`、`tail`，以及诊断命令本身。实测踩到过，表现为「正在跑的 shell 突然收到 SIGTERM」。App 侧读 pidfile 后还要用 `ps -p <pid> -o command=` 确认一次，避免 pid 复用误杀无关进程。
+5. **`TERM`/`INT` 的 trap 里必须 `exit`**。bash 的 trap 执行完会回到被中断的地方继续跑，只删 pidfile 不 `exit` 的话，App 的 `terminate()` 压根停不下巡检——实测就是这样每重启一次 App 就多一个孤儿守护，各自拿一份基线判出口。`EXIT` 分支只做清理，不要 `exit`（会递归）。
+6. **定位巡检只认 pidfile，不用 `pkill -f "claude-switch.sh watch"`**。`-f` 匹配整条命令行，任何命令行里含这串字的进程都会被误杀——包括用户自己的 `grep`、`tail`，以及诊断命令本身。实测踩到过，表现为「正在跑的 shell 突然收到 SIGTERM」。App 侧读 pidfile 后还要用 `ps -p <pid> -o command=` 确认一次，避免 pid 复用误杀无关进程。
 
 拦截后的提醒走三条路：窗口横幅、菜单栏图标、系统通知。**通知不能省**——出问题时用户多半没开着窗口，前两条都看不见。通知走 `osascript display notification` 而不是 `UNUserNotificationCenter`：App 是 ad-hoc 签名，重签名后通知授权会失效。
 
@@ -254,7 +257,7 @@ App 检查入口已改为 `checkdetail --json`：JSON 成功时按 `reportRowMap
 
 7. **拦截必须留结构化记录**。`stop_claude_now` 末尾调 `watch_incident <原因> <类型>`，写 `incidents.log`：TAB 分隔「时间 / 类型 / 原因」三列，只留最近 50 条。界面的「拦截记录」卡片按 TAB 切列渲染，**列数或分隔符一改，界面就整条丢掉**。`watch.log` 是流水账（启动/复检/接管全在里面），别拿它当历史——用户想回看「上次为什么被停」时，从几百行里捞是灾难。空原因不写：一条只有时间的记录只会把真记录挤出 50 条窗口。
 
-App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是最坏的一种组合。
+App 退出时必须 `stopWatch()`。App 关了而巡检还在杀 Claude，是最坏的一种组合。
 
 ## 验收标准（全部满足才算装完）
 
@@ -270,7 +273,7 @@ App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是
 | 症状 | 根因 | 处理 |
 |---|---|---|
 | TUN 网卡消失、出口变回国内 | **Clash Verge 更新/异常重启会把 `enable_tun_mode` 重置为 false** | 退出 App → 改 `verge.yaml` 为 true → 重启 App。切换器的一键修复已内置此逻辑 |
-| 时区总是自己变回去 | macOS 自动时区或未知程序改动 | 看门狗会自动回滚；查 `/var/log/claude-switcher/tz-watchdog.log`（旧安装件仍在 `~/Library/Logs/tz-watchdog.log`）留痕 |
+| 时区总是自己变回去 | macOS 自动时区或未知程序改动 | 巡检会自动回滚；查 `/var/log/claude-switcher/tz-watchdog.log`（旧安装件仍在 `~/Library/Logs/tz-watchdog.log`）留痕 |
 | 检查结果显示 0/11、数据为空 | 中文日志被 `cut -c` 按字节截断产生非法 UTF-8，Swift 严格解码整体失败 | 脚本必须 `export LC_ALL=en_US.UTF-8`；界面端用容错解码 `String(decoding:as:)` |
 | 修改 App 后界面没变化 | 菜单栏版本关闭窗口仅隐藏；`pkill` 匹配中文路径还可能因 Unicode NFD 编码失配而静默失败 | 先从盾牌菜单选「退出 Claude 环境检查器」，再替换 App；开发排障也可按进程名退出测试实例。不要把关窗改回退出，以免破坏菜单栏驻留 |
 | headless Chrome 做 WebRTC 检测无结果 | headless 模式 ICE 子系统不产出候选 | 不要走浏览器路线，用本项目的纯 Python STUN 探针 |
@@ -290,7 +293,7 @@ App 退出时必须 `stopWatch()`。App 关了而看门狗还在杀 Claude，是
 3. 不要在日志、文档、Issue 里暴露用户的住宅/代理 IP 与任何凭据
 4. 不要改动 `~/.claude-switcher/accounts/` 下的存档结构
 5. **维护纪律**：`core/`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——自动更新靠它校验工件完整性，清单与代码不一致会导致所有用户更新失败
-6. **守护进程脚本只在 root 目录**：`/Library/Application Support/claude-switcher/` 下的保镖/看门狗属 root:wheel，任何功能都不要改回写 `~/.local/bin/` 下的同名脚本（用户可写=提权面）；需要变更时引导用户重跑安装器。日志写在 root 所有的 `/var/log/claude-switcher/`，不要以 root 追加到用户目录（符号链接会被跟过去）
+6. **守护进程脚本只在 root 目录**：`/Library/Application Support/claude-switcher/` 下的保镖/巡检属 root:wheel，任何功能都不要改回写 `~/.local/bin/` 下的同名脚本（用户可写=提权面）；需要变更时引导用户重跑安装器。日志写在 root 所有的 `/var/log/claude-switcher/`，不要以 root 追加到用户目录（符号链接会被跟过去）
 
 ## 问题修复决策规则（Agent 必须遵守）
 
@@ -314,7 +317,7 @@ Windows 用户请使用 `windows/` 下的 PowerShell 版本。关键差异与注
 - **保镖实现**：用计划任务（AtLogOn 触发）启动隐藏 PowerShell 常驻进程，10 秒巡检，与 Mac 版行为一致。
 - **robocopy 退出码**：0-7 都是成功，8+ 才是失败——判断切换成败时不要按常规退出码判断。
 - **切换写入顺序**：先复制到 `accounts\<槽位>.new`，复制成功后才改名提交，旧快照暂存为 `.previous`。同盘时，载入暂存与换位备份放在 `%USERPROFILE%\.claude-switcher\staging\Claude.new` / `Claude.old`，避免 `%APPDATA%` 同时出现多个 Claude 数据目录；重定向到不同盘时回退 `%APPDATA%\Claude.new` / `Claude.old` 以避免跨卷改名。数据与 `current.txt` 先一起提交，再清理旧目录。预先存在的不明残留一律拒绝覆盖、绝不自动删除；仅 `staging\cleanup.json` 能证明路径与当前账号归属的 `Claude.old` 可在下次切换前重试清理。隔离回归：`powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-switch-integration.ps1`（临时目录 + 打桩进程，不需要真机账号）。
-- **账号数据目录**：传统 EXE 版为 `%APPDATA%\Claude`；旧目录不存在时自动发现 MSIX/Appx 的 `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>`（不是 macOS 的 `~/Library/Application Support/Claude`）。WPF 与 `status` 均支持 A–D、快照大小和日期；切换前必须重新完成审计。`keep-in-workspace.txt` 的语义与 macOS 相同，但 Windows 还需拒绝重解析点。
+- **账号数据目录**：传统 EXE 版为 `%APPDATA%\Claude`；旧目录不存在时自动发现 MSIX/Appx 的 `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>`（不是 macOS 的 `~/Library/Application Support/Claude`）。WPF 与 `status` 均支持 A–H、快照大小和日期；切换前必须重新完成审计。`keep-in-workspace.txt` 的语义与 macOS 相同，但 Windows 还需拒绝重解析点。
 - **代理客户端**：支持 `clash-verge` / `flclash` / `sing-box` / `clashx` / `surge` / `wireguard` / `other` / `auto`。`set-client` 同时更新核心脚本与 `proxy-mode.txt`，保镖每轮重新读取该文件；不要套用 macOS 的 root 守护同步方式。
 - **工具与快照**：`fingerprint`、`cli-info`、`open-safe`、`diagnose-proxy` 均已提供 Windows 实现。`snapshot-export` / `snapshot-import` 使用流式 `.csnap`（PBKDF2-HMAC-SHA256 200,000 轮、AES-256-CBC、HMAC-SHA256），不与 macOS DMG 兼容；密码仅经 stdin，先认证再解压，目标槽位非空或包路径越界必须拒绝。隔离回归另有 `tests\windows-snapshot-integration.ps1`。
 - **检查设置与日志**：Windows 有自己的 6 项非关键检查白名单（macOS 为 8 项），`allowOptionalFailures` 的作用边界与 macOS 一致；配置在 `%USERPROFILE%\.claude-switcher\checks.json`，脱敏日志在 `%USERPROFILE%\.claude-switcher\logs\client.log`，512 KiB 轮转。WPF 设置窗口和 `export-diagnostics` 可导出脱敏诊断 zip，不得包含账号、IP、凭据、Clash 配置或原始检查详情。独立代理诊断不得创建账号状态或写客户端日志。

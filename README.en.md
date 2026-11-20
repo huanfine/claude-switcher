@@ -38,7 +38,7 @@ repository, command-line script, and build artifact name.
   reachability, and better-node availability. Results are `ok` / `fail` /
   `config` / `warn` / `skip`; both `fail` and `config` block launch, and `skip`
   never counts as a pass.
-- **Snapshot switching (A–D)** — archives and restores whole account
+- **Snapshot switching (A–H)** — archives and restores whole account
   directories; APFS copy-on-write cloning avoids duplicating unchanged data.
   A slot also carries the Claude Code CLI state (`~/.claude/` and
   `~/.claude.json`), so the terminal and the desktop app never share a session.
@@ -64,6 +64,12 @@ repository, command-line script, and build artifact name.
   and local vantage points to distinguish a proxied path from a direct one.
 - **IP purity score** — an explainable 0–100 score from four independent data
   sources plus local PTR, with degraded verdicts when sources are unreachable.
+  Reputation penalties are continuous (about one point per five risk points,
+  no tier jumps) and never influence the node *type* — type comes only from
+  structural evidence, so a one-point reputation wobble cannot relabel a line.
+  Two caps exist: a residential verdict reached only by "nothing bad found"
+  caps at 70, and an unverified risk dimension caps at 85 with at most an
+  advisory verdict — "not checked" never reports as "clean".
   A low score is a soft signal: it never decides whether Claude can start, so
   the home screen shows passed-check counts (16/16) instead of an overall
   score, and the ring's color only answers whether Claude can start.
@@ -81,7 +87,7 @@ repository, command-line script, and build artifact name.
 - **Web check page** — a static browser-side check for exit IP, time zone,
   language, WebRTC, IPv6, DNS reachability, and common fingerprint signals.
 - **Windows and Linux ports (beta)** — PowerShell and bash implementations with
-  the same audit and switching model. Windows also includes A–D accounts,
+  the same audit and switching model. Windows also includes A–H accounts,
   proxy-client switching, read-only inspection tools, isolated browsing,
   standalone proxy diagnostics, and encrypted `.csnap` snapshots (not
   compatible with macOS DMG). New Windows UI and runtime flows still require
@@ -224,9 +230,12 @@ restarts the proxy client once. To switch manually:
 ```
 
 Keep `proxy` only if you switch to a UDP-capable node. When `IP purity` reports
-a "type estimate / reputation not measured" score, none of the risk sources
-answered: that number is a type-based baseline, not a measured reputation, and
-it is retried automatically after 5 minutes.
+a "type estimate / reputation not measured" or "risk not verified / capped"
+score, the risk dimension was not verified this round: either none of the risk
+sources answered (the number is a type-based baseline) or the type evidence
+arrived without a reputation score (capped at 85, never better than an
+advisory). Neither is a measured reputation, and both are retried after
+5 minutes.
 
 ## Exit IP score looks wrong
 
@@ -344,7 +353,7 @@ back at the same button.
    before switching (it writes to the directory being swapped).
 4. To pin an exit to a slot, scan once from the "更优节点 / Better node" row,
    then use the link icon in the top-right corner of a slot card and pick a
-   candidate from the report (`slot-node set <A-D> <node>` on the command line).
+   candidate from the report (`slot-node set <A-H> <node>` on the command line).
 5. After changing to a node in another country, run
    `~/.local/bin/claude-switch.sh set-region`.
 
@@ -374,7 +383,7 @@ protection differs**. Check what your platform actually has before installing:
 |---|---|---|---|
 | Per-item checks | 16 | 14 (no IP purity / better node) | 14 (same) |
 | Report v2 / offline conversion | ✓ | ✓ | ✓ |
-| One-click repair / A–D switching | ✓ | ✓ | ✓ |
+| One-click repair / A–H switching | ✓ | ✓ | ✓ |
 | Bodyguard (stops Claude when the proxy dies) | ✓ root LaunchDaemon | ✓ scheduled task | ✓ |
 | Launch lease (120s one-shot authorization) | ✓ | ✗ | ✗ |
 | Runtime egress watchdog (stops on egress drift) | ✓ | ✗ | ✗ |

@@ -9,6 +9,12 @@ final class FixtureDelegate: AppDelegate {
             fatalError("隔离演示需要显式传入 fake-core.sh 路径")
         }
         super.init(vm: VM(core: CommandLine.arguments[1]))
+        // 截图用：把「拦截历史 / 延迟采样」指到演示目录，别把真机记录画进去。
+        // NSHomeDirectory() 不认 $HOME，所以这里显式改路径（两个字段在生产代码里是 var）。
+        if let demo = ProcessInfo.processInfo.environment["DEMO_HOME"] {
+            vm.incidentsPath = demo + "/.claude-switcher/incidents.log"
+            vm.rttPath = demo + "/.claude-switcher/rtt.log"
+        }
     }
 
     override func applicationDidFinishLaunching(_ notification: Notification) {

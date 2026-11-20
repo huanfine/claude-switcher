@@ -98,7 +98,7 @@ lease                → claude-switcher-lease/1
 | `bodyguard` | 保镖 | 服务注册 + 脚本归属与权限 | 硬 |
 | `rules` | 规则置顶 | 读运行内核 `/rules` 按索引逐条比对，不是比对磁盘文件 | 硬 |
 | `client_language` / `asn` | 客户端语言 / ASN属性 | defaults 读取 / ASN 归属 | 软 |
-| `ip_purity` | IP纯净度 | 4 源并行 + PTR，类型基线 − 扣分 | 软 |
+| `ip_purity` | IP纯净度 | 4 源并行 + PTR，类型基线 − 连续扣分；类型只看结构证据 | 软 |
 | `ecosystem` | 生态可达性 | claude.ai 与 api.anthropic.com 各一次 | 软 |
 | `better_node` | 更优节点 | 只读扫描报告文件，检查预算内零网络请求 | 软 |
 
@@ -121,11 +121,11 @@ lease                → claude-switcher-lease/1
 
 ## 7. 账号隔离与节点治理
 
-一个槽位 = 两棵树：桌面版 `accounts/<A-D>/`，Claude Code `cli/<A-D>/home{,.json}`。
+一个槽位 = 两棵树：桌面版 `accounts/<A-H>/`，Claude Code `cli/<A-H>/home{,.json}`。
 归档是移动语义；载入先写 `.new` 成功后才提交；目标槽位没存档时 `restore_cli` 会清空现场
 （否则新槽位继承上一个账号登录态，等于没隔离）；`.new` / `.previous` 残留一律拒绝覆盖。
 
-节点治理是**只读优先**：扫描不切节点（逐节点实测会污染 iphistory 并触发看门狗），
+节点治理是**只读优先**：扫描不切节点（逐节点实测会污染 iphistory 并触发巡检），
 硬门槛先于评分（国家、Tor/代理、UDP），差距不足 10 分不出 BEST，应用时重新实时判门禁、
 切后复查国家不达标自动回滚。槽位绑定优先于本次最优。
 

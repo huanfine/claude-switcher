@@ -15,7 +15,7 @@
 
 - **Kill-Switch 是进程级急停，不是防火墙级 fail-closed**。保镖以 10 秒周期巡检"内核进程 × TUN 网卡"双因子，从隧道断开到进程被杀存在已知时间窗口（TOCTOU）；窗口内恰好发出的数据包不在防护范围内。未来版本评估引入 pf 防火墙锚点做网络级 fail-closed
 - **自动更新的信任根是 GitHub 仓库本身**。每次更新前会对照仓库根的 `SHA256SUMS` 逐项校验 zip 工件（core 脚本 + daemons 模板 + installer），可防传输层篡改/中间人换包；但如果仓库账号本身被攻陷，校验清单和工件会同时被替换——这是目前的信任边界。维护侧的发布纪律：`core/`、`daemons/`、`installer/` 任何改动提交前必须运行 `scripts/gen-sums.sh` 重新生成 SHA256SUMS，二者永远同提交
-- **守护进程脚本 root 所有、用户态不可写**。保镖与时区看门狗安装在 `/Library/Application Support/claude-switcher/`（root:wheel, 755），launchd 以 root 执行这些脚本，普通用户进程无法篡改其内容——本地权限提升面已收敛
+- **守护进程脚本 root 所有、用户态不可写**。保镖与时区巡检安装在 `/Library/Application Support/claude-switcher/`（root:wheel, 755），launchd 以 root 执行这些脚本，普通用户进程无法篡改其内容——本地权限提升面已收敛
 - **自动更新运行在用户态**（LaunchAgent），不再持有 root；需要 root 的守护脚本变更只提示用户运行安装器，绝不自动写系统目录
 
 ## 安全变更记录
