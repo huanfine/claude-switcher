@@ -39,6 +39,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -216,12 +217,15 @@ esac''')
 esac''' % (rdns, rdns))
 
     def stub_net(self, ipquery="", ipapi="", ipinfo="", sfs=SFS_CLEAN, calls=None,
-                 widget=None, scam=None):
+                 widget=None, scam=None, ipapi_flaky_once=False):
         """六个源各喂一份响应;calls 传文件名则记录每次调用。
 
         widget / scam 缺省给「正常答话」的响应(ipinfo 说 isp、欺诈分 0)——
         这两个源是类型证据与展示口径的一部分,大多数用例的期望值建立在
         「它们正常答话」之上。要测「源挂了」的场景,显式传空字符串。
+
+        ipapi_flaky_once=True 模拟「第一次连接挂住、超时后重试才成功」:
+        实测 ip-api 经隧道偶发 4 秒无响应(curl (28)),而重试一次 0.1 秒就回来了。
         """
         if widget is None:
             widget = _widget()
@@ -235,10 +239,16 @@ esac''' % (rdns, rdns))
         log = ""
         if calls is not None:
             log = 'echo "$*" >> "%s"\n' % (self.root / calls)
+        ipapi_cmd = 'cat "%s"' % files["q2"]
+        if ipapi_flaky_once:
+            # 第一次:超时,什么都不吐;第二次(重试):正常答话。
+            mark = self.root / "ipapi-first-call"
+            ipapi_cmd = 'if [ -e "%s" ]; then cat "%s"; else : > "%s"; fi' % (
+                mark, files["q2"], mark)
         self.stub("curl", f'''{log}case "$*" in
   *cdn-cgi/trace*) printf 'ip=203.0.113.10\\nloc=US\\n' ;;
   *api.ipquery.io*) cat "{files['q1']}" ;;
-  *ip-api.com*) cat "{files['q2']}" ;;
+  *ip-api.com*) {ipapi_cmd} ;;
   *widget/demo*) cat "{files['q5']}" ;;
   *ipinfo.io*) cat "{files['q3']}" ;;
   *stopforumspam*) cat "{files['q4']}" ;;
@@ -1058,6 +1068,61 @@ esac''')
         self.assertEqual(len(asn), 1, run.stdout)
         self.assertIn("ASN属性=ok:", asn[0])
         self.assertIn("GTT", asn[0])
+
+    def test_type_cache_writes_placeholder_for_empty_company_type(self):
+        """type-cache 里空字段必须落成占位符,否则这一行读回来就是坏的。
+
+        实测:widget 只给了 asn.type=isp、没有 company 块时,写盘是
+        `ip<TAB>isp<TAB><TAB>ts`。tab 属于 IFS 空白,`read` 会把连续的 IFS 空白
+        当成**一个**分隔符 —— 读回来是 ip / isp / ts 三段,时间戳落进 company 位、
+        tts 为空,整行按无效记录跳过。也就是说 asn.type=isp 这条最硬的正面证据
+        写了等于没写(限流期间正好靠它兜底)。
+        """
+        self.write_env("America/New_York")
+        # widget 正常答话但只有 asn.type,没有 company.type。
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                           timezone="America/New_York"),
+                      RATE_LIMITED, widget=_widget(asn_type="isp", company_type=None))
+        self.run_detail()
+        cache = self.home / ".claude-switcher" / "type-cache"
+        self.assertTrue(cache.exists(), "没写 type-cache")
+        row = cache.read_text(encoding="utf-8").strip()
+        self.assertEqual(row.split("\t")[1:3], ["isp", "-"], row)
+
+    def test_ipapi_timeout_is_retried_once(self):
+        """ip-api 一次超时不该被记成「仅一家风险源可达」。
+
+        实测现场(2026-11-21):同一个 `checkdetail` 连跑三次,两次纯净度只有 85 分
+        并标「仅一家风险源可达」;插桩抓到 ip-api 回 `curl: (28) Operation timed out
+        after 4004 milliseconds`,而同一时刻单发只要 0.12 秒。ipinfo 两个端点在这条
+        出口上长期 429(见 RATE_LIMITED),所以 src_n 的理论上限就是 2 —— ipquery
+        + ip-api,一家抖一下就掉到 1。那是我们的取数失败被写成了对用户线路的怀疑。
+        夹具按现场搭:ipinfo 两个端点都 429、把类型证据放进缓存、ip-api 首次超时。
+        """
+        self.write_env("America/New_York")
+        (self.home / ".claude-switcher" / "type-cache").write_text(
+            "203.0.113.10\tisp\t-\t%d\n" % int(time.time()), encoding="utf-8")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      RATE_LIMITED, widget="Too Many Requests",
+                      ipapi_flaky_once=True)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "ok", detail)
+        self.assertEqual(self.score(detail), 100, detail)
+        self.assertNotIn("仅一家风险源可达", detail)
+
+    def test_persistent_single_source_still_says_only_one(self):
+        """重试后仍然只有一家,必须照旧挂标记 —— 别让重试把真实缺口盖掉。
+
+        上一条的护栏:如果重试写成「不管成不成都当两源答话」,这条会红。
+        """
+        self.write_env("America/New_York")
+        (self.home / ".claude-switcher" / "type-cache").write_text(
+            "203.0.113.10\tisp\t-\t%d\n" % int(time.time()), encoding="utf-8")
+        self.stub_net(CARRIER_CLEAN, "", RATE_LIMITED, widget="Too Many Requests")
+        state, detail, _ = self.run_detail()
+        self.assertIn("仅一家风险源可达", detail)
+        self.assertNotEqual(state, "ok", detail)
 
     def test_single_risk_source_never_labels_hosting(self):
         """只剩一家风险源时,未收录的运营商名不能变成「机房」。

@@ -2982,7 +2982,7 @@ ip_purity() {
     #      失效,不进模型(2026-11-21 实测它对同一 IP 说 Server:Yes 而 ipinfo 说 isp,
     #      多库并列的意义正在于让这种分歧可见,而不是硬选一边)。
     curl -sL --max-time 6 -H "User-Agent: $PURITY_UA" "https://api.ipquery.io/$ip" >"$q1" 2>/dev/null &
-    curl -s --max-time 4 "http://ip-api.com/json/$ip?fields=status,proxy,hosting,mobile,city,regionName,timezone,countryCode" >"$q2" 2>/dev/null &
+    curl -s --max-time 6 "http://ip-api.com/json/$ip?fields=status,proxy,hosting,mobile,city,regionName,timezone,countryCode" >"$q2" 2>/dev/null &
     curl -sL --max-time 4 "https://ipinfo.io/$ip/json" >"$q3" 2>/dev/null &
     curl -s --max-time 4 "https://api.stopforumspam.org/api?ip=$ip&json" >"$q4" 2>/dev/null &
     curl -sL --max-time 6 -H "User-Agent: $PURITY_UA" "https://ipinfo.io/widget/demo/$ip" >"$q5" 2>/dev/null &
@@ -2992,6 +2992,18 @@ ip_purity() {
     b3=$(cat "$q3" 2>/dev/null); b4=$(cat "$q4" 2>/dev/null)
     b5=$(cat "$q5" 2>/dev/null); b6=$(cat "$q6" 2>/dev/null)
     rm -f "$q1" "$q2" "$q3" "$q4" "$q5" "$q6"
+    # 一次超时不等于「这个源答不上来」。ip-api 走明文 HTTP,经隧道偶发挂到 4 秒以上
+    # (2026-11-21 实测 curl (28) Operation timed out after 4004 milliseconds,
+    #  而同一时刻单发只要 0.12 秒);ipquery 在并发负载下也从 1.1 秒涨到 3.3 秒。
+    # 这两家是 src_n 的主要来源,掉一家就会被记成「仅一家风险源可达」+ 封顶 85 ——
+    # 明明是我们自己取数抖了一下,却写成了对用户线路的怀疑。空体重试一次,
+    # 仍然空才认:真的要判「只有一家源」时,失败是稳定的,重试只是筛掉抖动。
+    if ! printf '%s' "$b2" | grep -q '"status"'; then
+        b2=$(curl -s --max-time 6 "http://ip-api.com/json/$ip?fields=status,proxy,hosting,mobile,city,regionName,timezone,countryCode" 2>/dev/null)
+    fi
+    if ! printf '%s' "$b1" | grep -q '"ip"'; then
+        b1=$(curl -sL --max-time 6 -H "User-Agent: $PURITY_UA" "https://api.ipquery.io/$ip" 2>/dev/null)
+    fi
     # widget 是多行缩进 JSON,scamalytics 是 HTML 夹 JSON;_ipfield 按「一行里的
     # "key":value」找,多行会漏。压平成单行再喂给它,省得为两个字段引入 jq/python。
     b5=$(printf '%s' "$b5" | tr -d '\n \t')
@@ -3053,8 +3065,12 @@ ip_purity() {
             [ "$tcip" = "$ip" ] || continue
             case "${tts:-}" in ''|*[!0-9]*) continue ;; esac
             [ $((tnow - tts)) -lt "$TYPE_CACHE_TTL" ] || break
-            [ -z "$wi_asn_type" ] && wi_asn_type="${tasn:-}"
-            [ -z "$wi_comp_type" ] && wi_comp_type="${tcomp:-}"
+            # 空字段写成「-」(见下面的写回):tab 属于 IFS 空白类,read 会把连续的
+            # IFS 空白**合并成一个分隔符** —— 「ip<TAB>isp<TAB><TAB>ts」读回来是
+            # 三段,时间戳落到 company 位、tts 为空,整行被当成无效记录跳过。
+            # 实测 asn.type=isp 而 company.type 为空时,缓存写了等于没写。
+            [ -z "$wi_asn_type" ] && [ "${tasn:-}" != "-" ] && wi_asn_type="${tasn:-}"
+            [ -z "$wi_comp_type" ] && [ "${tcomp:-}" != "-" ] && wi_comp_type="${tcomp:-}"
             break
         done < "$BASE/type-cache"
     fi
@@ -3062,8 +3078,9 @@ ip_purity() {
     # 无限续命,从此再也不用向 ipinfo 求证 —— 那就是拿缓存冒充实时结论。
     if [ -n "${BASE:-}" ] && { [ -n "$live_asn" ] || [ -n "$live_comp" ]; }; then
         ttmp="$BASE/type-cache.$$"
+        # 空字段落成「-」而不是空串,理由见上面读回那里的注释。
         { grep -vF "$ip"$'\t' "$BASE/type-cache" 2>/dev/null
-          printf '%s\t%s\t%s\t%s\n' "$ip" "${wi_asn_type:-}" "${wi_comp_type:-}" "$tnow"; } \
+          printf '%s\t%s\t%s\t%s\n' "$ip" "${wi_asn_type:--}" "${wi_comp_type:--}" "$tnow"; } \
             2>/dev/null | tail -40 > "$ttmp" && mv "$ttmp" "$BASE/type-cache" 2>/dev/null
     fi
     # privacy.* 直接并进对应证据位:vpn/proxy/tor 是代理类证据(px_w),hosting 是
