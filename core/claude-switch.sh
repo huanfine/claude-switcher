@@ -1866,28 +1866,34 @@ def node_scan(clash_dir, group):
     # Selector;递归全列会给出「去改手动切换组」这种建议,等于替用户动了
     # 他没让我们碰的组。沿 now 链走到最深一层含叶子的 Selector 就停。
     def controlling_selector():
-        name, best, seen = group, "", set()
+        # 顺便收集链路明细:报错只说「没有可手动选择的节点组」,用户不知道是
+        # 哪一环的问题 —— 实测订阅把 Selector 改成 Fallback 后就是这句话,
+        # 用户以为是我们坏了。把每个组的名字和类型列出来,一眼看出是谁变的。
+        name, best, seen, chain = group, "", set(), []
         while is_group(name) and name not in seen:
             seen.add(name)
             item = proxies[name]
             children = item.get("all") or []
-            if str(item.get("type", "")).lower() == "selector" and any(
+            itype = str(item.get("type", "")).lower()
+            chain.append("%s(%s)" % (name, item.get("type", "")))
+            if itype == "selector" and any(
                     child not in builtin and not is_group(child) for child in children):
                 best = name
             nxt = str(item.get("now") or "")
             if not nxt or not is_group(nxt):
                 break
             name = nxt
-        return best
+        return best, chain
 
     # 只收「直接挂在 Selector 下的叶子」。URLTest / Fallback 会自己选路,
     # 对它们 PUT /proxies 会被内核覆盖或拒绝,列进候选等于给一个按不动的建议。
     rows = []
     if not group or not is_group(group):
         fail("配置的代理组不存在或不是代理组:" + str(group))
-    selector = controlling_selector()
+    selector, chain_desc = controlling_selector()
     if not selector:
-        fail("当前链路上没有可手动选择的节点组")
+        fail("当前链路上没有可手动选择的节点组(链路:" + " → ".join(chain_desc)
+             + ";若某组是 URLTest/Fallback 自动选路,切换须改回手动选择或换组)")
     item = proxies[selector]
     for child in item.get("all") or []:
         if child in builtin or is_group(child):
@@ -2886,17 +2892,21 @@ ip_purity() {
     #   (asn.type=isp / 白名单 / PTR),「无正面住宅证据封顶 70」删除 —— 干净出口
     #   就是 100;widget 挂了且名字无分类时给「类型不明」而不是冒充住宅。
     #   detail 里新增「欺诈分 N」展示字段。分数语义与类型判定都变了,必须换名。
+    # v10:「类型不明」不再产数字分数(用户 2026-11-21 指出:放一个猜的 70 不如
+    #   不放)—— 分数列为空,detail 前缀改「未评级(类型证据缺失)」。缓存列结构
+    #   没变,但分数列出现了新的合法空值,旧 v9 里数值型的 70 与新口径结论相悖,
+    #   必须换名让它整体作废。
     # 注意缓存里存的是**成品文案**(第 6 列),所以任何措辞变更都得换文件名,
     # 否则用户 24 小时内看到的还是旧话 —— 这一条以后会一直踩,别再想省这个版本号。
-    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v9" ]; then
+    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v10" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
-            case "${cscore:-}" in ''|*[!0-9]*) continue ;; esac
+            case "${cscore:-}" in ''|*[!0-9]*) [ -n "$cscore" ] && continue ;; esac
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v9"
+        done < "$BASE/purity-cache.v10"
     fi
 
     local q1 q2 q3 q4 q5 q6 b1 b2 b3 b4 b5 b6 rdns=""
@@ -3222,8 +3232,16 @@ ip_purity() {
         base=70
     fi
 
-    local score=$((base - pen))
-    [ "$score" -lt 0 ] && score=0
+    local score=""
+    if [ "$type" != "unknown" ]; then
+        # 类型不明时不产数字:**没有任何正面证据的 70 是拍出来的基线,不是量出来的分**。
+        # 放一个看起来精确的猜测分数,比明说「未评级」更有害 —— 用户会拿它跟
+        # ip.net.coffee 的实测分对比,发现对不上只会以为我们算错了。
+        # 判定不受影响:unknown 的基线 70 减去最大惩罚 14 也到不了 50 分线,
+        # 本来就永远是 warn(2026-11-21 实证枚举),删数字不改变任何门禁行为。
+        score=$((base - pen))
+        [ "$score" -lt 0 ] && score=0
+    fi
 
     # 「没查」不等于「查干净了」,这一条以前是**直接跳过扣分**:风险维度取不到值,
     # 罚分自然是 0,于是一个 ipquery 超时的白名单出口照样拿 100/ok —— 和两家源都
@@ -3235,7 +3253,8 @@ ip_purity() {
     local unverified=""
     if [ -z "$risk_known" ] || [ "$src_n" -lt 2 ] || [ -n "$degraded" ]; then
         unverified=1
-        [ "$score" -gt 85 ] && score=85
+        # 空分数(类型不明)没有可封顶的数字,标记与判定降档照常生效。
+        [ -n "$score" ] && [ "$score" -gt 85 ] && score=85
     fi
 
     # 判定比分数严:分数是 IP 信誉(宽口径),判定回答的是「能不能拿它开 Claude」。
@@ -3246,6 +3265,10 @@ ip_purity() {
     local verdict
     if [ -n "$tor" ] || [ -n "$px_strong" ]; then
         verdict=fail
+    elif [ -z "$score" ]; then
+        # 类型不明:没有量出来的分数,判定封顶在提示档。基线 70 减最大惩罚
+        # 本来就到不了 50 分线(见 score 处的注释),行为与旧口径完全一致。
+        verdict=warn
     elif [ -n "$degraded" ]; then
         # 降级判型:类型之外的东西一概没验证,判定封顶在 warn。
         # 拿我们自己的网络抖动去拦用户启动,是拿误报换安全感。
@@ -3313,11 +3336,15 @@ ip_purity() {
     # 降级时 score 只是「按运营商名/PTR 推出的类型基线」,风险维度一个都没验证过。
     # 不加标记地报「评分 60/100」,用户会当成实测信誉分,而这个数还会在缓存里
     # 反复出现五分钟。保留「评分 N/100」前缀(下游与测试都按它取数),补上口径。
-    local score_label="评分 ${score}/100"
-    if [ -n "$degraded" ]; then
+    local score_label
+    if [ -z "$score" ]; then
+        score_label="未评级(类型证据缺失)"
+    elif [ -n "$degraded" ]; then
         score_label="评分 ${score}/100(类型预估·未实测信誉)"
     elif [ -n "$unverified" ]; then
         score_label="评分 ${score}/100(风险未验证·封顶)"
+    else
+        score_label="评分 ${score}/100"
     fi
     # 判定词单独写出来。分数是信誉分(宽口径),判定是「这次能不能开」,
     # 两者不是同一个轴 —— 实测用户会拿「这个 53 分、那个 43 分」反推「53 更安全」,
@@ -3357,12 +3384,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「证据不全就提前重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v9.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v9" 2>/dev/null
+        tmp="$BASE/purity-cache.v10.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v10" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v9" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v10" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null
@@ -4623,7 +4650,9 @@ scan_nodes() {
                     IFS='|' read -r score verdict ptype detail cc < "$tmp/p_$ip"
                 fi
                 case "$score" in
-                    ''|*[!0-9]*) why="未取到评级"; score=""; eligible=0 ;;
+                    # 空分数不再是「取不到」,而是「未评级」这个合法结论(类型证据
+                    # 缺失)。没有量出来的分就没法排名,不参与候选,但话要说对。
+                    ''|*[!0-9]*) why="未评级(类型证据缺失)"; score=""; eligible=0 ;;
                 esac ;;
             *) why="出口类型未知"; eligible=0 ;;
         esac
@@ -4649,10 +4678,10 @@ scan_nodes() {
         # 第 9 列是分数区间,给排名表一个参照系。放在最后,前面各列的
         # 序号和 sort 键都不受影响。
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "${score:-0}" "$eligible" "$leaf" "$ip" "$cc" "$verdict" "$why" "$sel" \
+            "${score:-}" "$eligible" "$leaf" "$ip" "$cc" "$verdict" "$why" "$sel" \
             "$(purity_band "${score:-}")" >> "$tmp/ranked"
         if [ "$leaf" = "$current" ]; then
-            cur_ip="$ip"; cur_score="${score:-0}"
+            cur_ip="$ip"; cur_score="${score:-}"
         fi
     done < "$raw"
     # 当前节点没被枚举到(例如它挂在 URLTest 下)时,单独给它打一次分。
@@ -4668,13 +4697,20 @@ scan_nodes() {
         # 第 9 列(区间)必须有变量接住:read 的最后一个变量会吞掉剩余整段,
         # 少写一个就会把「优秀」拼进 BEST_SELECTOR,切节点时找不到那个名字。
         IFS=$'\t' read -r best_score eligible best_leaf best_ip best_cc verdict why best_sel best_band <<<"$line"
-        delta=$((best_score - cur_score))
         top_eligible=$best_score
-        # BEST 只表示「值得换」的那个节点。差距不够就把整组字段清空,
-        # 别留一个 BEST= 空、BEST_IP 却有值的半截报告给界面读。
-        if [ "$delta" -lt "$NODE_SCAN_MARGIN" ]; then
-            best_leaf=""; best_score=0; best_ip=""; best_cc=""; best_sel=""; delta=0
-        fi
+        # 当前节点没量出分数时没有比较基准 —— 拿 0 当基准会把「没查到」包装成
+        # 「比当前高 N 分」,和「没查冒充查干净」是同一种错。建议整体清空,
+        # 与 margin 不足走同一个出口。
+        case "${cur_score:-}" in
+            ''|*[!0-9]*) best_leaf=""; best_score=0; best_ip=""; best_cc=""; best_sel=""; delta=0 ;;
+            *)
+                delta=$((best_score - cur_score))
+                # BEST 只表示「值得换」的那个节点。差距不够就把整组字段清空,
+                # 别留一个 BEST= 空、BEST_IP 却有值的半截报告给界面读。
+                if [ "$delta" -lt "$NODE_SCAN_MARGIN" ]; then
+                    best_leaf=""; best_score=0; best_ip=""; best_cc=""; best_sel=""; delta=0
+                fi ;;
+        esac
     fi
 
     IFS='|' read -r gate reason <<<"$(node_gate)"
@@ -4728,7 +4764,11 @@ scan_nodes() {
             ''|0|*[!0-9]*) ;;
             *) cur_note="($(purity_band "$cur_score"))" ;;
         esac
-        echo "当前 $current · 评分 ${cur_score:-未评级}/100${cur_note}"
+        if [ -n "${cur_score:-}" ]; then
+            echo "当前 $current · 评分 ${cur_score}/100${cur_note}"
+        else
+            echo "当前 $current · 未评级(类型证据缺失)"
+        fi
         echo "候选 $candidates 个 → 去重 $unique 个出口 · 过硬门槛 $eligible_n 个 · 出口未知 $unknown_n 个"
         echo "门禁:${gate}${reason:+($reason)}"
         if [ "$pref_match" = "1" ]; then
@@ -4743,7 +4783,7 @@ scan_nodes() {
         else
             # 只比「过硬门槛内」的候选。下面名单里那些分数更高但被硬门槛
             # 排除的,不能算进「更干净」,否则 68 分 vs 49 分看起来像自相矛盾。
-            echo "过硬门槛内没有更优节点 · 合格最高 ${top_eligible} 分 / 当前 ${cur_score:-0} 分 · 差距 < ${NODE_SCAN_MARGIN} 分"
+            echo "过硬门槛内没有更优节点 · 合格最高 ${top_eligible} 分 / 当前 ${cur_score:-未评级} 分 · 差距 < ${NODE_SCAN_MARGIN} 分"
             local excluded_high
             excluded_high=$(awk -F'\t' -v cur="${cur_score:-0}" \
                 '$2==0 && ($1+0)>(cur+0) {n++} END {print n+0}' "$tmp/sorted")

@@ -255,10 +255,11 @@ evidence, not by name: a whitelist hit is residential, an explicit
 datacenter/cloud/backbone keyword in the operator name is datacenter, and
 since 2026-11-21 residential additionally requires **positive evidence** —
 the ipinfo widget's `asn.type`/`company.type` = `isp`, the whitelist, or a
-broadband PTR hostname. With none of the three the exit falls back to the
-neutral 70-point `warn` "type unknown" baseline rather than posing as
-residential. The geography dimension is flagged but no longer deducted from
-the score.
+broadband PTR hostname. With none of the three the exit honestly reports
+"type unknown / not rated (type evidence missing)" at an advisory-only
+verdict, with **no numeric score at all** — a guessed 70 tells the user less
+than admitting nothing was measured. The geography dimension is flagged but
+no longer deducted from the score.
 
 If the app **still** says "datacenter / type unknown" after upgrading, check the
 core script, not the app: every verdict in the UI comes from

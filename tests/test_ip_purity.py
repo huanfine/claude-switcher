@@ -732,6 +732,43 @@ esac''')
         self.assertEqual(len(fields), 7, "v4 应是 7 列,实际 %d: %s" % (len(fields), fields))
         self.assertEqual(fields[6], "US")
 
+    def test_unknown_result_writes_empty_score_row(self):
+        """类型不明的结论落缓存时分数列为空,detail 带「未评级」前缀。
+
+        结论一律 24h 缓存的口径对「未评级」同样适用 —— 它是正常结论,不是错误。
+        """
+        self.write_env("America/New_York")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      IPINFO_CARRIER, widget="")
+        self.run_detail()
+        cache = self.home / ".claude-switcher" / CACHE_NAME
+        self.assertTrue(cache.exists(), "未评级结论也要落缓存(结论一律 24h)")
+        fields = cache.read_text(encoding="utf-8").strip().split("|")
+        self.assertEqual(len(fields), 7, fields)
+        self.assertEqual(fields[3], "", "类型不明的分数列应为空: %s" % fields[3])
+        self.assertIn("未评级(类型证据缺失)", fields[5])
+
+    def test_unknown_cached_result_is_read_back_not_reasked(self):
+        """空分数的缓存行(类型不明·未评级)必须被读回,不能当脏数据重新打源。
+
+        分数列出现合法空值是 v10 的新形态:读缓存的校验只应拒绝「非空且非数字」
+        的损坏行,空分数本身就是结论。校验若写错,巡检会对同一个出口每分钟重问
+        一遍源 —— 这正是 v8 之前那个 1152 请求/天事故的形态。
+        """
+        import time
+        epoch = int(time.time())
+        row = ("203.0.113.10|%d|warn||unknown|"
+               "未评级(类型证据缺失) · 类型不明 · GTT Communications Inc. ·欺诈分0|US" % epoch)
+        (self.home / ".claude-switcher" / CACHE_NAME).write_text(row + "\n", encoding="utf-8")
+        self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID, calls="calls.log")
+        log = self.root / "calls.log"
+        log.write_text("", encoding="utf-8")
+        subprocess.run(["/bin/bash", str(SOURCE), "check"], text=True,
+                       capture_output=True, env=self.env, timeout=180)
+        self.assertEqual(log.read_text(encoding="utf-8").count("api.ipquery.io"), 0,
+                         "空分数缓存行被当成脏数据丢弃,巡检又去打源了")
+
     def test_provisional_result_is_cached_like_any_other(self):
         """证据不全的结果也按 24h 缓存 —— 它不该有自己的过期时间。
 
@@ -839,12 +876,15 @@ esac''')
         self.assertNotIn("建议换住宅", detail)
 
     def test_no_positive_evidence_is_unknown_not_residential(self):
-        """widget 挂、白名单不中、PTR 也没有:老实报「类型不明」,不冒充住宅。
+        """widget 挂、白名单不中、PTR 也没有:老实报「类型不明」,且不给数字分数。
 
         正面证据三选一(asn.type=isp / company.type=isp / 白名单 / PTR 家宽特征)
         一个都没有时,旧口径靠「两家源没查到异常」默认给住宅 —— GTT 就是这么
-        先拿到「住宅宽带」再被「无正面住宅证据」打回 70 的。现在直接报
-        「类型不明」(基线 70,warn):分数与旧口径相同,但标签不再说谎。
+        先拿到「住宅宽带」再被「无正面住宅证据」打回 70 的。中间一版改报
+        「类型不明 70/warn」,但那个 70 是自造基线,不是量出来的分 —— 用户拿它
+        对比 ip.net.coffee 只会更糊涂。用户 2026-11-21 定案:「放一个猜的分数
+        不如不放」。现在报「未评级(类型证据缺失)」+warn,判定行为不变
+        (unknown 基线 70 减最大惩罚本来就永远过不了 50 分硬门槛)。
         """
         self.write_env("America/New_York")
         self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
@@ -852,7 +892,8 @@ esac''')
                       IPINFO_CARRIER, widget="")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
-        self.assertEqual(self.score(detail), 70, detail)
+        self.assertIn("未评级(类型证据缺失)", detail)
+        self.assertNotIn("评分 ", detail)
         self.assertIn("类型不明", detail)
         self.assertNotIn("住宅宽带", detail)
         self.assertNotIn("机房", detail)
