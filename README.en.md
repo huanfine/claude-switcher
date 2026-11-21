@@ -88,6 +88,15 @@ repository, command-line script, and build artifact name.
   A low score is a soft signal: it never decides whether Claude can start, so
   the home screen shows passed-check counts (16/16) instead of an overall
   score, and the ring's color only answers whether Claude can start.
+- **One timeout is not a dead source** — ip-api is plain HTTP and intermittently
+  hangs past four seconds through a tunnel (instrumented run caught
+  `curl: (28) Operation timed out after 4004 ms` while a standalone request took
+  0.12 s). It is one of the two sources that count toward "risk sources that
+  answered", and ipinfo is permanently rate-limited on shared exits, so a single
+  timeout collapses the verdict into "only one risk source reachable · capped at
+  85". The wait is now six seconds, and ipquery / ip-api are each retried once
+  after the parallel batch (only on an empty response); a still-silent source is
+  treated as missing. The retry filters network jitter, it does not lower the bar.
 - **A separate "residential dial-up" tier** — when the ASN type library says
   `asn.type=isp` but ipquery/ip-api report a generic datacenter flag, the exit is
   no longer reported as "datacenter · switch to residential". It is classified as
@@ -454,6 +463,7 @@ field are treated as `unverified`, never as passed.
 - [Security policy](SECURITY.md)
 - [Agent handoff guide](AGENTS.md)
 - [Architecture and known gaps](ARCHITECTURE.md)
+- [Changelog](CHANGELOG.md) — behaviour changes, newest first
 - [Web environment check](https://huanfine.github.io/claude-switcher/) — published
   from `docs/`; enable GitHub Pages (`Deploy from a branch` / `main` / `/docs`)
   before the link resolves.
