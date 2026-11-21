@@ -2688,11 +2688,15 @@ IP_ORG=""; IP_ORG_LOOKED="0"
 # 跨检查还是每次都查 —— 单次约 1.4 秒,占整轮检查的十分之一,而出口 IP 往往
 # 一整天都不动。按 IP 缓存 24 小时:出口换了自然就查新的,没换就不该重复付这个钱。
 ORG_CACHE_TTL=86400
+# 类型证据(asn.type / company.type)同样是 ASN 的固有分类:ipinfo 判 GTT 是 isp,
+# 这个判断一天内不会翻。但它只有 ipinfo 一家能给,而 ipinfo 是免费额度最小的源 ——
+# 必须单独存一份,否则一次 429 就把刚查到过的证据一起丢掉(见 ip_purity)。
+TYPE_CACHE_TTL=86400
 ip_org() {
     [ "$IP_ORG_LOOKED" = "1" ] && { printf '%s' "$IP_ORG"; return 0; }
     IP_ORG_LOOKED="1"
     [ -z "${1:-}" ] && return 0
-    local ip="$1" now cip corg cts tmp
+    local ip="$1" now cip corg cts tmp api stale=""
     now=$(date +%s)
     if [ -n "${BASE:-}" ] && [ -f "$BASE/org-cache" ]; then
         while IFS=$(printf '\t') read -r cip corg cts; do
@@ -2701,13 +2705,39 @@ ip_org() {
             if [ $((now - cts)) -lt "$ORG_CACHE_TTL" ]; then
                 IP_ORG="$corg"; printf '%s' "$IP_ORG"; return 0
             fi
+            # 过期了不丢弃:先记下来,三个源都问不出来时用它兜底(见函数末尾)。
+            # org 是 IP 的固有属性,一天前查到的 GTT 今天还是 GTT。
+            stale="$corg"
             break
         done < "$BASE/org-cache"
     fi
     # 必须查「实际出口 IP」的 ASN。直接查 ipinfo.io/json 取的是访问 ipinfo 自身
     # 那条链路的出口,在分流配置下可能与受保护流量的出口不是同一个 IP,
     # 从而报出不相干的 ASN(例如受保护出口是机房 A,却报成 Cloudflare)。
-    IP_ORG=$(curl -s --max-time 6 "https://ipinfo.io/$1/json" 2>/dev/null | grep '"org"' | cut -d'"' -f4)
+    #
+    # **不能只赌 ipinfo 一家。** 它的免注册额度最小,而共享代理出口很容易把它打满:
+    # 2026-11-21 实测同一条出口连查 8.8.8.8 / 1.1.1.1 / 66.17.65.38 全部回 429
+    # (限流按调用方算,不是按被查地址),/json 与 widget 两个端点一起哑。那天
+    # org-cache 里 GTT 的记录刚过 24h 不到 10 分钟,于是既没续上也没回源成功,
+    # 界面从「ASN 属性:GTT Communications Inc.」掉成「未获取」,整轮少一项通过。
+    # ipquery 与 ip-api 的响应里本来就带运营商名,零额外成本,必须拿它们兜底。
+    IP_ORG=$(curl -s --max-time 6 "https://ipinfo.io/$ip/json" 2>/dev/null | grep '"org"' | cut -d'"' -f4)
+    [ -z "$IP_ORG" ] && IP_ORG=$(curl -s --max-time 6 "https://api.ipquery.io/$ip" 2>/dev/null \
+        | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -z "$IP_ORG" ]; then
+        # ip-api 的 as 字段是「AS3257 GTT Communications Inc.」这种最完整的写法,
+        # org 有时只有公司短名,isp 再退一档。
+        api=$(curl -s --max-time 6 "http://ip-api.com/json/$ip?fields=status,as,org,isp" 2>/dev/null)
+        IP_ORG=$(printf '%s' "$api" | grep -o '"as"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+        [ -z "$IP_ORG" ] && IP_ORG=$(printf '%s' "$api" | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+        [ -z "$IP_ORG" ] && IP_ORG=$(printf '%s' "$api" | grep -o '"isp"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
+    # 三个源全挂,但缓存里那条过期记录本身并没有说错 —— 用它,比在界面上写
+    # 「未获取」诚实。**不写缓存**:没验证过的旧名不该被续命成新证据。
+    if [ -z "$IP_ORG" ] && [ -n "$stale" ]; then
+        IP_ORG="$stale"
+        printf '%s' "$IP_ORG"; return 0
+    fi
     # 查不到就不写缓存:否则一次网络抖动会把「未知」钉住 24 小时
     if [ -n "${BASE:-}" ] && [ -n "$IP_ORG" ]; then
         tmp="$BASE/org-cache.tmp"
@@ -2896,9 +2926,13 @@ ip_purity() {
     #   不放)—— 分数列为空,detail 前缀改「未评级(类型证据缺失)」。缓存列结构
     #   没变,但分数列出现了新的合法空值,旧 v9 里数值型的 70 与新口径结论相悖,
     #   必须换名让它整体作废。
+    # v11:ipinfo 被限流(429)时不再和「类型真的判不出来」共用一句话 —— 文案改成
+    #   「未评级(ipinfo 限流)」+ 标记「·类型源限流」,并且不再劝人「换住宅或原生 IP」
+    #   (那时我们没有任何证据说这个出口不好)。org 与类型证据都加了多源兜底与
+    #   过期缓存兜底,但那两条不改变文案;改文案就必须换名,理由见下。
     # 注意缓存里存的是**成品文案**(第 6 列),所以任何措辞变更都得换文件名,
     # 否则用户 24 小时内看到的还是旧话 —— 这一条以后会一直踩,别再想省这个版本号。
-    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v10" ]; then
+    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v11" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
@@ -2906,7 +2940,7 @@ ip_purity() {
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v10"
+        done < "$BASE/purity-cache.v11"
     fi
 
     local q1 q2 q3 q4 q5 q6 b1 b2 b3 b4 b5 b6 rdns=""
@@ -2977,6 +3011,39 @@ ip_purity() {
     local wi_asn_type="" wi_comp_type=""
     wi_asn_type=$(printf '%s' "$b5" | grep -o '"asn":{[^{]*' | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
     wi_comp_type=$(printf '%s' "$b5" | grep -o '"company":{[^{]*' | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    # ---- 类型证据按 IP 落盘 24h ----
+    # asn.type / company.type 是 ASN 的固有分类,只有 ipinfo 一家能给,而 /json 与
+    # widget 共用同一份免费额度:它一限流,两个端点同时哑。2026-11-21 实测就撞上了——
+    # org-cache 里 GTT 的记录刚过 24h,回源吃 429,于是「运营商名」和「类型证据」
+    # 一起消失,界面从 16 项通过掉到 13 项,而两个源(ipquery/ip-api)明明都通着。
+    # 刚查到过的证据不该因为下一次没问到就作废,所以单独存一份,与 org 同构。
+    local live_asn="$wi_asn_type" live_comp="$wi_comp_type"
+    local tnow tcip tasn tcomp tts ttmp
+    # ipinfo 限流时两个端点的样子不一样:/json 回 {"status":429},widget 回纯文本
+    # Too Many Requests。认出来是为了让文案说实话 —— 见 score_label 与 next。
+    local type_src_down=""
+    printf '%s' "$b3" | grep -q '"status"[[:space:]]*:[[:space:]]*429' && type_src_down=1
+    printf '%s' "$b5" | grep -qi 'too many requests' && type_src_down=1
+    tnow=$(date +%s)
+    if [ -n "${BASE:-}" ] && [ -f "$BASE/type-cache" ]; then
+        while IFS=$(printf '\t') read -r tcip tasn tcomp tts; do
+            [ "$tcip" = "$ip" ] || continue
+            case "${tts:-}" in ''|*[!0-9]*) continue ;; esac
+            [ $((tnow - tts)) -lt "$TYPE_CACHE_TTL" ] || break
+            [ -z "$wi_asn_type" ] && wi_asn_type="${tasn:-}"
+            [ -z "$wi_comp_type" ] && wi_comp_type="${tcomp:-}"
+            break
+        done < "$BASE/type-cache"
+    fi
+    # 只有本次真的问到了才写回。否则「429 → 读盘 → 原样写回」会把一条旧证据
+    # 无限续命,从此再也不用向 ipinfo 求证 —— 那就是拿缓存冒充实时结论。
+    if [ -n "${BASE:-}" ] && { [ -n "$live_asn" ] || [ -n "$live_comp" ]; }; then
+        ttmp="$BASE/type-cache.$$"
+        { grep -vF "$ip"$'\t' "$BASE/type-cache" 2>/dev/null
+          printf '%s\t%s\t%s\t%s\n' "$ip" "${wi_asn_type:-}" "${wi_comp_type:-}" "$tnow"; } \
+            2>/dev/null | tail -40 > "$ttmp" && mv "$ttmp" "$BASE/type-cache" 2>/dev/null
+    fi
     # privacy.* 直接并进对应证据位:vpn/proxy/tor 是代理类证据(px_w),hosting 是
     # 机房证据(dc)。widget 是权威源,它说 true 时不需要第二家印证(px_w 直接
     # 计入 px_strong 的依据)。relay 与 is_anonymous 不在此列:iCloud 中继这类
@@ -3225,6 +3292,9 @@ ip_purity() {
            esac ;;
     esac
 
+    # 限流不能只在分数那一栏暗示:用户看到的是「未评级」,很容易理解成「这个 IP 被判坏了」。
+    # 单独挂一个标记,把「我们的取数被挡住了」和「这个出口有问题」区分开。
+    [ -n "$type_src_down" ] && flags="$flags ·类型源限流"
     # 降级判型时分数封顶 70。70 是本模型里「类型不明」的基线,含义正是「看着还行
     # 但没拿到证据」;带着一个没验证过的出口报 100 分,等于用「没查」冒充「查干净了」。
     # 这里不再叠任何扣分:风险分、滥用频次都取不到,地理也只剩一个源,没有可罚的依据。
@@ -3314,7 +3384,14 @@ ip_purity() {
         residential) next="" ;;
         *)       case "$verdict" in
                      ok)   next="" ;;
-                     warn) next="建议换住宅或原生 IP" ;;
+                     # 类型源限流时我们手上没有任何「它不适合」的证据,劝人换节点
+                     # 等于拿自己的取数失败去指控用户的出口 —— 一个干净的 GTT 出口
+                     # 会被劝去换「住宅或原生 IP」,而这恰恰是它本来就属于的那一类。
+                     warn) if [ -n "$type_src_down" ]; then
+                               next="ipinfo 类型库限流(429),点重新检查可重算"
+                           else
+                               next="建议换住宅或原生 IP"
+                           fi ;;
                      *)    next="换住宅节点后再试" ;;
                  esac ;;
     esac
@@ -3338,7 +3415,13 @@ ip_purity() {
     # 反复出现五分钟。保留「评分 N/100」前缀(下游与测试都按它取数),补上口径。
     local score_label
     if [ -z "$score" ]; then
-        score_label="未评级(类型证据缺失)"
+        # 「我们被限流」和「这个 IP 的类型确实判不出来」是两件事,不能共用一句话:
+        # 前者是我们手上少一份证据,后者是对这个出口下的结论。
+        if [ -n "$type_src_down" ]; then
+            score_label="未评级(ipinfo 限流)"
+        else
+            score_label="未评级(类型证据缺失)"
+        fi
     elif [ -n "$degraded" ]; then
         score_label="评分 ${score}/100(类型预估·未实测信誉)"
     elif [ -n "$unverified" ]; then
@@ -3384,12 +3467,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「证据不全就提前重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v10.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v10" 2>/dev/null
+        tmp="$BASE/purity-cache.v11.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v11" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v10" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v11" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null

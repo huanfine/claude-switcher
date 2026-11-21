@@ -153,6 +153,10 @@ IPINFO_RESID = _ipinfo("AS7922 Comcast Cable Communications, LLC", "Denver")
 IPINFO_HOSTING = _ipinfo("AS14956 RouterHosting LLC", "Ogden")
 IPINFO_PROXY = _ipinfo("AS13335 Cloudflare, Inc.", "Denver")
 SFS_CLEAN = _sfs(0)
+# ipinfo 免注册额度打满时的真实响应体(2026-11-21 实测原样)。
+RATE_LIMITED = json.dumps({"status": 429,
+                           "error": {"title": "Rate limit hit",
+                                     "message": "Sign up at ipinfo.io"}}, indent=2)
 
 
 class IpPurityTests(unittest.TestCase):
@@ -897,6 +901,73 @@ esac''')
         self.assertIn("类型不明", detail)
         self.assertNotIn("住宅宽带", detail)
         self.assertNotIn("机房", detail)
+
+    def test_type_evidence_survives_ipinfo_rate_limit(self):
+        """ipinfo 限流时,刚刚查到过的类型证据不能跟着一起丢。
+
+        2026-11-21 实测事故:org-cache 里 GTT 的记录刚过 24h 不到 10 分钟,回源吃
+        429,运营商名与类型证据同时消失,界面从 16 项通过掉到 13 项 —— 而 ipquery
+        与 ip-api 明明都通着。asn.type=isp 是 ASN 的固有分类,不该因为下一次没问到
+        就作废,所以按 IP 落盘 24h(与 org-cache 同构)。
+        """
+        self.write_env("America/New_York")
+        # 第一轮:widget 正常答话,ipinfo 说 GTT 是 isp → 住宅 100,证据落盘。
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      IPINFO_CARRIER)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "ok", detail)
+        self.assertEqual(self.score(detail), 100, detail)
+        tcache = self.home / ".claude-switcher" / "type-cache"
+        self.assertTrue(tcache.exists(), "类型证据没有落盘")
+        self.assertIn("isp", tcache.read_text(encoding="utf-8"))
+
+        # 第二轮:两个 ipinfo 端点一起 429。类型证据应当从盘里读回来,
+        # 结论不该翻面(这正是「越改越坏」手感的来源:同一个出口一天里忽好忽坏)。
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      RATE_LIMITED, widget="Too Many Requests")
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "ok", "限流把已查到的类型证据一起丢了: %s" % detail)
+        self.assertEqual(self.score(detail), 100, detail)
+        self.assertIn("住宅宽带", detail)
+
+    def test_rate_limited_type_source_is_named_not_blamed(self):
+        """限流时只能说「我们没问到」,不能说「这个 IP 不行」。
+
+        旧文案在同样是空分数的情况下写「建议换住宅或原生 IP」—— 对一个三家源都说
+        干净的 GTT 出口,这是拿自己的取数失败去指控用户的节点。用户在 2026-11-21
+        看到的正是这一句,而它没有任何证据支撑。
+        """
+        self.write_env("America/New_York")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      RATE_LIMITED, widget="Too Many Requests")
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("未评级(ipinfo 限流)", detail)
+        self.assertIn("类型源限流", detail)
+        self.assertNotIn("类型证据缺失", detail)
+        self.assertNotIn("建议换住宅", detail)
+        self.assertIn("点重新检查可重算", detail)
+        self.assertNotIn("评分 ", detail)
+
+    def test_operator_name_falls_back_when_ipinfo_is_rate_limited(self):
+        """ipinfo 429 时运营商名仍然取得到:ipquery / ip-api 的响应里本来就带着它。
+
+        ASN 属性那一项直接调 ip_org,而 ip_org 以前只问 ipinfo —— 429 就报「未获取」,
+        一整轮检查平白少一项通过(2026-11-21 实测 13/16 里少的那一项)。这里从
+        checkdetail 的整段输出看 ASN 属性,确保兜底真的接进了那条路径。
+        """
+        self.write_env("America/New_York")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      RATE_LIMITED, widget="Too Many Requests")
+        _, _, run = self.run_detail()
+        asn = [l for l in run.stdout.splitlines() if l.startswith("ASN属性=")]
+        self.assertEqual(len(asn), 1, run.stdout)
+        self.assertIn("ASN属性=ok:", asn[0])
+        self.assertIn("GTT", asn[0])
 
     def test_single_risk_source_never_labels_hosting(self):
         """只剩一家风险源时,未收录的运营商名不能变成「机房」。

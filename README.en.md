@@ -69,10 +69,22 @@ repository, command-line script, and build artifact name.
   structural evidence, so a one-point reputation wobble cannot relabel a line.
   **Residential needs positive evidence** (ipinfo widget `asn.type=isp`, the
   residential whitelist, or a broadband PTR hostname): a clean exit with
-  positive evidence scores 100; with none of the three it honestly reports
-  "type unknown" at the 70-point warn baseline instead of posing as
-  residential. An unverified risk dimension caps at 85 with at most an
-  advisory verdict — "not checked" never reports as "clean".
+  positive evidence scores 100; with none of the three it reports an
+  **unrated** verdict instead of posing as residential — no invented 70-point
+  baseline, because a guessed number is worse than no number. An unverified
+  risk dimension caps at 85 with at most an advisory verdict — "not checked"
+  never reports as "clean".
+- **One rate-limited source never decides the verdict** — ipinfo's `/json` and
+  `widget/demo` share a single keyless quota, and a shared proxy exit exhausts
+  it fast (HTTP 429; the limit is per *caller*, so querying `8.8.8.8` from the
+  same exit 429s too). The operator name is resolved ipinfo → ipquery → ip-api,
+  `ip_org` follows that same chain on its own instead of trusting one source,
+  and an expired cached name still backstops when all three fail; `asn.type` /
+  `company.type` are cached per IP for 24 hours, so evidence already obtained is
+  not thrown away by the next miss. When the type evidence genuinely cannot be
+  fetched, the label reads "unrated (ipinfo rate-limited)" with a
+  "type source rate-limited" flag, and it will **not** advise switching nodes —
+  at that point we hold no evidence against your exit at all.
   A low score is a soft signal: it never decides whether Claude can start, so
   the home screen shows passed-check counts (16/16) instead of an overall
   score, and the ring's color only answers whether Claude can start.
