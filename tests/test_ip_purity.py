@@ -952,6 +952,26 @@ esac''')
         self.assertIn("点重新检查可重算", detail)
         self.assertNotIn("评分 ", detail)
 
+    def test_rate_limit_flag_only_when_it_changed_the_verdict(self):
+        """ipinfo 的 /json 挂了但 widget 通:/json 的 429 与结论无关,不该挂「类型源限流」。
+
+        实测现场(2026-11-21 06:56 缓存原样):`评分 100/100 · 住宅宽带 · GTT …·类型源限流`
+        —— 一条满分结论后面缀着「限流」,用户只会问「到底限没限」。标记的用途是解释
+        「为什么未评级」,不是记录每一次 429。两个端点各自独立限流,证据拿到了就说明
+        这次限流没有影响判型。
+        """
+        self.write_env("America/New_York")
+        # widget 缺省 = 正常答话;只有 /json 回 429。
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      RATE_LIMITED)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "ok", detail)
+        self.assertEqual(self.score(detail), 100, detail)
+        self.assertIn("住宅宽带", detail)
+        self.assertNotIn("类型源限流", detail)
+        self.assertNotIn("限流", detail)
+
     def test_operator_name_falls_back_when_ipinfo_is_rate_limited(self):
         """ipinfo 429 时运营商名仍然取得到:ipquery / ip-api 的响应里本来就带着它。
 
