@@ -1869,7 +1869,11 @@ def node_scan(clash_dir, group):
         # 顺便收集链路明细:报错只说「没有可手动选择的节点组」,用户不知道是
         # 哪一环的问题 —— 实测订阅把 Selector 改成 Fallback 后就是这句话,
         # 用户以为是我们坏了。把每个组的名字和类型列出来,一眼看出是谁变的。
+        # 同时记下链路上遇到的「自动选路组」(URLTest/Fallback)及其直挂成员:
+        # 那正是「没有可手动目标」时唯一有意义的答案 —— 不是报错,而是说清楚
+        # 这组由内核自己挑、成员是哪几个、所以没有「更优节点」可以选。
         name, best, seen, chain = group, "", set(), []
+        auto = None
         while is_group(name) and name not in seen:
             seen.add(name)
             item = proxies[name]
@@ -1879,19 +1883,33 @@ def node_scan(clash_dir, group):
             if itype == "selector" and any(
                     child not in builtin and not is_group(child) for child in children):
                 best = name
+            if itype in ("urltest", "fallback"):
+                leaves = [c for c in children if c not in builtin and not is_group(c)]
+                auto = (name, item.get("type", ""), leaves)
             nxt = str(item.get("now") or "")
             if not nxt or not is_group(nxt):
                 break
             name = nxt
-        return best, chain
+        return best, chain, auto
 
     # 只收「直接挂在 Selector 下的叶子」。URLTest / Fallback 会自己选路,
     # 对它们 PUT /proxies 会被内核覆盖或拒绝,列进候选等于给一个按不动的建议。
     rows = []
     if not group or not is_group(group):
         fail("配置的代理组不存在或不是代理组:" + str(group))
-    selector, chain_desc = controlling_selector()
+    selector, chain_desc, auto = controlling_selector()
     if not selector:
+        # 链路上没有可手动选的目标,但落点是一个自动选路的组,而且它直挂叶子 ——
+        # 这不是错误,是结论:内核自己在这几个成员里挑,我们无权指定其中一个。
+        # 报错会把「你的配置本来就不需要换节点」说成「工具坏了」,而且界面还会
+        # 反过来催用户去点一个必然失败的按钮(2026-11-21 实测:🤖 OpenAi(Selector)
+        # → 🧠 AI·干净IP(Fallback),成员是两个固定 IP)。
+        if auto and auto[2]:
+            print("NOCHOICE\t" + re.sub(r"[\t\r\n]", " ", auto[0])
+                  + "\t" + re.sub(r"[\t\r\n]", " ", auto[1])
+                  + "\t" + re.sub(r"[\t\r\n]", " ", "|".join(auto[2])))
+            print("CHAIN\t" + re.sub(r"[\t\r\n]", " ", " → ".join(chain_desc)))
+            return
         fail("当前链路上没有可手动选择的节点组(链路:" + " → ".join(chain_desc)
              + ";若某组是 URLTest/Fallback 自动选路,切换须改回手动选择或换组)")
     item = proxies[selector]
@@ -4622,6 +4640,13 @@ checkdetail() {
         ns_gate=$(sed -n 's/^GATE=//p' "$NODE_SCAN_FILE" | head -1)
         ns_pref=$(sed -n 's/^PREFERRED=//p' "$NODE_SCAN_FILE" | head -1)
         ns_match=$(sed -n 's/^PREFERRED_MATCH=//p' "$NODE_SCAN_FILE" | head -1)
+        # 结构型结论:控制链落在自动选路的组上(见 node-scan 的 NOCHOICE 分支),
+        # 「更优节点」这个概念在该链路上不存在 —— 不是没扫,是没什么可比。
+        local ns_nochoice ns_nc_group ns_nc_type ns_nc_members
+        ns_nochoice=$(sed -n 's/^NOCHOICE=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_nc_group=$(sed -n 's/^NOCHOICE_GROUP=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_nc_type=$(sed -n 's/^NOCHOICE_TYPE=//p' "$NODE_SCAN_FILE" | head -1)
+        ns_nc_members=$(sed -n 's/^NOCHOICE_MEMBERS=//p' "$NODE_SCAN_FILE" | head -1)
         # 结论不能只有一句「当前线路最干净」:那等于让用户相信一个看不到
         # 依据的判断。把扫了几个、去重后几个出口、几个过硬门槛、当前多少分、
         # 什么时候扫的,一并写进这一行。旧格式报告缺这些字段时逐项省略,
@@ -4638,7 +4663,18 @@ checkdetail() {
         [ -n "$ns_time" ] && ns_stats="${ns_stats}${ns_stats:+ · }${ns_time} 扫描"
         ns_now=$(date +%s)
         case "${ns_epoch:-}" in ''|*[!0-9]*) ns_epoch=0 ;; esac
-        if [ $((ns_now - ns_epoch)) -gt "$NODE_SCAN_TTL" ]; then
+        if [ "$ns_nochoice" = "1" ]; then
+            # 这条链上没有可手动选的目标:内核自己在那几个成员里挑,我们无权指定。
+            # 给 ok 而不是 skip —— 结论是「不需要换」,不是「没检查」。
+            # 但仍要复核:用户可能换了订阅、改了规则,组已经不再自动选路。
+            if [ $((ns_now - ns_epoch)) -gt "$NODE_SCAN_TTL" ]; then
+                optional_result "更优节点" skip \
+                    "上次判定为自动选路 · 报告已过 24h,点「扫描可用节点」复核(约 1 秒,不查询任何数据源)"
+            else
+                optional_result "更优节点" ok \
+                    "当前组「${ns_nc_group}」由内核自动选路(${ns_nc_type}),没有可手动比较的候选 · 成员:${ns_nc_members} · 保持现状"
+            fi
+        elif [ $((ns_now - ns_epoch)) -gt "$NODE_SCAN_TTL" ]; then
             optional_result "更优节点" skip "扫描报告已过期 · 点「扫描可用节点」重新生成"
         elif [ "$ns_match" = "0" ] && [ -n "$ns_pref" ]; then
             # 固定过的线路被人/自动选路改回去了,这比「还有更干净的」更要紧。
@@ -4757,6 +4793,34 @@ scan_nodes() {
     if ! clash_rules node-scan >"$raw" 2>"$tmp/err"; then
         echo "FAIL:读不到运行中的内核节点($(head -1 "$tmp/err" 2>/dev/null))" >&2
         rm -rf "$tmp"; return 1
+    fi
+    # 没有可手动目标时不是失败:把「这组由内核自动选路、成员是这几个」落成一条
+    # 结论。报告里**不写** BEST / ELIGIBLE —— 一个候选都没比过,写 0 等于假装比过
+    # (第 16 项会据 NOCHOICE 给结论,不会走到「没有过硬门槛的候选」那句)。
+    if [ "$(awk -F'\t' 'NR==1{print $1}' "$raw")" = "NOCHOICE" ]; then
+        local nc_group nc_type nc_members nc_chain nc_now
+        nc_group=$(awk -F'\t' '$1=="NOCHOICE"{print $2; exit}' "$raw")
+        nc_type=$(awk -F'\t' '$1=="NOCHOICE"{print $3; exit}' "$raw")
+        nc_members=$(awk -F'\t' '$1=="NOCHOICE"{print $4; exit}' "$raw" | tr '|' '、')
+        nc_chain=$(awk -F'\t' '$1=="CHAIN"{print $2; exit}' "$raw")
+        nc_now=$(date +%s)
+        if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
+            { printf 'EPOCH=%s\n' "$nc_now"
+              printf 'NOCHOICE=1\n'
+              printf 'NOCHOICE_GROUP=%s\n' "$nc_group"
+              printf 'NOCHOICE_TYPE=%s\n' "$nc_type"
+              printf 'NOCHOICE_MEMBERS=%s\n' "$nc_members"
+              printf 'NOCHOICE_CHAIN=%s\n' "$nc_chain"
+              printf 'SCAN_TIME=%s\n' "$(date '+%Y-%m-%d %H:%M')"
+            } > "$NODE_SCAN_FILE.tmp" 2>/dev/null \
+                && mv "$NODE_SCAN_FILE.tmp" "$NODE_SCAN_FILE" 2>/dev/null
+        fi
+        # node-apply 切完会静默重扫一次,那时不该把整段人话混进应用回执。
+        if [ "${NODE_SCAN_QUIET:-0}" != "1" ]; then
+            printf '无候选可切换:%s 是 %s 自动选路(成员:%s)\n' "$nc_group" "$nc_type" "$nc_members"
+            printf '这条链上换节点等于换出口 IP,建议保持现状。\n'
+        fi
+        rm -rf "$tmp"; return 0
     fi
     grep -q '^SCANv1$' "$raw" || { echo "FAIL:节点枚举返回格式异常" >&2; rm -rf "$tmp"; return 1; }
     group=$(awk -F'\t' '$1=="GROUP"{print $2; exit}' "$raw")

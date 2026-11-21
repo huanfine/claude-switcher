@@ -98,7 +98,11 @@ repository, command-line script, and build artifact name.
   beat generic flags.
 - **Node scan and gated apply** — read-only ranking of the current Selector's
   candidate nodes; applying the best node requires a fresh real-time gate,
-  re-checks the exit country, and rolls back on any failed step.
+  re-checks the exit country, and rolls back on any failed step. When the
+  controlling chain is auto-routed (`Fallback` / `URLTest`, e.g. a `Selector →
+  Fallback` that only holds two fixed IPs), the scan reports a conclusion
+  instead of an error: no manually comparable candidates, keep the current
+  state — switching there just swaps the exit IP.
 - **Automatic updates** — a user-level LaunchAgent checks every 12 hours,
   verifies artifact hashes against `SHA256SUMS`, and rolls back if the
   post-update self-check fails. `touch ~/.claude-switcher/update-hold`

@@ -136,6 +136,33 @@ class NodeScanParserTests(unittest.TestCase):
         for secret in ("SUPER-SECRET-UUID", "SUPER-SECRET-PASSWORD"):
             self.assertNotIn(secret, out.getvalue(), "扫描输出里出现了凭据")
 
+    def test_auto_routing_chain_reports_nochoice_instead_of_failing(self):
+        """Selector → Fallback:报「无可手动目标」,不是抛错。
+
+        实测配置(2026-11-21):🤖 OpenAi(Selector) 只有 1 个子项,指向
+        🧠 AI·干净IP(Fallback),成员是两个固定 IP。旧实现直接 fail,界面把
+        「这条链上不需要换节点」显示成「扫描失败：…(退出码 1)」,用户只能
+        以为工具坏了,然后被界面反复催着去点一个必然失败的按钮。
+        """
+        proxies = {"proxies": {
+            "🤖 OpenAi": {"type": "Selector", "all": ["🧠 AI·干净IP"],
+                          "now": "🧠 AI·干净IP"},
+            "🧠 AI·干净IP": {"type": "Fallback",
+                          "all": ["🏠 固定IP·经良心云", "🏠 固定IP·美国-阿什本"],
+                          "now": "🏠 固定IP·经良心云"},
+            "🏠 固定IP·经良心云": {"type": "Http"},
+            "🏠 固定IP·美国-阿什本": {"type": "Http"},
+        }}
+        self.mod.controller_config = lambda _cli: (("unix", "/fake.sock", None), "")
+        self.mod.api_get = lambda _b, _s, _p: proxies
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.mod.node_scan(self.clash, "🤖 OpenAi")   # 不再 SystemExit
+        text = out.getvalue()
+        self.assertIn("NOCHOICE\t🧠 AI·干净IP\tFallback", text)
+        self.assertIn("🏠 固定IP·经良心云|🏠 固定IP·美国-阿什本", text)
+        self.assertNotIn("NODE\t", text, "自动选路组的成员不该被列成可点候选")
+
     def test_scan_rejects_unknown_group(self):
         self.mod.controller_config = lambda _cli: (("unix", "/fake.sock", None), "")
         self.mod.api_get = lambda _b, _s, _p: fake_proxies()
@@ -215,6 +242,28 @@ esac''')
         value = self.line(self.run_core("checkdetail").stdout, "更优节点")
         self.assertTrue(value.startswith("skip:"), value)
         self.assertIn("已过期", value)
+
+    def test_nochoice_report_is_ok_and_names_the_group(self):
+        """控制链落在自动选路组时给 ok,不是 skip —— 结论是「不需要换」,不是「没检查」。
+
+        这一项曾经永远停在「点扫描」,点下去又必然失败;而事实是那条链上根本
+        没有可手动比较的对象(内核自己挑成员)。
+        """
+        self.report(NOCHOICE="1", NOCHOICE_GROUP="🧠 AI·干净IP",
+                    NOCHOICE_TYPE="Fallback",
+                    NOCHOICE_MEMBERS="🏠 固定IP·经良心云、🏠 固定IP·美国-阿什本")
+        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
+        self.assertTrue(value.startswith("ok:"), value)
+        self.assertIn("自动选路", value)
+        self.assertIn("成员", value)
+
+    def test_stale_nochoice_report_asks_for_a_quick_recheck(self):
+        """结构型结论也讲「现在」:过 24h 要复核,用户可能换了订阅或改了规则。"""
+        self.report(EPOCH="1", NOCHOICE="1", NOCHOICE_GROUP="🧠 AI·干净IP",
+                    NOCHOICE_TYPE="Fallback")
+        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
+        self.assertTrue(value.startswith("skip:"), value)
+        self.assertIn("复核", value)
 
     def test_fresh_report_with_better_node_is_warn(self):
         self.report()
