@@ -5444,6 +5444,18 @@ self_update() {
         rm -rf "$tmpd"; return 0
     fi
 
+    # 自动更新哨兵:本地安装由人工托管时,--auto 不得静默覆盖。
+    # 上面的跳过判断只看「内容不同」,不看「谁新」——发布产物=安装产物,双方都是
+    # main 的原样拷贝,没有可比较的版本号,所以这个简化平时成立。代价是:开发机上
+    # 本地改动一旦还没推送,--auto 每 12 小时就会把远端旧版盖回来,2026-11-21
+    # 实测把已经验证安装的纯净度修复降级回滚。无人值守通道必须保守:
+    # touch ~/.claude-switcher/update-hold 即可让 --auto 只报告不动手。
+    # 手动 update 是显式意志,不受哨兵影响;删掉哨兵文件即恢复默认行为。
+    if [ "$auto" -eq 1 ] && [ -f "$BASE/update-hold" ]; then
+        echo "SKIP:本地安装由 update-hold 托管,自动更新不覆盖(手动 update 可强制)"
+        rm -rf "$tmpd"; return 0
+    fi
+
     # 备份现有核心脚本
     [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
 

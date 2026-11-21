@@ -78,7 +78,9 @@ repository, command-line script, and build artifact name.
   re-checks the exit country, and rolls back on any failed step.
 - **Automatic updates** — a user-level LaunchAgent checks every 12 hours,
   verifies artifact hashes against `SHA256SUMS`, and rolls back if the
-  post-update self-check fails.
+  post-update self-check fails. `touch ~/.claude-switcher/update-hold`
+  makes the automatic updater report without touching anything
+  (a manual `update` still runs).
 - **Diagnostics and inspection** — standalone proxy transport diagnosis, device
   fingerprint report, Claude Code CLI inspection, one-shot isolated browser,
   encrypted snapshot export/import, and redacted diagnostic bundles.
