@@ -2930,9 +2930,13 @@ ip_purity() {
     #   「未评级(ipinfo 限流)」+ 标记「·类型源限流」,并且不再劝人「换住宅或原生 IP」
     #   (那时我们没有任何证据说这个出口不好)。org 与类型证据都加了多源兜底与
     #   过期缓存兜底,但那两条不改变文案;改文案就必须换名,理由见下。
+    # v12:新增「住宅拨号线路」(relay)一档 —— 类型库说 asn.type=isp、却有源标它机房时,
+    #   不再一律判机房。这是照 xykt/IPQuality 与 sinspired/checkip(isp.go:134)的
+    #   做法补的:hosting 只是笼统兜底信号,不该抢在类型库之前命中。类型集变了、
+    #   标签与建议文案也变了,必须换名。
     # 注意缓存里存的是**成品文案**(第 6 列),所以任何措辞变更都得换文件名,
     # 否则用户 24 小时内看到的还是旧话 —— 这一条以后会一直踩,别再想省这个版本号。
-    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v11" ]; then
+    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v12" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
@@ -2940,7 +2944,7 @@ ip_purity() {
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v11"
+        done < "$BASE/purity-cache.v12"
     fi
 
     local q1 q2 q3 q4 q5 q6 b1 b2 b3 b4 b5 b6 rdns=""
@@ -3051,8 +3055,11 @@ ip_purity() {
     case "$(_ipfield "$b5" vpn)" in true) px_w=1 ;; esac
     case "$(_ipfield "$b5" proxy)" in true) px_w=1 ;; esac
     case "$(_ipfield "$b5" tor)" in true) tor=1; px_w=1 ;; esac
-    case "$(_ipfield "$b5" hosting)" in true) dc=1 ;; esac
-    case "$(_ipfield "$b5" is_hosting)" in true) dc=1 ;; esac
+    # privacy.hosting 单独记一份:它由 ipinfo 的隐私库直接给出,比 ipquery/ip-api 的
+    # 通用 datacenter 布尔更具体 —— 判「住宅拨号」时要区分「谁在说机房」(见 relay)。
+    local wi_priv_hosting=""
+    case "$(_ipfield "$b5" hosting)" in true) dc=1; wi_priv_hosting=1 ;; esac
+    case "$(_ipfield "$b5" is_hosting)" in true) dc=1; wi_priv_hosting=1 ;; esac
     case "$(_ipfield "$b5" is_mobile)" in true) mob=1 ;; esac
     local wi_relay="" wi_anon=""
     case "$(_ipfield "$b5" relay)" in true) wi_relay=1 ;; esac
@@ -3189,10 +3196,35 @@ ip_purity() {
        || [ -n "$resid_hint" ] || [ "$asn_kind" = "residential" ]; then
         pos_residential=1
     fi
+    # ---- 住宅拨号线路(relay):类型库说是运营商线路,却有源把它标成机房 ----
+    # 这是机场「住宅 IP 池」的典型形态,两个成熟实现都单独给了它一档:
+    #   xykt/IPQuality(ip.sh)同样取 widget 的 asn.type 做类型;
+    #   sinspired/checkip(pkg/ipinfo/isp.go:134)写得很明确 ——
+    #     case companyType == "hosting" && asnType == "isp": 住宅拨号
+    #   并在注释里点明:hosting 只是笼统的兜底信号,不该抢在类型库之前命中。
+    # 我们原来把 dc 布尔排在住宅之前,于是这类出口一律报「机房 · 建议换住宅」,
+    # 而它其实是运营商线路下的住宅拨号出口 —— 这是「评分不对」里最实的一处误判。
+    #
+    # 只认类型库(asn.type=isp)说话的两条路径:
+    #   a. company.type=hosting 且 asn.type=isp —— ipinfo 自己在两个维度上打架;
+    #   b. asn.type=isp 且有通用机房布尔(ipquery/ip-api),但没有任何更强的反证。
+    # 反证有三条,任一成立仍判机房:PTR 自曝 cloud/vps(host_hint)、widget 隐私库
+    # 直接说 hosting(wi_priv_hosting)、运营商名本身命中机房词(asn_kind=hosting)。
+    # PTR 与隐私库是逐 IP 的实测,比「通用 datacenter 布尔」硬,不能被类型库推翻。
+    local relay="" relay_conflict=""
+    if [ "$asn_kind" != "hosting" ] && [ "$wi_asn_type" = "isp" ]; then
+        if [ "$wi_comp_type" = "hosting" ]; then
+            relay=1
+        elif [ -n "$dc" ] && [ -z "$host_hint" ] && [ -z "$wi_priv_hosting" ]; then
+            relay=1; relay_conflict=1
+        fi
+    fi
     if [ -n "$tor" ]; then
         type=tor
     elif [ -n "$px_strong" ]; then
         type=vpn
+    elif [ -n "$relay" ]; then
+        type=relay
     elif [ -n "$dc" ] || [ -n "$host_hint" ] \
          || { [ "$asn_kind" = "hosting" ] && [ -z "$name_only_host" ]; }; then
         type=hosting
@@ -3214,6 +3246,10 @@ ip_purity() {
         tor)         base=46 ;;   # 网站实测 43~50
         vpn)         base=65 ;;   # 61~69
         hosting)     base=55 ;;   # 51~58
+        # 住宅拨号介于代理与住宅之间:类型库认它是运营商线路,别的源说机房。
+        # 取 75 而不是住宅的 100,也不是机房的 55 —— 这类出口通常就是机场的
+        # 「住宅 IP 池」,质量比真家宽差、比纯机房好,数字要让这个差别看得见。
+        relay)       base=75 ;;
         mobile)      base=85 ;;
         residential) base=100 ;;
         # 类型不明不给满分,也不当机房:70 分落在「良好」档,提示但不拦。
@@ -3266,7 +3302,7 @@ ip_purity() {
     #    ip.net.coffee 的 Trust Score 不含地理维度,我们多扣 4~6 分,两边就没法比)。
     #    标记保留:它是「这次的地理画像本身模糊」的证据,只是不再影响分数。
     case "$type" in
-        residential|tor|vpn) ;;   # 这三类的城市不反映用户位置,整段跳过
+        residential|relay|tor|vpn) ;;   # 这三类的城市不反映用户位置,整段跳过
         *)
             if [ "${ncities:-0}" -ge 2 ]; then
                 flags="$flags ·地理模糊"
@@ -3279,6 +3315,8 @@ ip_purity() {
     # 一个布尔在说话。分开标,分类讨论才有依据。widget 的中继/匿名标志只挂
     # 标记不扣分:iCloud 中继不是恶意代理,拦启动太重。
     [ -n "$px_conflict" ] && flags="$flags ·代理特征(单源)"
+    # 冲突要写在脸上:否则用户只看到「住宅拨号」,不知道我们手上两份证据在打架。
+    [ -n "$relay_conflict" ] && flags="$flags ·机房标志(与类型库冲突)"
     [ -n "$wi_relay" ] && flags="$flags ·中继出口"
     [ -n "$wi_anon" ] && [ -z "$wi_relay" ] && flags="$flags ·匿名特征"
     # scamalytics 欺诈分是展示口径:它和 risk/滥用相关但口径独立(0-100 欺诈分,
@@ -3348,6 +3386,11 @@ ip_purity() {
         # 降级判型:类型之外的东西一概没验证,判定封顶在 warn。
         # 拿我们自己的网络抖动去拦用户启动,是拿误报换安全感。
         verdict=warn
+    elif [ "$type" = "relay" ]; then
+        # 住宅拨号:证据自己就在打架(类型库说运营商线路、别的源说机房),判定封顶
+        # 在提示档。分数照给(基线 75),让用户看到「比机房好、比住宅差」,但这类
+        # 线路不该拿到 ok —— 拿一个内部矛盾的证据去放行,比不判更糟。
+        verdict=warn
     elif [ "$type" = "hosting" ]; then
         if [ "$score" -ge 30 ]; then verdict=warn; else verdict=fail; fi
     elif [ "$score" -ge 75 ]; then
@@ -3376,6 +3419,7 @@ ip_purity() {
         tor)         tlabel="Tor 出口" ;;
         vpn)         tlabel="代理/VPN" ;;
         hosting)     tlabel="机房" ;;
+        relay)       tlabel="住宅拨号线路" ;;
         mobile)      tlabel="移动网络" ;;
         residential) tlabel="住宅宽带" ;;
         *)           tlabel="类型不明" ;;
@@ -3384,6 +3428,13 @@ ip_purity() {
         tor)     next="Tor 会被 Claude 直接标记,换普通住宅节点" ;;
         vpn)     next="代理特征明显,换住宅或原生 IP 节点" ;;
         hosting) next="机房出口风险偏高,建议换住宅 IP" ;;
+        # 住宅拨号本身就是运营商线路,劝人「换住宅」是废话;也不劝「换机房」——
+        # 那是把用户往更差的一档推。只在证据冲突时提示一句「可复核」。
+        relay)   if [ -n "$relay_conflict" ]; then
+                     next="类型库与机房标志冲突,可点重新检查复核"
+                 else
+                     next=""
+                 fi ;;
         # 已经判成住宅还劝人「换住宅」是自相矛盾的。这一档的 warn 只来自证据不全
         # (单源/无正面证据),不是换节点能解决的事,所以不给动作建议。
         residential) next="" ;;
@@ -3472,12 +3523,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「证据不全就提前重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v11.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v11" 2>/dev/null
+        tmp="$BASE/purity-cache.v12.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v12" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v11" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v12" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null

@@ -902,6 +902,76 @@ esac''')
         self.assertNotIn("住宅宽带", detail)
         self.assertNotIn("机房", detail)
 
+    # ---- 住宅拨号线路:类型库与机房标志打架时怎么判 ----
+
+    def test_relay_line_when_company_says_hosting_asn_says_isp(self):
+        """ipinfo 自己在两个维度上打架:asn.type=isp 而 company.type=hosting。
+
+        sinspired/checkip(`pkg/ipinfo/isp.go:134`)把这个组合单独判成「住宅拨号」,
+        注释写明 hosting 只是笼统兜底信号、不该抢在类型库之前命中。机场的住宅 IP 池
+        基本都长这个形状;我们原来把 dc 排在住宅之前,一律报「机房 · 建议换住宅」。
+        """
+        self.write_env("America/New_York")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      IPINFO_CARRIER,
+                      widget=_widget(asn_type="isp", company_type="hosting"))
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("住宅拨号线路", detail)
+        self.assertEqual(self.score(detail), 75, detail)
+        self.assertNotIn("机房", detail)
+        # 它本来就是运营商线路,劝人「换住宅」是废话。
+        self.assertNotIn("建议换住宅", detail)
+
+    def test_relay_line_when_datacenter_flag_conflicts_with_type_db(self):
+        """类型库说 isp、ipquery 却标 datacenter:判住宅拨号,并把冲突写在脸上。
+
+        单独一个「通用 datacenter 布尔」不足以把运营商线路钉成机房 —— 它比 PTR 自曝
+        和 ipinfo 隐私库都笼统。但改判必须留痕,不能悄悄翻面,否则用户只看到同一个
+        出口昨天说机房今天说住宅。
+        """
+        self.write_env("America/New_York")
+        conflicting = _ipquery("GTT Communications Inc.", "GTT Communications Inc.",
+                               city="Ashburn", timezone="America/New_York",
+                               is_datacenter=True)
+        self.stub_net(conflicting, _ipapi("Ashburn", countryCode="US",
+                                          timezone="America/New_York"),
+                      IPINFO_CARRIER)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("住宅拨号线路", detail)
+        self.assertIn("与类型库冲突", detail)
+        self.assertEqual(self.score(detail), 75, detail)
+
+    def test_ptr_self_report_beats_type_db(self):
+        """PTR 自曝 cloud/vps 时,即使类型库说 isp,仍然判机房。
+
+        「机房降到最后兜底」不等于「机房不判」:PTR 是出口自己写下的身份,是逐 IP 的
+        实测,比通用布尔和类型库都硬。这一条是防止上面那条放宽过头的负例。
+        """
+        self.write_env("America/New_York")
+        self.set_ptr("vps123.cloud.example.net")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      IPINFO_CARRIER)
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("机房", detail)
+        self.assertNotIn("住宅拨号", detail)
+
+    def test_privacy_library_hosting_beats_type_db(self):
+        """widget 隐私库直接说 hosting 时仍判机房 —— 它是逐 IP 判断,不是通用布尔。"""
+        self.write_env("America/New_York")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      IPINFO_CARRIER,
+                      widget=_widget(asn_type="isp", company_type="isp", hosting=True))
+        state, detail, _ = self.run_detail()
+        self.assertEqual(state, "warn", detail)
+        self.assertIn("机房", detail)
+        self.assertNotIn("住宅拨号", detail)
+
     def test_type_evidence_survives_ipinfo_rate_limit(self):
         """ipinfo 限流时,刚刚查到过的类型证据不能跟着一起丢。
 

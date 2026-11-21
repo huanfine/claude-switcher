@@ -88,6 +88,14 @@ repository, command-line script, and build artifact name.
   A low score is a soft signal: it never decides whether Claude can start, so
   the home screen shows passed-check counts (16/16) instead of an overall
   score, and the ring's color only answers whether Claude can start.
+- **A separate "residential dial-up" tier** — when the ASN type library says
+  `asn.type=isp` but ipquery/ip-api report a generic datacenter flag, the exit is
+  no longer reported as "datacenter · switch to residential". It is classified as
+  residential dial-up (75/100, advisory only) and flagged "datacenter flag
+  conflicts with type library" — which is exactly the shape of airport-style
+  residential IP pools. A PTR that self-reports `cloud/vps`, or the ipinfo privacy
+  library saying `hosting`, still wins over the type library: per-IP measurements
+  beat generic flags.
 - **Node scan and gated apply** — read-only ranking of the current Selector's
   candidate nodes; applying the best node requires a fresh real-time gate,
   re-checks the exit country, and rolls back on any failed step.
