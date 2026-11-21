@@ -62,13 +62,16 @@ repository, command-line script, and build artifact name.
   database.
 - **WebRTC leak probe** — a standard-library STUN client that compares global
   and local vantage points to distinguish a proxied path from a direct one.
-- **IP purity score** — an explainable 0–100 score from four independent data
+- **IP purity score** — an explainable 0–100 score from six parallel data
   sources plus local PTR, with degraded verdicts when sources are unreachable.
   Reputation penalties are continuous (about one point per five risk points,
   no tier jumps) and never influence the node *type* — type comes only from
   structural evidence, so a one-point reputation wobble cannot relabel a line.
-  Two caps exist: a residential verdict reached only by "nothing bad found"
-  caps at 70, and an unverified risk dimension caps at 85 with at most an
+  **Residential needs positive evidence** (ipinfo widget `asn.type=isp`, the
+  residential whitelist, or a broadband PTR hostname): a clean exit with
+  positive evidence scores 100; with none of the three it honestly reports
+  "type unknown" at the 70-point warn baseline instead of posing as
+  residential. An unverified risk dimension caps at 85 with at most an
   advisory verdict — "not checked" never reports as "clean".
   A low score is a soft signal: it never decides whether Claude can start, so
   the home screen shows passed-check counts (16/16) instead of an overall
@@ -250,10 +253,12 @@ and operators outside the residential whitelist were always labelled
 locks older than 60 seconds are now reclaimed. The type is now decided by
 evidence, not by name: a whitelist hit is residential, an explicit
 datacenter/cloud/backbone keyword in the operator name is datacenter, and
-when both risk sources deny hosting with a low risk score the exit is scored
-as residential — the same call ip.net.coffee makes. Only when the evidence is
-incomplete does it fall back to the neutral 70-point `warn` baseline. The
-geography dimension is flagged but no longer deducted from the score.
+since 2026-11-21 residential additionally requires **positive evidence** —
+the ipinfo widget's `asn.type`/`company.type` = `isp`, the whitelist, or a
+broadband PTR hostname. With none of the three the exit falls back to the
+neutral 70-point `warn` "type unknown" baseline rather than posing as
+residential. The geography dimension is flagged but no longer deducted from
+the score.
 
 If the app **still** says "datacenter / type unknown" after upgrading, check the
 core script, not the app: every verdict in the UI comes from
@@ -262,10 +267,15 @@ itself. An `*-app-only.*` package replaces the app only. Compare
 `shasum -a 256 ~/.local/bin/claude-switch.sh` against `SHA256SUMS` and, if they
 differ, run
 `bash <(curl -fsSL https://raw.githubusercontent.com/huanfine/claude-switcher/main/scripts/upgrade-core.sh)`.
-Measured on one machine and one exit (`66.17.65.38`, AS3257): the old core
-reported "datacenter, 70/100, type unknown"; the current core reports "operator
-not classified, 100/100, residential broadband". Only the script version
-differed.
+Measured on one machine and one exit (`66.17.65.38`, AS3257), three versions
+show why the model moved to positive evidence: the earliest core reported
+"datacenter, 70/100, type unknown" (unclassified name = datacenter); a later
+one reported "70/100, residential broadband, no positive residential evidence"
+(residential by "nothing bad found", then capped for lacking positive
+evidence — the same exit pushed around by one guess twice); the current core
+reports "100/100, residential broadband, fraud score 0" — the ipinfo widget's
+ASN database says `asn.type=isp` (positive evidence), Scamalytics scores
+fraud 0, and ip.net.coffee gives 98. Only the script version differed.
 
 The score is IP reputation; whether the exit is usable for Claude is decided
 separately by hard gates, so the two can diverge. Under the `reject` policy UDP

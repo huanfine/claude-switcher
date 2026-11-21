@@ -2779,7 +2779,6 @@ ip_class() {
 #                  tor-exit-read-me.dfri.se / …static.cloudzy.com / …hsd1.ca.comcast.net
 #   stopforumspam  滥用记录。DNSBL 这条走不通:Clash fake-ip 会把任何 A 查询接管成
 #                  198.18.x,黑名单命中率全是假的,所以只能用 HTTP 接口。
-PURITY_CACHE_TTL=86400
 
 # 「什么时候问源」和「一条结论能用多久」是两件事,不能塞进同一个参数。
 #
@@ -2803,6 +2802,11 @@ PURITY_CACHE_TTL=86400
 # 天然重查。降级结果照样按 24h 缓存 —— 它不需要「定时自愈」,用户点一次
 # 重新检查就够,而那一次是显式的、他自己要的。
 PURITY_CACHE_TTL=86400
+
+# widget/scamalytics 两个源的请求头。scamalytics 对无 UA 的 curl 会回反爬页面,
+# ipinfo widget 偶有同样行为;不带浏览器 UA 的响应会被当成「源挂了」,
+# 类型证据悄悄缺失。写死一份 UA 不算环境值 —— 它是协议的一部分,不是机器差异。
+PURITY_UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36"
 
 # 从扁平 JSON 取标量字段。不引入 jq:检查链路得能在只装了 Xcode 命令行工具的机器上跑,
 # 多一个依赖就多一个装不上的理由。
@@ -2868,7 +2872,7 @@ ip_purity() {
     # 跳过缓存不等同于清缓存 —— 查完仍要落盘,下一次巡检才不会重复打源。
     # 文件名带 v3:第 7 列是出口国家代码。v2 的 6 列没有它,混读会让 detail
     # 把「|US」吞进去,宁可让旧缓存作废(v3 同时清掉 v2 里被钉住 24h 的降级结果)。
-    # v4:类型判定改成证据驱动(见 ip_class 与 clean_residential)。改判定的同时
+    # v4:类型判定改成证据驱动(见 ip_class 与 pos_residential)。改判定的同时
     # 不换文件名,升级后 24 小时内会继续读到「类型不明 / 机房」这种旧结论 ——
     # 用户重装完还是老样子,只能以为我们又没修好。改口径必须让旧缓存失效。
     # v5/v6 同理:v5 是代理特征按源计数 + 判定词显式化;v6 是住宅档不再劝人换住宅。
@@ -2877,9 +2881,14 @@ ip_purity() {
     # v8:降级结果不再有单独的短过期(一律 24h),要新结论由 checkdetail 传 force
     # 显式重问。同时把降级文案的「稍后重查」改成「点重新检查可重算」—— 缓存里存的是
     # 成品文案,不换名会让用户 24 小时内继续看到「稍后重查」,而它已经不成立了。
+    # v9:类型与分数口径重做(2026-11-21,GitHub 业界口径调研后):
+    #   新增 widget(ipinfo demo)与 scamalytics 两个源;住宅类型需要正面证据
+    #   (asn.type=isp / 白名单 / PTR),「无正面住宅证据封顶 70」删除 —— 干净出口
+    #   就是 100;widget 挂了且名字无分类时给「类型不明」而不是冒充住宅。
+    #   detail 里新增「欺诈分 N」展示字段。分数语义与类型判定都变了,必须换名。
     # 注意缓存里存的是**成品文案**(第 6 列),所以任何措辞变更都得换文件名,
     # 否则用户 24 小时内看到的还是旧话 —— 这一条以后会一直踩,别再想省这个版本号。
-    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v8" ]; then
+    if [ "$force" != "1" ] && [ -n "${BASE:-}" ] && [ -f "$BASE/purity-cache.v9" ]; then
         while IFS='|' read -r cip cep cver cscore ctype cdet ccc || [ -n "$cip" ]; do
             [ "$cip" = "$ip" ] || continue
             case "${cep:-}" in ''|*[!0-9]*) continue ;; esac
@@ -2887,23 +2896,40 @@ ip_purity() {
             [ $((now - cep)) -lt "$PURITY_CACHE_TTL" ] || break
             printf '%s|%s|%s|%s|%s' "$cscore" "$cver" "$ctype" "$cdet" "${ccc:-}"
             return 0
-        done < "$BASE/purity-cache.v8"
+        done < "$BASE/purity-cache.v9"
     fi
 
-    local q1 q2 q3 q4 b1 b2 b3 b4 rdns=""
+    local q1 q2 q3 q4 q5 q6 b1 b2 b3 b4 b5 b6 rdns=""
     q1=$(mktemp "${TMPDIR:-/tmp}/purity1.XXXXXX") || return 0
     q2=$(mktemp "${TMPDIR:-/tmp}/purity2.XXXXXX") || { rm -f "$q1"; return 0; }
     q3=$(mktemp "${TMPDIR:-/tmp}/purity3.XXXXXX") || { rm -f "$q1" "$q2"; return 0; }
     q4=$(mktemp "${TMPDIR:-/tmp}/purity4.XXXXXX") || { rm -f "$q1" "$q2" "$q3"; return 0; }
-    # 四个源并行:串行最坏 20 秒,会顶掉 App 的 45 秒检查预算。
-    curl -sL --max-time 6 "https://api.ipquery.io/$ip" >"$q1" 2>/dev/null &
+    q5=$(mktemp "${TMPDIR:-/tmp}/purity5.XXXXXX") || { rm -f "$q1" "$q2" "$q3" "$q4"; return 0; }
+    q6=$(mktemp "${TMPDIR:-/tmp}/purity6.XXXXXX") || { rm -f "$q1" "$q2" "$q3" "$q4" "$q5"; return 0; }
+    # 六个源并行:串行最坏 36 秒,会顶掉 App 的 45 秒检查预算。
+    # q5 = ipinfo widget demo:免费无 key,给 asn.type / company.type / privacy.*
+    #      (vpn/proxy/tor/relay/hosting 五个布尔)—— 这是「正面类型证据」的主要来源,
+    #      2026-11-21 实测对 GTT(AS3257)给 asn.type=isp / privacy.hosting=false,
+    #      与名字关键词猜测(「GTT」不含机房词 → 落进「无正面住宅证据」)完全相反。
+    # q6 = scamalytics 免费页:页面内嵌一份 JSON("score":"0","risk":"low"),
+    #      提取分数做展示口径;页面里的 Server 标志在 HTML 表格里,结构一改就静默
+    #      失效,不进模型(2026-11-21 实测它对同一 IP 说 Server:Yes 而 ipinfo 说 isp,
+    #      多库并列的意义正在于让这种分歧可见,而不是硬选一边)。
+    curl -sL --max-time 6 -H "User-Agent: $PURITY_UA" "https://api.ipquery.io/$ip" >"$q1" 2>/dev/null &
     curl -s --max-time 4 "http://ip-api.com/json/$ip?fields=status,proxy,hosting,mobile,city,regionName,timezone,countryCode" >"$q2" 2>/dev/null &
     curl -sL --max-time 4 "https://ipinfo.io/$ip/json" >"$q3" 2>/dev/null &
     curl -s --max-time 4 "https://api.stopforumspam.org/api?ip=$ip&json" >"$q4" 2>/dev/null &
+    curl -sL --max-time 6 -H "User-Agent: $PURITY_UA" "https://ipinfo.io/widget/demo/$ip" >"$q5" 2>/dev/null &
+    curl -sL --max-time 6 -H "User-Agent: $PURITY_UA" "https://scamalytics.com/ip/$ip" >"$q6" 2>/dev/null &
     wait
     b1=$(cat "$q1" 2>/dev/null); b2=$(cat "$q2" 2>/dev/null)
     b3=$(cat "$q3" 2>/dev/null); b4=$(cat "$q4" 2>/dev/null)
-    rm -f "$q1" "$q2" "$q3" "$q4"
+    b5=$(cat "$q5" 2>/dev/null); b6=$(cat "$q6" 2>/dev/null)
+    rm -f "$q1" "$q2" "$q3" "$q4" "$q5" "$q6"
+    # widget 是多行缩进 JSON,scamalytics 是 HTML 夹 JSON;_ipfield 按「一行里的
+    # "key":value」找,多行会漏。压平成单行再喂给它,省得为两个字段引入 jq/python。
+    b5=$(printf '%s' "$b5" | tr -d '\n \t')
+    b6=$(printf '%s' "$b6" | tr -d '\n \t')
     # PTR 走本地解析器,不占网络预算。去掉结尾的点,便于按关键词匹配。
     # dig 超时/解析失败时会把诊断行「;; connection timed out; ...」写到 **stdout**,
     # +short 也挡不住。它曾一路混进 PTR:既让 known=1(等于拿一条报错当「这个 IP
@@ -2915,22 +2941,51 @@ ip_purity() {
 
     local dc="" mob="" px="" tor="" risk="" tzip="" abfreq="" cc=""
     # 代理特征按「几个独立源报出来」计数:ipquery(is_vpn/is_proxy)算一个源
-    # (同一家不会自己反驳自己)、ip-api(proxy)算第二个、PTR 自曝算第三个。
-    # 计数是为了区分两种情况:多源一致的代理特征,和「只有一家说它是代理,
-    # 另外两家都说这是机房」—— 后者实测会让同一个节点的不同 IP 得到一个 fail
-    # 一个 warn,用户看到的是一台机器换个 IP 结论就翻脸。
-    local px_q="" px_a="" px_r="" px_src=0
+    # (同一家不会自己反驳自己)、ip-api(proxy)算第二个、PTR 自曝算第三个、
+    # widget 的 privacy.vpn/proxy 算第四个。计数是为了区分两种情况:多源一致的
+    # 代理特征,和「只有一家说它是代理,另外几家都说这是机房」—— 后者实测会让
+    # 同一个节点的不同 IP 得到一个 fail 一个 warn,用户看到的是一台机器换个
+    # IP 结论就翻脸。
+    local px_q="" px_a="" px_r="" px_w="" px_src=0
     case "$(_ipfield "$b1" is_vpn)" in true) px_q=1 ;; esac
     case "$(_ipfield "$b1" is_mobile)" in true) mob=1 ;; esac
     case "$(_ipfield "$b1" is_proxy)" in true) px_q=1 ;; esac
     case "$(_ipfield "$b1" is_tor)" in true) tor=1 ;; esac
     risk=$(_ipfield "$b1" risk_score)
     tzip=$(_ipfield "$b1" timezone)
-    # 机房证据同样两源都收:ipquery 说 datacenter、ip-api 说 hosting,任一成立即算。
+    # 机房证据同样多源都收:ipquery 说 datacenter、ip-api 说 hosting、widget 的
+    # privacy.hosting / is_hosting 任一成立即算 —— ipinfo 的隐私库是独立维护的,
+    # 它说 hosting 时不再依赖我们拿运营商名去猜。
     case "$(_ipfield "$b1" is_datacenter)" in true) dc=1 ;; esac
     case "$(_ipfield "$b2" proxy)" in true) px_a=1 ;; esac
     case "$(_ipfield "$b2" hosting)" in true) dc=1 ;; esac
     case "$(_ipfield "$b2" mobile)" in true) mob=1 ;; esac
+    # widget(q5):压平后的 JSON,privacy 四布尔与 asn/company 的 type 是关键字段。
+    # asn.type=isp 是**正面 ISP 线路证据** —— 它来自 ipinfo 自己的 ASN 分类库,
+    # 不靠我们在名字里找关键词。实测 GTT(AS3257):名字里没有 hosting/server 词,
+    # 旧口径落进「无正面住宅证据」封顶 70;widget 明确说 asn.type=isp。
+    local wi_asn_type="" wi_comp_type=""
+    wi_asn_type=$(printf '%s' "$b5" | grep -o '"asn":{[^{]*' | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
+    wi_comp_type=$(printf '%s' "$b5" | grep -o '"company":{[^{]*' | grep -o '"type":"[^"]*"' | head -1 | cut -d'"' -f4)
+    # privacy.* 直接并进对应证据位:vpn/proxy/tor 是代理类证据(px_w),hosting 是
+    # 机房证据(dc)。widget 是权威源,它说 true 时不需要第二家印证(px_w 直接
+    # 计入 px_strong 的依据)。relay 与 is_anonymous 不在此列:iCloud 中继这类
+    # 匿名通道不是恶意代理,拿它拦启动太重,只挂标记(见 flags 区)。
+    case "$(_ipfield "$b5" vpn)" in true) px_w=1 ;; esac
+    case "$(_ipfield "$b5" proxy)" in true) px_w=1 ;; esac
+    case "$(_ipfield "$b5" tor)" in true) tor=1; px_w=1 ;; esac
+    case "$(_ipfield "$b5" hosting)" in true) dc=1 ;; esac
+    case "$(_ipfield "$b5" is_hosting)" in true) dc=1 ;; esac
+    case "$(_ipfield "$b5" is_mobile)" in true) mob=1 ;; esac
+    local wi_relay="" wi_anon=""
+    case "$(_ipfield "$b5" relay)" in true) wi_relay=1 ;; esac
+    case "$(_ipfield "$b5" is_anonymous)" in true) wi_anon=1 ;; esac
+    # scamalytics(q6):只取欺诈分与等级做展示口径,不参与类型与扣分 ——
+    # 它与 risk/滥用记录高度相关,并入会双计。
+    local sca_score="" sca_risk=""
+    sca_score=$(_ipfield "$b6" score)
+    sca_risk=$(_ipfield "$b6" risk)
+    case "$sca_score" in ''|*[!0-9]*) sca_score="" ;; esac
     abfreq=$(_ipfield "$b4" frequency)
     # 国家代码只从已经在手的三份响应里取,不为它多发一次请求。离线给候选节点
     # 排名时,这一列是硬性门槛(COUNTRY_TARGET)的唯一依据:一个再干净的英国
@@ -2950,6 +3005,7 @@ ip_purity() {
     [ -n "$px_q" ] && px_src=$((px_src+1))
     [ -n "$px_a" ] && px_src=$((px_src+1))
     [ -n "$px_r" ] && px_src=$((px_src+1))
+    [ -n "$px_w" ] && px_src=$((px_src+1))
     [ "$px_src" -ge 1 ] && px=1
 
     # 两件事必须分开判,混成一件就会在两侧各错一次:
@@ -2967,6 +3023,9 @@ ip_purity() {
         known=1; src_n=$((src_n+1))
     fi
     [ "$(_ipfield "$b2" status)" = "success" ] && { known=1; src_n=$((src_n+1)); }
+    # widget 的 privacy 块是完整的风险信号组(五个布尔),它答上来了就和一个
+    # 风险源等价 —— 挂了的时候类型与隐私两个维度同时缺证据,不能当没这回事。
+    printf '%s' "$b5" | grep -q '"privacy"' && { known=1; src_n=$((src_n+1)); }
     # ipinfo 只说「这个地址有主」,它一个风险标志都不给,所以只参与 ①、不参与 ②。
     org3=$(printf '%s' "$b3" | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
     [ -n "$org3" ] && known=1
@@ -2992,7 +3051,7 @@ ip_purity() {
     # 拦启动。这种冲突按机房处理并留标记,不按代理一票否决。
     local px_strong="" px_conflict=""
     if [ -n "$px" ]; then
-        if [ "$px_src" -ge 2 ] || [ -n "$px_q" ]; then
+        if [ "$px_src" -ge 2 ] || [ -n "$px_q" ] || [ -n "$px_w" ]; then
             px_strong=1
         elif [ -z "$dc" ] || [ "$src_n" -lt 2 ]; then
             px_strong=1
@@ -3041,21 +3100,17 @@ ip_purity() {
     # 一个 1 分的抖动改了三处结论,用户看到的是「同一个 ISP 换了个说法」。
     # 类型回答的是「这是什么线路」,信誉回答的是「这条线脏不脏」;混进同一个 if
     # 就会互相冒充:脏一点被当成线路变了,线路不明又被当成脏。
-    local clean_residential=""
-    if [ "$src_n" -ge 2 ] && [ -n "$asn_org" ] && [ "$asn_kind" != "hosting" ] \
-       && [ -z "$dc" ] && [ -z "$host_hint" ] && [ -z "$px" ] && [ -z "$tor" ] && [ -z "$mob" ]; then
-        clean_residential=1
-    fi
-    # 「没查到问题」不等于「有住宅的正面证据」。下面这条 clean_residential 只说明
-    # 两家源都没报异常,运营商名也不在机房名单里 —— 实测 AS3257 GTT 这种骨干网地址
-    # 靠它拿到了 100/100「住宅宽带」(66.17.65.38)。
-    # 与参考站对齐的是**类型**(ip.net.coffee 也给住宅),但分数不能直接满分:
-    # 没有正面住宅证据(运营商名命中白名单 / PTR 自曝家宽特征)时封顶 70,
-    # 也就是「看着还行,但没拿到证据」那一档。类型保留,不把它硬说成机房。
-    local clean_only=""
-    if [ -n "$clean_residential" ] && [ -z "$resid_hint" ] \
-       && [ "$asn_kind" != "residential" ]; then
-        clean_only=1
+    # 「住宅/ISP 线路」从 2026-11-21 起要**正面证据**,不再接受隐式推断。
+    # 旧口径是「src_n>=2 且没有任何风险标志且运营商名不含机房词」就算住宅 ——
+    # GTT(AS3257)靠它拿到「住宅宽带」标签,再被「无正面住宅证据」封顶 70,
+    # 一个出口两次被同一套猜测摆布。widget 的 asn.type/company.type=isp 是
+    # ipinfo 自己的 ASN 分类库给的判断(实测 GTT = isp),PTR 自曝家宽特征
+    # (hsd/dhcp/dsl…)与白名单命中仍是正面证据;三者皆无时老老实实给
+    # 「类型不明」(基线 70,同档 warn),不再冒充住宅。
+    local pos_residential=""
+    if [ "$wi_asn_type" = "isp" ] || [ "$wi_comp_type" = "isp" ] \
+       || [ -n "$resid_hint" ] || [ "$asn_kind" = "residential" ]; then
+        pos_residential=1
     fi
     if [ -n "$tor" ]; then
         type=tor
@@ -3066,9 +3121,7 @@ ip_purity() {
         type=hosting
     elif [ -n "$mob" ]; then
         type=mobile
-    elif [ -n "$resid_hint" ] || [ "$asn_kind" = "residential" ]; then
-        type=residential
-    elif [ -n "$clean_residential" ]; then
+    elif [ -n "$pos_residential" ]; then
         type=residential
     fi
 
@@ -3076,6 +3129,9 @@ ip_purity() {
     # 上一版把 VPN/机房/Tor 的基线抬高了 5~14 分(75/60/50),理由是「别把门焊死」;
     # 但判定本来就不看这几个数(代理和 Tor 直接 fail,机房固定 warn),抬基线只
     # 有一个后果:同一个 IP 我们报 60 分、网站报 55 分,用户以为我们算错了。
+    # residential=100:类型现在需要正面证据(asn.type=isp / 白名单 / PTR)才给,
+    # 有正面证据的干净 ISP 出口就是满分 —— Scamalytics 对 GTT 的欺诈分是 0,
+    # ip.net.coffee 给 98,「无正面住宅证据封顶 70」的自造惩罚已随旧口径删除。
     local base
     case "$type" in
         tor)         base=46 ;;   # 网站实测 43~50
@@ -3086,11 +3142,6 @@ ip_purity() {
         # 类型不明不给满分,也不当机房:70 分落在「良好」档,提示但不拦。
         *)           base=70 ;;
     esac
-    # 只靠「没查到异常」判出来的住宅,分数封顶在 70(与「类型不明」同档):
-    # 100 分是给有正面住宅证据的出口的,不能拿没查到来冒充查干净了。
-    if [ -n "$clean_only" ] && [ "$base" -gt 70 ]; then
-        base=70
-    fi
 
     local pen=0 riskpen=0 abpen=0 flags=""
     # 1) 第三方风险分:**连续扣分**,每 5 分风险约 1 分信誉分,60 分以上封顶 12。
@@ -3148,9 +3199,21 @@ ip_purity() {
     esac
 
     # 证据冲突必须写在脸上:否则用户只知道「这次比上次分低」,不知道是 ip-api
-    # 一个布尔在说话。分开标,分类讨论才有依据。
+    # 一个布尔在说话。分开标,分类讨论才有依据。widget 的中继/匿名标志只挂
+    # 标记不扣分:iCloud 中继不是恶意代理,拦启动太重。
     [ -n "$px_conflict" ] && flags="$flags ·代理特征(单源)"
-    [ -n "$clean_only" ] && flags="$flags ·无正面住宅证据"
+    [ -n "$wi_relay" ] && flags="$flags ·中继出口"
+    [ -n "$wi_anon" ] && [ -z "$wi_relay" ] && flags="$flags ·匿名特征"
+    # scamalytics 欺诈分是展示口径:它和 risk/滥用相关但口径独立(0-100 欺诈分,
+    # <20 即低风险),并排给出让用户能和业界工具直接对照。不参与扣分 —— 双计。
+    case "$sca_score" in
+        ''|*[!0-9]*) ;;
+        *) flags="$flags ·欺诈分${sca_score}"
+           case "$sca_risk" in
+               low)   ;;
+               *)     flags="$flags(${sca_risk:-})" ;;
+           esac ;;
+    esac
 
     # 降级判型时分数封顶 70。70 是本模型里「类型不明」的基线,含义正是「看着还行
     # 但没拿到证据」;带着一个没验证过的出口报 100 分,等于用「没查」冒充「查干净了」。
@@ -3294,12 +3357,12 @@ ip_purity() {
         done
         # 即使极端情况下没抢到锁也要落盘:少一行缓存只是多查一次,静默丢掉
         # 本次结果会让「证据不全就提前重查」「24h 复用」整套口径全部失效。
-        tmp="$BASE/purity-cache.v8.$$"
-        { grep -vF "$ip|" "$BASE/purity-cache.v8" 2>/dev/null
+        tmp="$BASE/purity-cache.v9.$$"
+        { grep -vF "$ip|" "$BASE/purity-cache.v9" 2>/dev/null
           printf '%s|%s|%s|%s|%s|%s|%s\n' \
               "$ip" "$cache_epoch" "$verdict" "$score" "$type" "$detail" "$cc"
         } | tail -20 > "$tmp" 2>/dev/null \
-            && mv "$tmp" "$BASE/purity-cache.v8" 2>/dev/null \
+            && mv "$tmp" "$BASE/purity-cache.v9" 2>/dev/null \
             || rm -f "$tmp" 2>/dev/null
         if [ "$got" = 1 ]; then
             rm -f "$lock/owner" 2>/dev/null

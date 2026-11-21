@@ -14,6 +14,14 @@
   2. **地理维度只标记、不扣分。** 它和「时区」检查项说的是同一件事,扣分等于
      重复计费,而网站那边不含这一维,多扣的几分让两边永远对不上。
 
+2026-11-21 口径重做(起因:用户指出「评分不对」,GitHub 业界口径调研后定案):
+  1. **住宅类型需要正面证据。** widget 的 asn.type/company.type=isp、住宅白名单、
+     PTR 家宽特征三者皆无 → 「类型不明」(70/warn),不再靠「没查到异常」冒充住宅。
+     有正面证据的干净出口就是 100 —— 「无正面住宅证据封顶 70」删除。
+  2. **六源取证。** 新增 ipinfo widget demo(正面类型证据 + privacy 五布尔)与
+     scamalytics 免费页(欺诈分做展示口径,不参与扣分)。widget 的 privacy 块
+     答上来了就和一个风险源等价(计入 src_n)。
+
 这一项的价值全在三件事上:
 1. **结论能解释** —— 分数低必须能指出是哪一项扣的(机房/代理/Tor/滥用),否则
    用户拿到一个 46 分不知道该改什么。
@@ -35,6 +43,22 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "core/claude-switch.sh"
+
+
+def _cache_name():
+    """从核心源码里推导当前缓存文件名(purity-cache.vN)。
+
+    缓存换版本是口径变更的例行动作(见核心 v9 沿革注释),测试里硬编码 v8 在
+    v9 落地那天会让 5 个用例一起假红 —— 「没写缓存」,其实写的是新名字。
+    从源码里读,版本号只维护一处。
+    """
+    m = re.search(r'purity-cache\.(v\d+)', SOURCE.read_text(encoding="utf-8"))
+    if not m:
+        raise AssertionError("核心源码里找不到 purity-cache.vN,缓存读写路径被改坏了?")
+    return "purity-cache." + m.group(1)
+
+
+CACHE_NAME = _cache_name()
 
 
 def _risk(**flags):
@@ -71,6 +95,39 @@ def _ipinfo(org, city=""):
 
 def _sfs(frequency):
     return json.dumps({"success": 1, "ip": {"frequency": frequency}})
+
+
+def _widget(asn_type="isp", company_type="isp", org="AS7922 Comcast Cable Communications, LLC",
+            **privacy):
+    """ipinfo widget demo 的响应形状(2026-11-21 实测字段与嵌套照原样,多行缩进)。
+
+    privacy 五布尔默认全否;asn.type / company.type 是正面类型证据的主来源。
+    """
+    p = {"vpn": False, "proxy": False, "tor": False, "relay": False, "hosting": False}
+    p.update(privacy)
+    d = {
+        "data": {
+            "ip": "203.0.113.10",
+            "org": org,
+            "asn": {"asn": "AS7922", "name": "Comcast", "type": asn_type},
+            "company": {"name": "Comcast", "type": company_type},
+            "privacy": p,
+            "is_hosting": p["hosting"],
+            "is_mobile": False,
+            "is_anonymous": any([p["vpn"], p["proxy"], p["tor"], p["relay"]]),
+        }
+    }
+    # 故意用多行缩进:核心要先压平再解析,夹具必须还原真实排版才能钉住那条路径。
+    return json.dumps(d, indent=2)
+
+
+def _scam(score=0, risk="low"):
+    """scamalytics 免费页:HTML 夹一份 JSON 块(只提取 score/risk,其余是表格)。"""
+    return ('<html><head><title>IP Fraud Risk</title></head><body>'
+            '<script>{"ip":"203.0.113.10","score":"%d","risk":"%s",'
+            '"is_blacklisted_external": false}</script>'
+            '<table><tr><td>Server</td><td>Yes</td></tr></table></body></html>'
+            % (score, risk))
 
 
 # ---- 四个典型出口 ----
@@ -154,10 +211,21 @@ esac''')
   *) echo 198.18.0.2 ;;
 esac''' % (rdns, rdns))
 
-    def stub_net(self, ipquery="", ipapi="", ipinfo="", sfs=SFS_CLEAN, calls=None):
-        """四个源各喂一份响应;calls 传文件名则记录每次调用。"""
+    def stub_net(self, ipquery="", ipapi="", ipinfo="", sfs=SFS_CLEAN, calls=None,
+                 widget=None, scam=None):
+        """六个源各喂一份响应;calls 传文件名则记录每次调用。
+
+        widget / scam 缺省给「正常答话」的响应(ipinfo 说 isp、欺诈分 0)——
+        这两个源是类型证据与展示口径的一部分,大多数用例的期望值建立在
+        「它们正常答话」之上。要测「源挂了」的场景,显式传空字符串。
+        """
+        if widget is None:
+            widget = _widget()
+        if scam is None:
+            scam = _scam()
         files = {}
-        for key, body in (("q1", ipquery), ("q2", ipapi), ("q3", ipinfo), ("q4", sfs)):
+        for key, body in (("q1", ipquery), ("q2", ipapi), ("q3", ipinfo),
+                          ("q4", sfs), ("q5", widget), ("q6", scam)):
             files[key] = self.root / (key + ".json")
             files[key].write_text(body, encoding="utf-8")
         log = ""
@@ -167,8 +235,10 @@ esac''' % (rdns, rdns))
   *cdn-cgi/trace*) printf 'ip=203.0.113.10\\nloc=US\\n' ;;
   *api.ipquery.io*) cat "{files['q1']}" ;;
   *ip-api.com*) cat "{files['q2']}" ;;
+  *widget/demo*) cat "{files['q5']}" ;;
   *ipinfo.io*) cat "{files['q3']}" ;;
   *stopforumspam*) cat "{files['q4']}" ;;
+  *scamalytics.com*) cat "{files['q6']}" ;;
   *claude.ai*|*api.anthropic.com*) printf '200' ;;
 esac''')
 
@@ -179,7 +249,7 @@ esac''')
         第二次会直接命中上一次的结果,断言就永远拿第一次的数。这一条踩过:
         「连续扣分」用例五个 risk 全报 70,看起来像扣分没生效,其实是缓存。
         """
-        (self.home / ".claude-switcher" / "purity-cache.v8").unlink(missing_ok=True)
+        (self.home / ".claude-switcher" / CACHE_NAME).unlink(missing_ok=True)
 
     def run_detail(self, cmd="checkdetail"):
         run = subprocess.run(["/bin/bash", str(SOURCE), cmd], text=True,
@@ -391,7 +461,7 @@ esac''')
         风险维度只验了一半 —— 所以分数封顶 85、判定只到 warn。类型对不等于验过了。
         """
         self.set_ptr("c-73-158-10-5.hsd1.ca.comcast.net")
-        self.stub_net(NEUTRAL, _ipapi(), "")
+        self.stub_net(NEUTRAL, _ipapi(), "", widget="")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("住宅宽带", detail)
@@ -400,12 +470,13 @@ esac''')
     # ---- 「不知道」必须说不知道 ----
 
     def test_no_data_is_not_a_pass(self):
-        """两个源都挂时必须说「未评级」并给 warn。
+        """六个源全挂时必须说「未评级」并给 warn。
 
         这里是最容易退化成假绿的地方:取不到数据 -> 变量为空 -> 不扣分 -> 100 分 ok。
-        那等于把「不知道」伪装成「很干净」。
+        那等于把「不知道」伪装成「很干净」。widget 现在也计一个源(privacy 块),
+        所以「全挂」要连它一起 stub 掉。
         """
-        self.stub_net("", "", "", "")
+        self.stub_net("", "", "", "", widget="")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("未评级", detail)
@@ -423,17 +494,20 @@ esac''')
             "location": {"country": "", "country_code": "", "city": "", "timezone": ""},
             "risk": _risk(risk_score=0),
         })
-        self.stub_net(shell, _ipapi(status="fail"), "")
+        self.stub_net(shell, _ipapi(status="fail"), "", widget="")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("未评级", detail)
         self.assertNotIn("100/100", detail)
 
     def test_unknown_result_is_not_cached(self):
-        """查不到就不写缓存 —— 否则一次网络抖动会把「未知」钉住一整天。"""
-        self.stub_net("", "", "", "")
+        """查不到就不写缓存 —— 否则一次网络抖动会把「未知」钉住一整天。
+
+        widget 计源后,「全挂」要连它一起 stub 掉,否则它会把这次查询救活。
+        """
+        self.stub_net("", "", "", "", widget="")
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v8"
+        cache = self.home / ".claude-switcher" / CACHE_NAME
         if cache.exists():
             self.assertNotIn("203.0.113.10", cache.read_text(encoding="utf-8"))
 
@@ -460,7 +534,7 @@ esac''')
         名拼进检查项 —— 用户界面上出现「评分 60/100 · 机房 · ;; connection timed
         out;」。诊断行必须以 ;; 开头丢掉:这时正确结论是「未评级」。
         """
-        self.stub_net("", "", "", "")
+        self.stub_net("", "", "", "", widget="")
         self.set_ptr(";; connection timed out; no servers could be reached")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
@@ -471,7 +545,7 @@ esac''')
 
     def test_degraded_score_is_labelled_as_an_estimate(self):
         """降级判型给出的分数只是类型基线,不能让人读成实测信誉分。"""
-        self.stub_net("", "", IPINFO_RESID)
+        self.stub_net("", "", IPINFO_RESID, widget="")
         _, detail, _ = self.run_detail()
         self.assertIn("风险源不可达", detail)
         self.assertIn("类型预估", detail)
@@ -479,13 +553,13 @@ esac''')
         self.assertEqual(self.score(detail), 70, detail)
 
     def test_risk_sources_down_still_types_from_operator(self):
-        """ipquery 与 ip-api 同时连不上时,靠 ipinfo 的运营商名照样把类型判出来。
+        """ipquery、ip-api 与 widget 同时连不上时,靠 ipinfo 的运营商名照样把类型判出来。
 
-        实测这两个源会同时回 000(ipinfo 却是通的)。这时直接报「未评级」等于把手里的
+        实测这几个源会同时回 000(ipinfo 却是通的)。这时直接报「未评级」等于把手里的
         信息扔掉 —— 我们明明知道出口属于 Comcast。但也不能报满分:代理与滥用两个维度
         一个都没验过,所以分数封顶 70、判定封顶 warn,并在同一行里说清原因。
         """
-        self.stub_net("", "", IPINFO_RESID)
+        self.stub_net("", "", IPINFO_RESID, widget="")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("住宅宽带", detail)
@@ -505,7 +579,7 @@ esac''')
         保镖 / 规则置顶这些没 stub 的检查污染了,拿它做断言等于在测别的东西。
         「warn 不拦启动」由 test_risk_sources_down_still_types_from_operator 的 state 保证。
         """
-        self.stub_net("", "", IPINFO_RESID)
+        self.stub_net("", "", IPINFO_RESID, widget="")
         run = subprocess.run(["/bin/bash", str(SOURCE), "check"], text=True,
                              capture_output=True, env=self.env, timeout=180)
         self.assertNotIn("出口未过使用门槛", run.stdout, run.stdout + run.stderr)
@@ -518,7 +592,7 @@ esac''')
         让用户看得见我们到底依据了什么。
         """
         self.set_ptr("c-73-158-10-5.hsd1.ca.comcast.net")
-        self.stub_net("", "", "")
+        self.stub_net("", "", "", widget="")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("住宅宽带", detail)
@@ -533,8 +607,9 @@ esac''')
         代理特征就可能漏判。以前这里「只加说明、不改判定」,结果是 ipquery 一超时,
         一个没验过风险的出口照样报 100/ok —— 和两家源都验过的 100 长得一模一样。
         现在分数表达「现有证据支持到这里」:封顶 85,并且不给绿勾。
+        widget 也计一个源,所以「只剩一家」要连它一起 stub 掉。
         """
-        self.stub_net(RESIDENTIAL, _ipapi(status="fail"), "")
+        self.stub_net(RESIDENTIAL, _ipapi(status="fail"), "", widget="")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertEqual(self.score(detail), 85, detail)
@@ -574,11 +649,13 @@ esac''')
                                        city="Ashburn", risk_score=risk),
                               _ipapi("Ashburn"), "")
                 state, detail, _ = self.run_detail()
-                self.assertEqual(state, "warn", detail)
+                # 正面证据的住宅基线 100,risk 10/11 各只扣 2 分 → 98,过 ok 线。
+                # 旧口径 68 分 warn 是「隐式住宅」时代的数字;类型不该翻的断言不变。
+                self.assertEqual(state, "ok", detail)
                 self.assertIn("住宅宽带", detail)
                 self.assertNotIn("类型不明", detail)
                 self.assertNotIn("建议换住宅", detail)
-                self.assertEqual(self.score(detail), 68, detail)
+                self.assertEqual(self.score(detail), 98, detail)
 
     def test_risk_penalty_is_continuous(self):
         """风险扣分是连续函数:每 +5 分风险正好 -1 分信誉,没有档口跳变。"""
@@ -590,8 +667,9 @@ esac''')
                           _ipapi("Ashburn"), "")
             _, detail, _ = self.run_detail()
             scores[risk] = self.score(detail)
-        # 基线 70(只靠「没查到异常」判出的住宅),扣分 (risk*12+30)/60
-        self.assertEqual(scores, {0: 70, 5: 69, 10: 68, 25: 65, 50: 60}, scores)
+        # 基线 100:widget 的 asn.type=isp 是正面住宅证据,干净出口不再封顶 70;
+        # 扣分 (risk*12+30)/60,50 分风险扣 10。
+        self.assertEqual(scores, {0: 100, 5: 99, 10: 98, 25: 95, 50: 90}, scores)
 
     # ---- 与门禁、缓存的一致性 ----
 
@@ -648,7 +726,7 @@ esac''')
         """
         self.stub_net(RESIDENTIAL, _ipapi("Denver", countryCode="US"), IPINFO_RESID)
         self.run_detail()
-        cache = self.home / ".claude-switcher" / "purity-cache.v8"
+        cache = self.home / ".claude-switcher" / CACHE_NAME
         self.assertTrue(cache.exists(), "没写 v4 缓存")
         fields = cache.read_text(encoding="utf-8").strip().split("|")
         self.assertEqual(len(fields), 7, "v4 应是 7 列,实际 %d: %s" % (len(fields), fields))
@@ -665,11 +743,11 @@ esac''')
         现在的分工是:证据不齐只影响**文案与封顶**,不影响缓存时长;要新结论,
         由 checkdetail 显式传 force 去要。所以这里断言的就是 24h。
         """
-        self.stub_net("", "", IPINFO_RESID)
+        self.stub_net("", "", IPINFO_RESID, widget="")
         state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertIn("风险源不可达", detail)
-        cache = self.home / ".claude-switcher" / "purity-cache.v8"
+        cache = self.home / ".claude-switcher" / CACHE_NAME
         line = cache.read_text(encoding="utf-8").strip()
         fields = line.split("|")
         self.assertEqual(len(fields), 7, fields)
@@ -683,7 +761,7 @@ esac''')
         cache.unlink()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        fresh = (self.home / ".claude-switcher" / "purity-cache.v8").read_text(encoding="utf-8")
+        fresh = (self.home / ".claude-switcher" / CACHE_NAME).read_text(encoding="utf-8")
         rows = [r for r in fresh.strip().splitlines() if r.startswith("203.0.113.10|")]
         self.assertEqual(len(rows), 1, "同一个 IP 不该留下两条缓存")
         remaining = 86400 - (int(time.time()) - int(rows[0].split("|")[1]))
@@ -736,27 +814,48 @@ esac''')
         self.assertNotIn("硬门槛:", detail)
 
 
-    def test_clean_carrier_is_residential_but_not_full_marks(self):
-        """两家源都说没问题 → 类型按住宅判(与 ip.net.coffee 同口径),但分数封顶 70。
+    def test_clean_carrier_with_widget_isp_evidence_is_full_marks(self):
+        """widget 说 asn.type=isp 的干净骨干出口就是 100 分,不再封顶 70。
 
-        用户先说「其他地方检查都是住宅 ip,我们却提示是机房 ip」(11-06),
-        又说「骨干网地址拿 100 分不对」(11-19)。两句都对,分开处理:
-        类型跟参考站一致,分数不跟着满分 —— 100 分是给有**正面住宅证据**的出口的
-        (运营商名命中白名单,或 PTR 自曝 hsd/dynamic/dhcp 这类家宽特征)。
-        实测 66.17.65.38 是 AS3257 GTT 的骨干网地址,靠「没查到异常」拿到 100/100。
+        用户 11-06 说「其他地方检查都是住宅 ip,我们却提示是机房」、11-19 说
+        「骨干网地址拿 100 分不对」—— 两句都对,但解法不是扣帽子:旧口径先用
+        「名字没收录」把 GTT 判成住宅/机房摇摆,再用「无正面住宅证据」封顶 70,
+        同一个出口被一套猜测摆布两次。2026-11-21 实测 ipinfo widget 对
+        66.17.65.38(AS3257 GTT)明确给 asn.type=isp、Scamalytics 欺诈分 0、
+        ip.net.coffee 给 98 —— 正面证据成立,就该与业界同口径给满分。
+        「100 分不对」的担忧由「正面证据」这一关把守,不再由封顶把守。
         """
         self.write_env("America/New_York")
         self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
                                             timezone="America/New_York"),
                       IPINFO_CARRIER)
         state, detail, _ = self.run_detail()
+        self.assertEqual(state, "ok", detail)
+        self.assertEqual(self.score(detail), 100, detail)
+        self.assertIn("住宅宽带", detail)
+        self.assertNotIn("机房", detail)
+        self.assertNotIn("无正面住宅证据", detail)
+        # 判成住宅却劝人「换住宅」是自相矛盾的。
+        self.assertNotIn("建议换住宅", detail)
+
+    def test_no_positive_evidence_is_unknown_not_residential(self):
+        """widget 挂、白名单不中、PTR 也没有:老实报「类型不明」,不冒充住宅。
+
+        正面证据三选一(asn.type=isp / company.type=isp / 白名单 / PTR 家宽特征)
+        一个都没有时,旧口径靠「两家源没查到异常」默认给住宅 —— GTT 就是这么
+        先拿到「住宅宽带」再被「无正面住宅证据」打回 70 的。现在直接报
+        「类型不明」(基线 70,warn):分数与旧口径相同,但标签不再说谎。
+        """
+        self.write_env("America/New_York")
+        self.stub_net(CARRIER_CLEAN, _ipapi("Ashburn", countryCode="US",
+                                            timezone="America/New_York"),
+                      IPINFO_CARRIER, widget="")
+        state, detail, _ = self.run_detail()
         self.assertEqual(state, "warn", detail)
         self.assertEqual(self.score(detail), 70, detail)
-        self.assertIn("住宅宽带", detail)
-        self.assertIn("无正面住宅证据", detail)
+        self.assertIn("类型不明", detail)
+        self.assertNotIn("住宅宽带", detail)
         self.assertNotIn("机房", detail)
-        # 判成住宅却劝人「换住宅」是自相矛盾的:这一档的 warn 只来自证据不全。
-        self.assertNotIn("建议换住宅", detail)
 
     def test_single_risk_source_never_labels_hosting(self):
         """只剩一家风险源时,未收录的运营商名不能变成「机房」。
@@ -809,7 +908,7 @@ esac''')
         lock.mkdir()
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v8"
+        cache = base / CACHE_NAME
         self.assertTrue(cache.exists(), "陈旧锁之后仍应写入缓存")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertFalse(lock.exists(), "陈旧锁应被回收")
@@ -823,7 +922,7 @@ esac''')
         (lock / "owner").write_text(str(int(time.time())), encoding="utf-8")
         self.stub_net(RESIDENTIAL, _ipapi("Denver"), IPINFO_RESID)
         self.run_detail()
-        cache = base / "purity-cache.v8"
+        cache = base / CACHE_NAME
         self.assertTrue(cache.exists(), "抢不到锁也要落盘,不能丢掉结果")
         self.assertIn("203.0.113.10|", cache.read_text(encoding="utf-8"))
         self.assertTrue(lock.exists(), "活锁不该被别人抢走")
