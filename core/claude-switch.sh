@@ -2235,6 +2235,58 @@ for rule in rules:
     [ -n "$group" ] && printf '%s\n' "$group"
 }
 
+# 组名自愈:订阅更新会整份覆盖客户端配置,env.json 里记的组名可能已不存在
+# (老订阅的组被上游改写/删除)。此时规则写不进、校验必失败、fix 用旧组名重试
+# 永远收敛 —— 用户看到的就是「一键修复修不好」。修法:修复前从内核 /proxies
+# 枚举真实代理组,按「固定IP > AI/干净 > 稳定型组」打分自动换到现存最优组,
+# 写回 env.json。当前组名仍存在时优先保留,不会在订阅正常时乱换。
+GROUP_RESELECTED=""
+ensure_proxy_group() {
+    GROUP_RESELECTED=""
+    local sock json pick
+    sock=$(clash_sock 2>/dev/null) || return 1
+    json=$(curl -s --max-time 10 --unix-socket "$sock" http://localhost/proxies 2>/dev/null)
+    [ -n "$json" ] || return 1
+    pick=$(printf '%s' "$json" | "${CLAUDE_SWITCHER_PYTHON:-python3}" -c '
+import json, re, sys
+try:
+    proxies = json.load(sys.stdin).get("proxies") or {}
+except Exception:
+    sys.exit(0)
+BAD = {"DIRECT", "REJECT", "GLOBAL", "PASS"}
+current = sys.argv[1] if len(sys.argv) > 1 else ""
+best, best_score = "", -1
+for name, item in proxies.items():
+    if name in BAD or not isinstance(item, dict) or "all" not in item:
+        continue
+    # 组内全是 DIRECT/REJECT 的「组」没有代理意义,选上去也是死路
+    if not [m for m in (item.get("all") or []) if m not in BAD]:
+        continue
+    gtype = str(item.get("type") or "").lower()
+    if gtype not in ("select", "fallback", "url-test", "load-balance", "relay"):
+        continue
+    score = 0
+    if name == current:
+        score += 1000  # 现组名仍有效:无条件保留,订阅正常时不许乱换
+    if re.search(r"固定|fixed", name, re.I):
+        score += 100  # 产品语义:固定出口组是最优目标
+    if re.search(r"ai|openai|干净|clean", name, re.I):
+        score += 50
+    if gtype in ("select", "fallback"):
+        score += 10   # 手动/fallback 组比自动测速组更贴合「钉死规则」的用途
+    if score > best_score:
+        best, best_score = name, score
+if best:
+    print(best)
+' "$PROXY_GROUP" 2>/dev/null)
+    [ -n "$pick" ] || return 1
+    [ "$pick" = "$PROXY_GROUP" ] && return 0
+    support env-set "proxy_group=$pick" >/dev/null 2>&1 || return 1
+    PROXY_GROUP="$pick"
+    GROUP_RESELECTED=1
+    return 0
+}
+
 # 读取环境层。env.json 缺失 → 用保底值(首次安装与老版本升级都走这条路);
 # env.json 损坏 → 明确报错,不静默降级:环境值错会直接把规则写进错误的代理组。
 load_env() {
@@ -2501,7 +2553,7 @@ rule_fix_hint() {
         *不是*rule*模式*)
             printf '客户端不在规则模式 · 切到「规则」后重新检查' ;;
         *代理组不存在*|*实际的代理组*)
-            printf '配置的代理组在客户端里不存在 · 点「一键修复」重新选择' ;;
+            printf '配置的代理组在客户端里不存在(常见于订阅更新)· 点「一键修复」会自动切换到可用组' ;;
         *没有可用的当前节点*|*直连或拒绝*)
             printf '代理组当前节点是直连或拒绝 · 换一个代理节点' ;;
         *UDP*)
@@ -5456,6 +5508,15 @@ ASEOF
     if [ "$PROXY_MODE" = "clash-verge" ] && [ "$(clash_mode)" = "global" ]; then
         echo "FIX:全局模式,置顶规则不适用(全部流量已走代理) ✓"
     elif [ "$PROXY_MODE" = "clash-verge" ]; then
+        # 先自愈组名:订阅更新整份覆盖配置后,env.json 的组名可能已不存在,
+        # 规则写入与校验会永远失败。换到现存最优组后再写,否则修复是死循环。
+        if ensure_proxy_group; then
+            if [ "$GROUP_RESELECTED" = "1" ]; then
+                echo "FIX:原代理组已不存在(常见于订阅更新换组名)· 已自动切换到 $PROXY_GROUP ✓"
+            fi
+        else
+            echo "FIX:读取内核代理组失败,组名校验跳过(若修复仍失败请检查客户端是否在线)"
+        fi
         echo "FIX:写入全局扩展脚本(保留已有 main 与无关配置)..."
         local rules_result verify_err need_reload=0
         if ! rules_result=$(write_merge_rules 2>&1); then
