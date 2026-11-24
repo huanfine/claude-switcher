@@ -88,7 +88,9 @@ jobs:
           cd build
           # 产物名由 package-macos.sh 写入 build/ARCH_LABEL。
           # 现在是 universal,不再随构建机架构变化。
-          ARCH_LABEL="$(cat build/ARCH_LABEL)"
+          # cwd 已是 build/:此前这里写的是 cat build/ARCH_LABEL,
+          # 实际读的是 build/build/ARCH_LABEL,v1.8.13-dev 首次发版当场炸出。
+          ARCH_LABEL="$(cat ARCH_LABEL)"
           test -n "$ARCH_LABEL"
           shasum -a 256 \
             "ClaudeSwitcher-${VERSION}-macos-${ARCH_LABEL}-full.zip" \
