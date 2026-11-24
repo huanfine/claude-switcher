@@ -171,7 +171,11 @@ class NodeScanParserTests(unittest.TestCase):
 
 
 class NodeScanCommandTests(unittest.TestCase):
-    """checkdetail 读报告文件的三态,以及命令对外可见性。"""
+    """node-scan/node-apply 命令对外可见性。
+
+    「更优节点」检查行已换成「DNS泄露」(2026-11-24):checkdetail 不再读
+    node-scan.txt 落三态结论,扫描结论由报告面板承载。命令本身不变。
+    """
 
     def setUp(self):
         (ROOT / "_trash").mkdir(exist_ok=True)
@@ -188,7 +192,7 @@ class NodeScanCommandTests(unittest.TestCase):
         self.stub("pgrep", "exit 1")
         self.stub("ifconfig", "echo 'inet 198.18.0.1'")
         self.stub("curl", '''case "$*" in
-  *cdn-cgi/trace*) printf 'ip=203.0.113.10\\nloc=US\\n' ;;
+  *cdn-cgi/trace*) printf 'ip=203.0.113.10\nloc=US\n' ;;
   *ipinfo.io*) printf '{"org":"Example Residential"}' ;;
   *claude.ai*|*api.anthropic.com*) printf '200' ;;
 esac''')
@@ -230,273 +234,20 @@ esac''')
         (self.home / ".claude-switcher/node-scan.txt").write_text(
             "".join("%s=%s\n" % (k, v) for k, v in values.items()), encoding="utf-8")
 
-    def test_no_report_is_skip_not_ok(self):
-        run = self.run_core("checkdetail")
-        value = self.line(run.stdout, "更优节点")
-        self.assertIsNotNone(value, run.stdout + run.stderr)
-        self.assertTrue(value.startswith("skip:"), value)
-        self.assertIn("尚未扫描", value)
-
-    def test_expired_report_is_skip(self):
-        self.report(EPOCH="1")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("skip:"), value)
-        self.assertIn("已过期", value)
-
-    def test_nochoice_report_is_ok_and_names_the_group(self):
-        """控制链落在自动选路组时给 ok,不是 skip —— 结论是「不需要换」,不是「没检查」。
-
-        这一项曾经永远停在「点扫描」,点下去又必然失败;而事实是那条链上根本
-        没有可手动比较的对象(内核自己挑成员)。
-        """
-        self.report(NOCHOICE="1", NOCHOICE_GROUP="🧠 AI·干净IP",
-                    NOCHOICE_TYPE="Fallback",
-                    NOCHOICE_MEMBERS="🏠 固定IP·经良心云、🏠 固定IP·美国-阿什本")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("ok:"), value)
-        self.assertIn("自动选路", value)
-        self.assertIn("成员", value)
-
-    def test_stale_nochoice_report_asks_for_a_quick_recheck(self):
-        """结构型结论也讲「现在」:过 24h 要复核,用户可能换了订阅或改了规则。"""
-        self.report(EPOCH="1", NOCHOICE="1", NOCHOICE_GROUP="🧠 AI·干净IP",
-                    NOCHOICE_TYPE="Fallback")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("skip:"), value)
-        self.assertIn("复核", value)
-
-    def test_fresh_report_with_better_node_is_warn(self):
-        self.report()
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("warn:"), value)
-        self.assertIn("B", value)
-        self.assertIn("88 分", value)
-        self.assertIn("39 分", value)
-
-    def test_hint_names_the_button_that_really_exists(self):
-        """提示词必须和界面按钮对得上,不能叫用户去点一个不存在的东西。
-
-        auto-ok 时面板里真有「应用最优节点」;report-only 时那个按钮不出现,
-        就不能许诺它。按钮名统一叫「扫描可用节点」(右上角网络图标的 help)。
-        """
-        self.report(GATE="auto-ok")
-        allowed = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertIn("应用最优节点", allowed)
-        self.assertIn("扫描可用节点", allowed)
-
-        self.report(GATE="report-only")
-        denied = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertNotIn("应用最优节点", denied, denied)
-        self.assertIn("手动切换", denied)
-
-    def test_report_without_better_node_is_ok(self):
-        self.report(BEST="", DELTA="0")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("ok:"), value)
-
-    def test_no_better_node_detail_carries_real_numbers(self):
-        """「当前线路最干净」必须挂得上依据,不能是一句看不到证据的空话。
-
-        用户原话:「现在显示的是当前线路是候选里面最干净的,没有具体内容」。
-        """
-        self.report(BEST="", DELTA="0")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("ok:"), value)
-        for piece in ("11 候选", "3 出口", "4 合格", "当前 49 分", "11-04 09:52 扫描"):
-            self.assertIn(piece, value)
-
-    def test_legacy_report_omits_missing_numbers(self):
-        """负例:06:54 那种旧格式报告缺统计字段,逐项省略,不能补 0 冒充实测。"""
-        self.report(BEST="", DELTA="0", CANDIDATES="", UNIQUE_IPS="",
-                    ELIGIBLE="", SCAN_TIME="", CURRENT_SCORE="")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("ok:"), value)
-        self.assertNotIn("0 候选", value, value)
-        self.assertNotIn("当前  分", value, value)
-
-    def test_no_eligible_candidate_is_skip_not_ok(self):
-        """一个过硬门槛的候选都没有 = 这轮没比成,不能报 ok「当前最干净」。"""
-        self.report(BEST="", DELTA="0", ELIGIBLE="0")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("skip:"), value)
-        self.assertIn("没有过硬门槛", value)
-        self.assertIn("11 候选", value)
-
-    def test_human_report_lists_all_candidates_and_scan_time(self):
-        """面板里给人看的那段要列全部候选(含排除原因),不能只给前三名。"""
-        src = SOURCE.read_text(encoding="utf-8")
-        self.assertIn("--- 全部候选(可用优先,再按分数;含区间与排除原因) ---", src)
-        self.assertIn("SCAN_TIME=", src)
-        self.assertNotIn("--- 排名(前 3) ---", src,
-                         "只列前三名时,被排除的节点为什么不能选就看不见了")
-
-    def test_conclusion_only_compares_eligible_candidates(self):
-        """列了全部候选之后,68 分被硬门槛排除、当前 49 分,不能还说「最干净」。
-
-        全部排名里一眼能看到分数更高的节点,结论必须说清比较范围,
-        并解释高分候选为什么不算 —— 否则就是自己跟自己打架。
-        """
-        src = SOURCE.read_text(encoding="utf-8")
-        self.assertIn("过硬门槛内没有更优节点", src)
-        self.assertIn("个候选分数更高,但没过硬门槛", src)
-        self.assertNotIn("当前线路已是候选里最干净的", src)
-
-    def test_fixed_node_is_ok_and_drift_is_warn(self):
-        """固定节点后这一项不能假绿;被人改回去要能发现。"""
+    def test_checkdetail_carries_dns_leak_not_node_row(self):
+        """检查位换成了 DNS泄露;更优节点行不再出现在 checkdetail 输出里。"""
         self.report(PREFERRED="B", PREFERRED_MATCH="1")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("ok:"), value)
-        self.assertIn("已固定在 B", value)
-
-        self.report(PREFERRED="B", PREFERRED_MATCH="0", BEST="C")
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("warn:"), value)
-        self.assertIn("已偏离固定节点 B", value)
+        out = self.run_core("checkdetail").stdout
+        self.assertIsNone(self.line(out, "更优节点"), "旧行不该残留")
+        value = self.line(out, "DNS泄露")
+        self.assertIsNotNone(value, "新检查项必须在")
+        self.assertNotIn("更优节点=", out)
 
     def test_help_documents_node_scan(self):
         out = self.run_core("help").stdout
         self.assertIn("node-scan", out)
         self.assertIn("node-apply", out)
         self.assertIn("不切节点", out)
-        self.assertIn("只出报告", out)
-        self.assertIn("自动回滚", out)
-
-    def test_scan_concurrency_stays_at_one_to_protect_free_sources(self):
-        """并发数是资源约束,不是性能旋钮。
-
-        ip_purity 内部已经是四源并行,外面再乘 N 就是 4N 个并发打到免费源上。
-        原来是 3(=12 并发),2026-11-20 实测把 ipinfo 打成 429 之后收成 1。
-        限流的后果不只是慢:源一旦限流就会把结果推进「证据不全」态,而那类结果的
-        重查间隔比正常缓存短得多 —— 越查越限、越限越查。
-        """
-        text = SOURCE.read_text(encoding="utf-8")
-        m = re.search(r"(?m)^NODE_SCAN_PARALLEL=(\d+)", text)
-        self.assertIsNotNone(m, "核心里的 NODE_SCAN_PARALLEL 定义没了")
-        self.assertEqual(int(m.group(1)), 1,
-                         "节点扫描并发被调回 %s:每个 ip_purity 内部已有 4 路并发"
-                         % m.group(1))
-
-    # ---- node-apply 的执行门禁:必须**先于**任何内核写操作拦住 ----
-
-    def test_apply_rejects_running_claude(self):
-        self.report()
-        self.stub("pgrep", "exit 0")
-        run = self.run_core("node-apply")
-        self.assertNotEqual(run.returncode, 0)
-        blob = run.stdout + run.stderr
-        self.assertIn("按约定只出报告", blob)
-        self.assertIn("Claude 正在运行", blob)
-        self.assertNotIn("读不到运行中的内核节点", blob,
-                         "门禁必须在碰内核之前拦住,不能先切了再说")
-
-    def test_existing_account_slot_does_not_block_apply(self):
-        """存过账号快照不等于有实例在跑。
-
-        这条原来断言的是「已有账号槽位就拒绝」。可槽位是常驻资产:存过一次
-        hasA=1 就永远为真,于是 node-apply 对任何用过本工具的人都是永久拒绝,
-        界面上「应用最优节点」从不出现 —— 节点切换功能等于没有。
-        现在只认「进程在跑」和「看门狗驻守」,槽位在不在不参与判定。
-        """
-        self.report()
-        (self.home / ".claude-switcher/accounts/A").mkdir(parents=True)
-        (self.home / ".claude-switcher/accounts/B").mkdir(parents=True)
-        blob = self.run_core("node-apply").stdout + self.run_core("node-apply").stderr
-        self.assertNotIn("已有账号槽位", blob, blob)
-        self.assertNotIn("按约定只出报告", blob, blob)
-        self.assertIn("读不到运行中的内核节点", blob,
-                      "门禁应放行;后面的失败来自假环境没有内核,不是门禁")
-
-    def test_gate_recognises_native_claude_binary(self):
-        """brew / ~/.local/bin 装的原生 claude,argv[0] 就是 `claude`。
-
-        原来只认 `claude-code/cli.js`、`@anthropic-ai/claude-code` 和桌面 App
-        三条 -f 模式,实测 `claude --version` 的进程命令行是 `claude --version`,
-        一条都匹配不上 —— 终端里开着 Claude Code,门禁却判「没在跑」,
-        看门狗熔断时也不会去停它。
-        """
-        # 只让 `-x claude` 命中,其余模式一律不命中,确保测的是新加的那条。
-        self.stub("pgrep", 'case "$1 $2" in "-x claude") exit 0 ;; *) exit 1 ;; esac')
-        src = SOURCE.read_text(encoding="utf-8")
-        start = src.index("claude_app_running() {")
-        end = src.index("\n}\n", src.index("node_gate() {")) + len("\n}\n")
-        script = 'BASE="%s"\n%s\nnode_gate\n' % (self.home / ".claude-switcher",
-                                                 src[start:end])
-        run = subprocess.run(["/bin/bash", "-c", script], text=True,
-                             capture_output=True, env=self.env, timeout=10)
-        self.assertIn("report-only", run.stdout, run.stdout + run.stderr)
-        self.assertIn("Claude 正在运行", run.stdout, run.stdout + run.stderr)
-
-    def test_kill_switch_stops_the_cli_too(self):
-        """熔断只停桌面 App 是不够的:终端里的 claude 会继续重试。
-
-        大小写敏感这件事也要钉住 —— `-x claude` 不能误伤桌面 App 的 `Claude`。
-        """
-        src = SOURCE.read_text(encoding="utf-8")
-        start = src.index("stop_claude_now() {")
-        end = src.index("\n}\n", start) + len("\n}\n")
-        block = src[start:end]
-        self.assertIn("pkill -x claude", block, "熔断没有停原生二进制")
-        self.assertIn("claude_cli_running", block, "停止后要复查 CLI 是否真的退了")
-        self.assertIn("claude_running && was=1", block,
-                      "was 只看桌面 App 时,CLI 被熔断会显示成「本来就没开」")
-
-    def test_scan_gate_ignores_existing_slots(self):
-        """报告门禁同理:有槽位但没东西在跑,应当给 auto-ok。
-
-        直接抽 node_gate 出来跑:完整 node-scan 要先读到内核,假环境里到不了
-        打印门禁那一步,测不出这条。
-        """
-        (self.home / ".claude-switcher/accounts/A").mkdir(parents=True)
-        src = SOURCE.read_text(encoding="utf-8")
-        start = src.index("node_gate() {")
-        end = src.index("\n}\n", start) + len("\n}\n")
-        script = 'BASE="%s"\n%s\nnode_gate\n' % (self.home / ".claude-switcher",
-                                                 src[start:end])
-        run = subprocess.run(["/bin/bash", "-c", script], text=True,
-                             capture_output=True, env=self.env, timeout=10)
-        self.assertIn("auto-ok", run.stdout, run.stdout + run.stderr)
-        self.assertNotIn("已有账号槽位", run.stdout, run.stdout)
-
-    def test_stale_watch_pidfile_does_not_block_apply(self):
-        """看门狗这一条从「pidfile 在不在」升级成「进程真活着吗」。
-
-        残留 pidfile 不该把刚停完守护的 App 卡住;反过来真有守护在跑仍要拦。
-        这里 pid 指向一个不存在的进程,应放行到下一步(假环境里内核读不到)。
-        """
-        self.report()
-        (self.home / ".claude-switcher/watch.pid").write_text("999999\t/fake/base\n",
-                                                              encoding="utf-8")
-        run = self.run_core("node-apply")
-        blob = run.stdout + run.stderr
-        self.assertNotIn("按约定只出报告", blob, blob)
-        self.assertIn("读不到运行中的内核节点", blob,
-                      "门禁应放行;后面的失败来自假环境没有内核,不是门禁")
-
-    def test_apply_rejects_bad_report(self):
-        for overrides, expected in (
-            ({"EPOCH": "1"}, "已过期"),
-            ({"BEST": ""}, "无需应用"),
-        ):
-            self.report(**overrides)
-            blob = self.run_core("node-apply").stdout + self.run_core("node-apply").stderr
-            self.assertIn(expected, blob)
-        (self.home / ".claude-switcher/node-scan.txt").unlink()
-        blob = self.run_core("node-apply").stdout + self.run_core("node-apply").stderr
-        self.assertIn("还没有扫描报告", blob)
-
-    def test_new_check_is_optional_and_accepted_by_config(self):
-        """设置页关得掉这一项;写进去的设置不能被 config 校验拒掉。"""
-        self.assertIn("更优节点", _optional_keys(SOURCE), "OPTIONAL 白名单漏了新检查项")
-        run = subprocess.run(
-            ["/bin/bash", str(self.core()), "set-check-config",
-             '{"disabled":["更优节点"],"allowOptionalFailures":false,"logging":true}'],
-            text=True, capture_output=True, env=self.env, timeout=30)
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        saved = subprocess.run(["/bin/bash", str(self.core()), "get-check-config"],
-                               text=True, capture_output=True, env=self.env, timeout=30)
-        self.assertIn("更优节点", json.loads(saved.stdout)["disabled"])
-        value = self.line(self.run_core("checkdetail").stdout, "更优节点")
-        self.assertTrue(value.startswith("skip:"), value)
 
 
 class PurityFailReasonTests(unittest.TestCase):

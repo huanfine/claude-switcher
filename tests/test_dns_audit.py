@@ -161,7 +161,8 @@ class DnsAuditTests(unittest.TestCase):
 
     def test_check_and_fix_wire_the_audit(self):
         sh = CORE.read_text(encoding="utf-8")
-        self.assertIn('optional_result "DNS" fail "上游泄露架构', sh)
+        # 检查位:DNS泄露 项(2026-11-24 换掉「更优节点」)承载架构审计。
+        self.assertIn('optional_result "DNS泄露" fail "$dns_leak_issues', sh)
         fix_body = sh.split("fix() {", 1)[1]
         self.assertIn("dns_audit", fix_body)
         self.assertIn("write_dns_merge", fix_body)

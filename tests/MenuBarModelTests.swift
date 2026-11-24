@@ -1,8 +1,8 @@
 import Foundation
 import AppKit
 
-private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性", "更优节点"]
-private let auditIDs = ["proxy_core", "tun", "egress_ip", "ip_stability", "timezone", "locale", "ipv6", "dns", "webrtc", "bodyguard", "rules", "client_language", "asn", "ip_purity", "ecosystem", "better_node"]
+private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性", "DNS泄露"]
+private let auditIDs = ["proxy_core", "tun", "egress_ip", "ip_stability", "timezone", "locale", "ipv6", "dns", "webrtc", "bodyguard", "rules", "client_language", "asn", "ip_purity", "ecosystem", "dns_leak"]
 
 private struct TestFailure: Error, CustomStringConvertible {
     let description: String
@@ -357,7 +357,7 @@ struct MenuBarModelTests {
                 // 它必须和设置页的开关完全一致,否则会出现「关不掉」或「关了还拦」。
                 let vm = f.vm()
                 vm.start(); try f.idle(vm)
-                try expect(vm.rows.count == 16, "检查项应为 16 项(含新增的「更优节点」)")
+                try expect(vm.rows.count == 16, "检查项应为 16 项(含「DNS泄露」)")
                 let soft = Set(vm.rows.filter { $0.canDisable }.map { $0.name })
                 let expected = Set(VM.optionalChecks.map { $0.label })
                 try expect(soft == expected, "可关闭项与设置页不一致:\(soft.sorted()) vs \(expected.sorted())")
@@ -554,7 +554,7 @@ struct MenuBarModelTests {
                 func rows(_ overrides: [String: RowState],
                           details: [String: String] = [:]) -> [CheckRow] {
                     let hard = ["代理内核", "TUN网卡", "出口IP", "时区", "地区", "IPv6", "保镖", "规则置顶"]
-                    let soft = ["IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性", "更优节点"]
+                    let soft = ["IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性", "DNS泄露"]
                     return (hard.map { ($0, false) } + soft.map { ($0, true) }).map { name, disable in
                         CheckRow(name: name, icon: "circle", canDisable: disable,
                                  state: overrides[name] ?? .ok,
@@ -649,12 +649,12 @@ struct MenuBarModelTests {
                 ], details: ["IP纯净度": "评分 0/100 · 机房"]))
                 try expect(everythingBad.score == 0, "四维全打满应归零，实际 \(everythingBad.score)")
 
-                // (4) 新增的「更优节点」进身份维度,权重 4;它是建议不是故障,
-                //     而且 skip(报告还没生成 / 用户关掉)绝不能算扣分。
-                let betterNode = HealthSummary.evaluate(rows(["更优节点": .warn]))
-                try expect(betterNode.score == 96, "有更优节点应只扣 4 分，实际 \(betterNode.score)")
-                let notScanned = HealthSummary.evaluate(rows(["更优节点": .skip]))
-                try expect(notScanned.score == 100, "没扫描不等于不合格，实际 \(notScanned.score)")
+                // (4) 「DNS泄露」进身份维度,权重 4;它是可修复项不是故障,
+                //     而且用户关掉(可关闭项)绝不能算扣分。
+                let betterNode = HealthSummary.evaluate(rows(["DNS泄露": .warn]))
+                try expect(betterNode.score == 96, "DNS泄露 warn 应只扣 4 分，实际 \(betterNode.score)")
+                let notScanned = HealthSummary.evaluate(rows(["DNS泄露": .skip]))
+                try expect(notScanned.score == 100, "用户关闭的项不该扣分，实际 \(notScanned.score)")
                 let disabled = HealthSummary.evaluate(rows(["IP一致": .skip]))
                 try expect(disabled.score == 100, "用户关掉的检查项不该拉低总分，实际 \(disabled.score)")
 
@@ -950,7 +950,9 @@ struct MenuBarModelTests {
                 try expect(vm.note.contains("核心脚本过旧"), "回执要说明跳过了节点扫描，实际 \(vm.note)")
 
             case "node_scan_report_updates_row":
-                // 扫描报告必须能就地更新「更优节点」这一行,且不能把其他行改掉。
+                // 「更优节点」检查行已换成「DNS泄露」(2026-11-24):applyNodeScan
+                // 不再有落行目标,必须是安全空转,不许崩、不许改别的行。
+                // 解析与证据拼装逻辑仍在(报告面板用),行为继续钉住。
                 let vm = f.vm()
                 let before = vm.rows.map { $0.name }
                 let best = """
@@ -967,38 +969,17 @@ struct MenuBarModelTests {
                 try expect(info["BEST"] == "鱼3·美国-犹他州", "没解析出最优节点")
                 try expect(info["BEST_SCORE"] == "88", "没解析出最优节点分数")
                 vm.applyNodeScan(info)
-                guard let row = vm.rows.first(where: { $0.name == "更优节点" }) else {
-                    throw TestFailure(description: "找不到「更优节点」行")
-                }
-                try expect(row.state == .warn, "有更优节点应落到 warn")
-                try expect(row.detail.contains("鱼3·美国-犹他州") && row.detail.contains("88 分"),
-                           "建议里要写清节点名和分数，实际 \(row.detail)")
-                try expect(vm.rows.map { $0.name } == before, "不该动到别的检查行")
+                try expect(vm.rows.map { $0.name } == before, "收据落行已撤下,不许动到任何检查行")
 
-                // 差距不够时 BEST 为空:这一行应当是「已是最干净」,不是 warn。
-                vm.applyNodeScan(VM.parseNodeScan("BEST=\nBEST_SCORE=49\nDELTA=0\nELIGIBLE=4\n"))
-                try expect(vm.rows.first(where: { $0.name == "更优节点" })?.state == .ok,
-                           "没有更优节点不该报 warn")
-
-                // 结论必须挂得上证据。用户反馈:「显示的是当前线路是候选里面
-                // 最干净的,没有具体内容」—— 一句结论看不到扫了几个、多少分、
-                // 什么时候扫的,读起来就像功能根本没跑。
-                let evidence = VM.parseNodeScan(
-                    "BEST=\nBEST_SCORE=49\nDELTA=0\nELIGIBLE=4\nCANDIDATES=11\n" +
-                    "UNIQUE_IPS=3\nCURRENT_SCORE=49\nSCAN_TIME=11-04 09:52\n")
-                vm.applyNodeScan(evidence)
-                let cleanDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
-                try expect(cleanDetail.contains("过硬门槛内没有更优节点"),
-                           "结论要写明比较范围，否则会和排名表里更高分但被排除的节点打架，实际 \(cleanDetail)")
+                // 证据拼装:结论必须挂得上证据,旧格式缺字段时逐项省略。
+                let evidenceLine = VM.nodeScanEvidence(VM.parseNodeScan(
+                    "CANDIDATES=11\nUNIQUE_IPS=3\nELIGIBLE=4\nCURRENT_SCORE=49\nSCAN_TIME=11-04 09:52\n"))
                 for piece in ["11 候选", "3 出口", "4 合格", "当前 49 分", "11-04 09:52 扫描"] {
-                    try expect(cleanDetail.contains(piece),
-                               "结论里缺 \(piece)，实际 \(cleanDetail)")
+                    try expect(evidenceLine.contains(piece), "证据里缺 \(piece)，实际 \(evidenceLine)")
                 }
                 // 负例:旧格式报告没这些字段,不能拿 0 冒充实测值。
-                vm.applyNodeScan(VM.parseNodeScan("BEST=\nDELTA=0\nELIGIBLE=4\n"))
-                let legacyDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
-                try expect(!legacyDetail.contains("0 候选") && !legacyDetail.contains("扫描"),
-                           "旧报告不该凭空造数字，实际 \(legacyDetail)")
+                try expect(!VM.nodeScanEvidence(VM.parseNodeScan("BEST=\nDELTA=0\nELIGIBLE=4\n")).contains("0 候选"),
+                           "旧报告不该凭空造数字")
                 try expect(VM.nodeScanEvidence([:]).isEmpty, "空报告不该造出证据")
 
                 // 面板只给人话:脚本 stdout 末尾的 KEY=VALUE 是给 App 解析的。
@@ -1009,55 +990,9 @@ struct MenuBarModelTests {
                 try expect(!VM.displayableNodeReport("OK:已应用\nAPPLY=OK\nAPPLIED=鱼3\n")
                             .contains("APPLY="), "应用回执里的机器行也要收掉")
 
-                // 一个过硬门槛的候选都没有:跳过,而不是假绿。
-                vm.applyNodeScan(VM.parseNodeScan("BEST=\nELIGIBLE=0\n"))
-                try expect(vm.rows.first(where: { $0.name == "更优节点" })?.state == .skip,
-                           "没有可用候选应报跳过")
-
                 // 负例:解析不认无关行,免得界面把人话读成键值。
                 let noise = VM.parseNodeScan("节点扫描(只读) · 组 🤖 OpenAi\n门禁:report-only(已有账号槽位)\n")
                 try expect(noise.isEmpty, "人话行不该被当成机器字段: \(noise)")
-
-                // 固定节点:偏离优先于「还有更干净的」,已固定则不误报。
-                vm.applyNodeScan(["PREFERRED": "鱼3", "PREFERRED_MATCH": "1", "BEST": ""])
-                try expect(vm.rows.first(where: { $0.name == "更优节点" })?.state == .ok,
-                           "已固定不该报 warn")
-                vm.applyNodeScan(["PREFERRED": "鱼3", "PREFERRED_MATCH": "0",
-                                  "BEST": "鱼2", "DELTA": "30"])
-                guard let drifted = vm.rows.first(where: { $0.name == "更优节点" }) else {
-                    throw TestFailure(description: "找不到「更优节点」行")
-                }
-                try expect(drifted.state == .warn, "偏离固定节点应报 warn")
-                try expect(drifted.detail.contains("已偏离固定节点 鱼3"), drifted.detail)
-
-                // 门禁按钮只在 auto-ok 且确实有更优节点时出现(用户选的保守并集)。
-                try expect(!vm.canApplyBestNode, "没有报告信息时不该给按钮")
-                vm.setNodeScanInfoForTest(["GATE": "report-only", "BEST": "鱼2", "DELTA": "30"])
-                try expect(!vm.canApplyBestNode, "报告门禁不放行时不该给自动应用按钮")
-                vm.setNodeScanInfoForTest(["GATE": "auto-ok", "BEST": ""])
-                try expect(!vm.canApplyBestNode, "没有更优节点不该给按钮")
-                vm.setNodeScanInfoForTest(["GATE": "auto-ok", "BEST": "鱼2", "DELTA": "30"])
-                try expect(vm.canApplyBestNode, "门禁允许且确有更优节点时该给按钮")
-
-                // 提示词和按钮必须互相印证:auto-ok 时该指向「应用最优节点」,
-                // report-only 时不该许诺一个根本不会出现的按钮。两处文案曾经
-                // 各说各的(界面叫「到客户端切换」,脚本叫「点扫描节点」),
-                // 这里用正例 + 负例把它锁住。
-                let allowedInfo = VM.parseNodeScan(
-                    "BEST=鱼2\nBEST_SCORE=90\nDELTA=30\nGATE=auto-ok\nELIGIBLE=4\n")
-                vm.applyNodeScan(allowedInfo)
-                let allowedDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
-                try expect(allowedDetail.contains("应用最优节点"),
-                           "门禁允许时应告诉用户可以自动应用,实际 \(allowedDetail)")
-
-                let deniedInfo = VM.parseNodeScan(
-                    "BEST=鱼2\nBEST_SCORE=90\nDELTA=30\nGATE=report-only\nELIGIBLE=4\n")
-                vm.applyNodeScan(deniedInfo)
-                let deniedDetail = vm.rows.first(where: { $0.name == "更优节点" })?.detail ?? ""
-                try expect(!deniedDetail.contains("应用最优节点"),
-                           "报告门禁不放行时不该许诺自动应用按钮,实际 \(deniedDetail)")
-                try expect(deniedDetail.contains("手动切换"),
-                           "报告门禁不放行时应指到客户端手动切换,实际 \(deniedDetail)")
             case "menu_bar_brand_icon":
                 // 菜单栏图标以前是系统符号 checkmark.shield.fill；窗口标记与 App 图标
                 // 换成 Claude 星芒后它成了唯一一枚「盾牌 + 对号」。这里锁住新的自绘图标：

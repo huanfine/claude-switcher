@@ -105,8 +105,8 @@ struct HealthSummary {
     /// 其余几项要么是稳定性,要么是可达性 —— 真出问题时用户自己会立刻感觉到。
     private static let warningOrder = [
         "IP纯净度", "ASN属性", "WebRTC", "DNS", "IP一致", "客户端语言", "生态可达性",
-        // 「有更干净的可用节点」是建议,不是故障 —— 排最后,别抢纯净度那句话。
-        "更优节点",
+        // 「上游架构可能泄露」是可修复项 —— 排最后,别抢纯净度那句话。
+        "DNS泄露",
     ]
 
     /// 排序键统一去掉空格:界面显示「IP 纯净度」,检查协议里是「IP纯净度」。
@@ -203,9 +203,9 @@ struct HealthSummary {
         }
         identity += penalty("ASN属性", 6)
         identity += penalty("IP一致", 4)
-        // 「存在更干净且过硬门槛的可用节点」属于身份维度:它说的是这条出口
-        // 还有更好的选择,不是环境漏了。4 分,不足以一票压过纯净度实测分。
-        identity += penalty("更优节点", 4)
+        // 「DNS 上游架构可能泄露」属于身份维度:它说的是查询路径被递归看到,
+        // 不是环境漏了。4 分,不足以一票压过纯净度实测分。
+        identity += penalty("DNS泄露", 4)
         identity = min(identity, Weight.identityCap)
 
         let isolation = min(
@@ -453,7 +453,7 @@ final class VM: ObservableObject {
         CheckRow(name: "生态可达性", icon: "chart.line.uptrend.xyaxis", canDisable: true),
         // 13pt/medium 下着墨盒 13.0×13.0、着墨量 8.91%,和这一列同一档
         // (实测 arrow.up.right 只有 9.5×9.5 / 3.64%,会显得缺一块)。
-        CheckRow(name: "更优节点", icon: "network", canDisable: true),
+        CheckRow(name: "DNS 泄露", icon: "lock.shield", canDisable: true),
     ]
     @Published var phase: Phase = .checking
     @Published var current = "?"
@@ -595,7 +595,7 @@ final class VM: ObservableObject {
         ("ASN属性", "ASN 属性"),
         ("IP纯净度", "IP 纯净度"),
         ("生态可达性", "生态可达性"),
-        ("更优节点", "更优节点"),
+        ("DNS泄露", "DNS 泄露"),
     ]
 
     static let clientChoices: [(key: String, label: String)] = [
@@ -755,7 +755,7 @@ final class VM: ObservableObject {
         "IPv6": "IPv6 关闭", "DNS": "DNS 走隧道", "WebRTC": "WebRTC",
         "保镖": "保镖在线", "规则置顶": "规则置顶",
         "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "IP纯净度": "IP 纯净度",
-        "生态可达性": "生态可达性", "更优节点": "更优节点",
+        "生态可达性": "生态可达性", "DNS泄露": "DNS 泄露",
     ]
 
     /// 稳定 ID → 界面行。ID 是 JSON 契约，显示名只是文案；
@@ -766,7 +766,7 @@ final class VM: ObservableObject {
         "ipv6": "IPv6 关闭", "dns": "DNS 走隧道", "webrtc": "WebRTC",
         "bodyguard": "保镖在线", "rules": "规则置顶",
         "client_language": "客户端语言", "asn": "ASN 属性",
-        "ip_purity": "IP 纯净度", "ecosystem": "生态可达性", "better_node": "更优节点",
+        "ip_purity": "IP 纯净度", "ecosystem": "生态可达性", "dns_leak": "DNS 泄露",
     ]
 
     private static func state(from raw: String) -> RowState {
@@ -1582,7 +1582,7 @@ final class VM: ObservableObject {
     /// 修不了、但换节点/换线路就能解决的项。剩下的那些(DNS 没走隧道)得去
     /// 客户端改设置,笼统写成「换节点」会把用户支到错的方向。
     static let nodeBoundNames: Set<String> = [
-        "ASN 属性", "IP 纯净度", "IP 与上次一致", "生态可达性", "更优节点",
+        "ASN 属性", "IP 纯净度", "IP 与上次一致", "生态可达性",
     ]
 
 
@@ -1746,9 +1746,10 @@ final class VM: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 扫描完就地更新「更优节点」这一行,不做整轮 refresh。
-    /// refresh() 会先撤掉巡检再检查 —— 那是「重新检查」的代价,不该让
-    /// 一个只读扫描顺手把守护停掉。
+    /// 「更优节点」检查行已撤下(2026-11-24 换成 DNS泄露),本函数不再有
+    /// 落行目标 —— guard 空转,扫描结论由报告面板(NodeScanSheet)承载。
+    /// 保留函数本身:switch 链路与菜单入口仍在调用,refresh() 的代价说明
+    /// (撤巡检、整轮重查)仍然成立。
     func applyNodeScan(_ info: [String: String]) {
         guard let idx = rows.firstIndex(where: { $0.name == "更优节点" }) else { return }
         let best = info["BEST"] ?? ""
@@ -4053,19 +4054,9 @@ struct ContentView: View {
                                 // 用透明度而不是位移/条件渲染:行高先占住,卡片不抽。
                                 let shown = rowShown(row)
                                 Group {
-                                    // 只有「更优节点」可点:其余各行点下去没有任何动作,
-                                    // 整行都做成按钮会让人以为到处能点,试两次就学会了不点。
-                                    if row.name == "更优节点" {
-                                        Button { vm.scanNodes() } label: {
-                                            checkRow(row, index: idx, interactive: true)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .disabled(vm.nodeScanBusy)
-                                        .help(vm.nodeScanBusy ? "正在扫描可用节点…"
-                                                              : "扫描可用节点（只读，不切线路）")
-                                    } else {
-                                        checkRow(row, index: idx)
-                                    }
+                                    // 16 行一律普通行:行级交互入口随「更优节点」项一起
+                                    // 撤下(2026-11-24),节点扫描保留在菜单与报告面板。
+                                    checkRow(row, index: idx)
                                 }
                                 .opacity(shown ? 1 : 0)
                                 // 透明不等于不可点:按钮得跟着一起藏起来。
@@ -4240,26 +4231,6 @@ struct ContentView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(width: Rhythm.nameColumn, alignment: .leading)
-
-                // 「更优节点」这一行自己就是入口:点它重新扫一遍候选。
-                // 以前挂在工具栏的地球图标上,离这一项太远 —— 用户读着
-                // 「过硬门槛内没有更优节点」,并不知道还能让它再比一次。
-                if row.name == "更优节点" {
-                    HStack(spacing: 3) {
-                        if vm.nodeScanBusy {
-                            SpinRing(size: 9, lineWidth: 1.2, duration: 0.9)
-                        } else {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .font(.system(size: 9, weight: .semibold))
-                        }
-                        Text(vm.nodeScanBusy ? "扫描中" : "扫描")
-                            .font(Type.microFont)
-                    }
-                    .foregroundColor(ClaudeTheme.brandText)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(ClaudeTheme.terracottaTint))
-                }
 
                 // 弹性空隙放在结论**之前**，结论一律贴右。
                 // 注意不能把弹性 frame 加在结论本身（`maxWidth:.infinity, alignment:.trailing`）：

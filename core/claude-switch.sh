@@ -69,10 +69,10 @@ import zipfile
 
 
 OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "IP纯净度", "生态可达性",
-            "更优节点")
+            "DNS泄露")
 ALL_CHECKS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
               "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性",
-              "更优节点")
+              "DNS泄露")
 DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True,
             "strict": []}
 LOG_LIMIT = 512 * 1024
@@ -106,7 +106,7 @@ CHECK_SPECS = (
     ("asn", "ASN属性", False),
     ("ip_purity", "IP纯净度", False),
     ("ecosystem", "生态可达性", False),
-    ("better_node", "更优节点", False),
+    ("dns_leak", "DNS泄露", False),
 )
 CHECK_SPEC_BY_NAME = {name: (cid, critical) for cid, name, critical in CHECK_SPECS}
 
@@ -4652,15 +4652,7 @@ checkdetail() {
     else
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
         case "$dnsip" in
-            "$FAKE_PREFIX"*)
-                # 走隧道 ≠ 上游干净:fake-ip 只证明查询被 TUN 劫持,上游是哪家
-                # 递归看不到。2026-11-23 实测:订阅 fallback 并发架构下,这里
-                # ok 而泄露测试页标国内解析器。所以隧道通过后还要审计上游。
-                if dns_issues=$(dns_audit 2>/dev/null); then
-                    optional_result "DNS" fail "上游泄露架构($dns_issues) · 点「一键修复」"
-                else
-                    optional_result "DNS" ok "走隧道 · 上游已审计"
-                fi ;;
+            "$FAKE_PREFIX"*) optional_result "DNS" ok "走隧道" ;;
             # 这一项脚本修不了(见 fix() 里的说明),界面因此不再给它「修复」按钮。
             # 既然不给按钮,「怎么办」就必须写在这一行里 —— 否则用户既没有按钮,
             # 也不知道下一步做什么,只能对着一个红叉发呆。
@@ -4791,81 +4783,32 @@ checkdetail() {
             optional_result "生态可达性" fail "$detail · 换条线路后重新检查"
         fi
     fi
-    # 16. 更优节点。读的是 scan-nodes 落下的报告,不在这里发网络请求 ——
-    # 整轮检查有 45 秒预算,给十几个候选 IP 打分会把它吃光。
-    # 没扫过就老老实实报「跳过」,绝不能借 ok 冒充「已经比过了」。
-    if check_disabled "更优节点"; then
-        optional_result "更优节点" ok
-    elif [ ! -f "$NODE_SCAN_FILE" ]; then
-        optional_result "更优节点" skip "尚未扫描 · 点右上角「扫描可用节点」生成候选排名"
+    # 16. DNS 泄露。补「走隧道」的盲区:fake-ip 只证明查询被 TUN 劫持,
+    # 证明不了上游递归是谁 —— 2026-11-23 实测,订阅 fallback 并发架构下
+    # 泄露测试页标国内解析器而全项绿。两项合一:
+    #   (a) 上游架构审计(dns_audit:fallback 并发/明文上游/无海外加密上游);
+    #   (b) 内核解析活性(/dns/query 必须真能给出应答,证明海外加密 DoH 可达)。
+    if check_disabled "DNS泄露"; then
+        optional_result "DNS泄露" ok
+    elif [ "$PROXY_MODE" != "clash-verge" ]; then
+        optional_result "DNS泄露" skip "上游审计仅支持 Clash Verge(读不到其他客户端的标准运行配置)"
     else
-        local ns_epoch ns_best ns_score ns_cur ns_delta ns_gate ns_now ns_pref ns_match
-        local ns_hint ns_cand ns_unique ns_eligible ns_time ns_stats
-        ns_epoch=$(sed -n 's/^EPOCH=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_best=$(sed -n 's/^BEST=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_score=$(sed -n 's/^BEST_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_cur=$(sed -n 's/^CURRENT_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_delta=$(sed -n 's/^DELTA=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_gate=$(sed -n 's/^GATE=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_pref=$(sed -n 's/^PREFERRED=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_match=$(sed -n 's/^PREFERRED_MATCH=//p' "$NODE_SCAN_FILE" | head -1)
-        # 结构型结论:控制链落在自动选路的组上(见 node-scan 的 NOCHOICE 分支),
-        # 「更优节点」这个概念在该链路上不存在 —— 不是没扫,是没什么可比。
-        local ns_nochoice ns_nc_group ns_nc_type ns_nc_members
-        ns_nochoice=$(sed -n 's/^NOCHOICE=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_nc_group=$(sed -n 's/^NOCHOICE_GROUP=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_nc_type=$(sed -n 's/^NOCHOICE_TYPE=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_nc_members=$(sed -n 's/^NOCHOICE_MEMBERS=//p' "$NODE_SCAN_FILE" | head -1)
-        # 结论不能只有一句「当前线路最干净」:那等于让用户相信一个看不到
-        # 依据的判断。把扫了几个、去重后几个出口、几个过硬门槛、当前多少分、
-        # 什么时候扫的,一并写进这一行。旧格式报告缺这些字段时逐项省略,
-        # 绝不补 0 冒充实测值。
-        ns_cand=$(sed -n 's/^CANDIDATES=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_unique=$(sed -n 's/^UNIQUE_IPS=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_eligible=$(sed -n 's/^ELIGIBLE=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_time=$(sed -n 's/^SCAN_TIME=//p' "$NODE_SCAN_FILE" | head -1)
-        ns_stats=""
-        [ -n "$ns_cand" ] && ns_stats="${ns_cand} 候选"
-        [ -n "$ns_unique" ] && ns_stats="${ns_stats}${ns_stats:+/}${ns_unique} 出口"
-        [ -n "$ns_eligible" ] && ns_stats="${ns_stats}${ns_stats:+/}${ns_eligible} 合格"
-        [ -n "$ns_cur" ] && ns_stats="${ns_stats}${ns_stats:+ · }当前 ${ns_cur} 分"
-        [ -n "$ns_time" ] && ns_stats="${ns_stats}${ns_stats:+ · }${ns_time} 扫描"
-        ns_now=$(date +%s)
-        case "${ns_epoch:-}" in ''|*[!0-9]*) ns_epoch=0 ;; esac
-        if [ "$ns_nochoice" = "1" ]; then
-            # 这条链上没有可手动选的目标:内核自己在那几个成员里挑,我们无权指定。
-            # 给 ok 而不是 skip —— 结论是「不需要换」,不是「没检查」。
-            # 但仍要复核:用户可能换了订阅、改了规则,组已经不再自动选路。
-            if [ $((ns_now - ns_epoch)) -gt "$NODE_SCAN_TTL" ]; then
-                optional_result "更优节点" skip \
-                    "上次判定为自动选路 · 报告已过 24h,点「扫描可用节点」复核(约 1 秒,不查询任何数据源)"
-            else
-                optional_result "更优节点" ok \
-                    "当前组「${ns_nc_group}」由内核自动选路(${ns_nc_type}),没有可手动比较的候选 · 成员:${ns_nc_members} · 保持现状"
-            fi
-        elif [ $((ns_now - ns_epoch)) -gt "$NODE_SCAN_TTL" ]; then
-            optional_result "更优节点" skip "扫描报告已过期 · 点「扫描可用节点」重新生成"
-        elif [ "$ns_match" = "0" ] && [ -n "$ns_pref" ]; then
-            # 固定过的线路被人/自动选路改回去了,这比「还有更干净的」更要紧。
-            optional_result "更优节点" warn \
-                "已偏离固定节点 ${ns_pref} · 点「扫描可用节点」重新应用"
-        elif [ "$ns_match" = "1" ] && [ -n "$ns_pref" ]; then
-            optional_result "更优节点" ok "已固定在 ${ns_pref} · 后续检查都基于这条线路"
-        elif [ -n "$ns_best" ]; then
-            ns_hint="到客户端手动切换"
-            [ "$ns_gate" = "auto-ok" ] && ns_hint="点「扫描可用节点」→「应用最优节点」自动切换"
-            optional_result "更优节点" warn \
-                "有更干净的节点 ${ns_best}(${ns_score} 分,比当前高 ${ns_delta} 分) · ${ns_hint}${ns_stats:+ · $ns_stats}"
-        elif [ "$ns_eligible" = "0" ]; then
-            # 一个过硬门槛的候选都没有时说「当前最干净」是假的,和 App 侧
-            # applyNodeScan 的 .skip 对齐:这轮没比成,不是比完了没事。
-            optional_result "更优节点" skip \
-                "没有过硬门槛的候选节点 · 保持当前线路${ns_stats:+ · $ns_stats}"
+        local dns_leak_issues dl_sock dl_secret dl_json
+        if dns_leak_issues=$(dns_audit 2>/dev/null); then
+            optional_result "DNS泄露" fail "$dns_leak_issues · 点「一键修复」"
         else
-            # 和面板同口径:只比过硬门槛内的候选。报告里那些分数更高但被
-            # 硬门槛排除的不算「更干净」,否则这一行会和排名表打架。
-            optional_result "更优节点" ok \
-                "过硬门槛内没有更优节点${ns_stats:+ · $ns_stats}"
+            dl_sock=$(clash_sock 2>/dev/null)
+            dl_secret=$(sed -n 's/^secret:[[:space:]]*//p' "$CLASH_DIR/clash-verge.yaml" 2>/dev/null | tr -d '"' | head -1)
+            if [ -n "$dl_sock" ] && \
+               dl_json=$(curl -s --max-time 8 --unix-socket "$dl_sock" \
+                   -H "Authorization: Bearer ${dl_secret}" \
+                   "http://localhost/dns/query?name=www.cloudflare.com&type=A" 2>/dev/null) && \
+               printf '%s' "$dl_json" | grep -q '"Status":0'; then
+                optional_result "DNS泄露" ok "上游架构审计通过 · 内核加密解析可达"
+            else
+                # 架构干净但解析器答不上话:海外 DoH 走代理出去,代理不通就查不了。
+                optional_result "DNS泄露" warn "上游架构干净但内核解析未应答 · 检查节点可达性后重查"
+            fi
         fi
     fi
 }

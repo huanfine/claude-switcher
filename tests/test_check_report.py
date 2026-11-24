@@ -22,7 +22,7 @@ SCRIPT = ROOT / "core" / "claude-switch.sh"
 EXPECTED_IDS = [
     "proxy_core", "tun", "egress_ip", "ip_stability", "timezone", "locale",
     "ipv6", "dns", "webrtc", "bodyguard", "rules", "client_language", "asn",
-    "ip_purity", "ecosystem", "better_node",
+    "ip_purity", "ecosystem", "dns_leak",
 ]
 FULL = textwrap.dedent("""\
     代理内核=ok:Clash Verge 运行中
@@ -40,7 +40,7 @@ FULL = textwrap.dedent("""\
     ASN属性=ok:Example Residential
     IP纯净度=ok:100/100 · 住宅宽带
     生态可达性=ok:claude.ai:200 api:200
-    更优节点=skip:尚未扫描
+    DNS泄露=skip:尚未扫描
 """)
 
 
