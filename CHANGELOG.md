@@ -38,9 +38,13 @@
   上游 → fail。fix 命中后把托管修复块写进 Merge.yaml（全局 merge，订阅更新
   覆盖后仍生效；块外内容保留、块外顶层 `dns:` 键移除防重复键拒载、写前备份、
   幂等），随规则流程一并重启内核，重启后再审一次确认真正生效。
-  回归护栏：`tests/test_dns_audit.py`（9 例：老架构双报 / 明文上游 / 修复架构
+  回归护栏：`tests/test_dns_audit.py`（11 例：老架构双报 / 明文上游 / 修复架构
   通过 / 非 clash-verge 跳过 / 缺配置不编造 / Merge 块外科目保留与 dns 去重 /
-  幂等 / 旧托管块替换 / check-fix 挂接）。
+  幂等 / 旧托管块替换 / check-fix 挂接 / 内联数组老架构点名 / 内联干净不误报）。
+  交付后复审（六形态端到端 + 修复闭环，见
+  `docs/superpowers/plans/2026-11-23-dns-leak-detection-audit.md`）发现内联
+  数组写法（`fallback: [8.8.4.4]`）被误判「nameserver 为空」—— 不漏放行但
+  原因错、干净内联配置误报；已修（`dns_list_entries` 块+内联通吃）。
   提交：见 git log。
 
 - **代理组消失后「一键修复」不再死循环（组名自愈）**
