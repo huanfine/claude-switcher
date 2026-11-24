@@ -2287,6 +2287,98 @@ if best:
     return 0
 }
 
+# 运行配置的 DNS 段。内核 runtime 配置在 root 服务区不可读,但 Clash Verge 每次
+# 应用配置都会重新生成用户目录这份(clash-verge.yaml),内容与内核加载的一致。
+runtime_dns_section() {
+    local cfg="$CLASH_DIR/clash-verge.yaml"
+    [ -f "$cfg" ] || return 1
+    awk '/^dns:/{f=1;print;next} f&&/^[^[:space:]#]/{exit} f{print}' "$cfg"
+}
+
+# DNS 上游体检:只审计能从配置文本机械确定的泄露形态(2026-11-23 实测的泄露类):
+#   1. fallback 非空 —— nameserver+fallback 并发查询,海外域名必进国内递归(泄露源头);
+#   2. nameserver 含明文 UDP 上游 —— 运营商可见、可劫持;
+#   3. nameserver 无海外加密上游 —— 海外域名由国内递归解析,权威侧看到国内解析器。
+# 有问题输出问题列表并返回 0;无问题输出空返回 1。只对 clash-verge 生效(其余客户端
+# 读不到标准 YAML 运行配置,不硬猜)。
+dns_audit() {
+    local section issues="" ns plain="" foreign="" u fb
+    if [ "$PROXY_MODE" != "clash-verge" ]; then return 1; fi
+    section=$(runtime_dns_section 2>/dev/null) || return 1
+    # fallback 列表条目(2 空格缩进的子键,列出后遇下一个同级键停)
+    fb=$(printf '%s\n' "$section" | awk '/^  fallback:/{f=1;next} f&&/^  [a-zA-Z]/{exit} f&&/^  - /{print $2}')
+    [ -n "$fb" ] && issues="${issues}fallback 并发查询未清空(泄露源头) "
+    ns=$(printf '%s\n' "$section" | awk '/^  nameserver:/{f=1;next} f&&/^  [a-zA-Z]/{exit} f&&/^  - /{print $2}')
+    if [ -z "$ns" ]; then
+        issues="${issues}nameserver 为空 "
+    else
+        while IFS= read -r u; do
+            [ -n "$u" ] || continue
+            case "$u" in
+                https://*|tls://*|quic://*) ;;
+                *) plain="${plain}${u} " ;;
+            esac
+            case "$u" in
+                *8.8.8.8*|*1.1.1.1*|*dns.google*|*cloudflare-dns.com*|*9.9.9.9*|*dns.quad9.net*|*dns.sb*|*dns.opendns.com*|*dns.adguard.com*) foreign=1 ;;
+            esac
+        done <<< "$ns"
+        [ -n "$plain" ] && issues="${issues}nameserver 含明文上游(${plain% }) "
+        [ -z "$foreign" ] && issues="${issues}nameserver 无海外加密上游(海外域名将由国内递归解析) "
+    fi
+    [ -n "$issues" ] && { printf '%s\n' "${issues% }"; return 0; }
+    return 1
+}
+
+# DNS 修复块写进 Merge.yaml(全局 merge,订阅更新覆盖后仍生效)。与 Script.js 同一套
+# 纪律:标记块内机器管、块外内容保留、写前备份、无变化不落盘。Merge.yaml 若有块外
+# 的顶层 dns: 键必须移除 —— 同一 YAML 映射里重复的 dns: 键会让 mihomo 拒载整份配置。
+write_dns_merge() {
+    local merge="$CLASH_DIR/profiles/Merge.yaml"
+    [ -d "$CLASH_DIR/profiles" ] || { echo "profiles 目录不存在"; return 1; }
+    local block new
+    block='# >>> claude-switcher managed dns >>>
+# 海外域名只由海外加密上游解析,fallback 并发已清空。
+# 依据 2026-11-23 实测:订阅原生架构(国内 nameserver + fallback 并发)会把海外
+# 域名的解析送进国内递归,权威侧看到国内解析器(泄露)。geosite:cn/private 仍走
+# 国内 DoH(国内域名直连快解析);proxy-server-nameserver 用国内 DoH 解析节点
+# 服务器域名,避免「解析节点要走代理、走代理要先解析节点」的死锁。
+dns:
+  respect-rules: true
+  nameserver:
+  - https://8.8.8.8/dns-query
+  - https://1.1.1.1/dns-query
+  fallback: []
+  proxy-server-nameserver:
+  - https://doh.pub/dns-query
+  - https://dns.alidns.com/dns-query
+  nameserver-policy:
+    geosite:cn:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+    geosite:private:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+# <<< claude-switcher managed dns <<<'
+    new=$(
+        if [ -f "$merge" ]; then
+            awk '/# >>> claude-switcher managed dns >>>/{skip=1;next}
+                 skip&&/# <<< claude-switcher managed dns <<</{skip=0;next}
+                 skip{next}
+                 # 块外顶层 dns: 键及其子树移除(由托管块接管,避免重复键拒载)
+                 /^dns:/{d=1;next} d&&/^[^[:space:]#]/{d=0} !d{print}' "$merge"
+        fi
+        printf '%s\n' "$block"
+    )
+    if [ -f "$merge" ] && [ "$(cat "$merge")" = "$new" ]; then
+        echo "无变化"
+        return 0
+    fi
+    [ -f "$merge" ] && cp "$merge" "$merge.bak.$(date +%Y%m%d-%H%M%S)"
+    printf '%s\n' "$new" > "$merge.tmp" && mv "$merge.tmp" "$merge" \
+        || { echo "写入 Merge.yaml 失败"; return 1; }
+    echo "已写入 Merge.yaml(重启客户端后生效)"
+}
+
 # 读取环境层。env.json 缺失 → 用保底值(首次安装与老版本升级都走这条路);
 # env.json 损坏 → 明确报错,不静默降级:环境值错会直接把规则写进错误的代理组。
 load_env() {
@@ -4560,7 +4652,15 @@ checkdetail() {
     else
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
         case "$dnsip" in
-            "$FAKE_PREFIX"*) optional_result "DNS" ok "走隧道" ;;
+            "$FAKE_PREFIX"*)
+                # 走隧道 ≠ 上游干净:fake-ip 只证明查询被 TUN 劫持,上游是哪家
+                # 递归看不到。2026-11-23 实测:订阅 fallback 并发架构下,这里
+                # ok 而泄露测试页标国内解析器。所以隧道通过后还要审计上游。
+                if dns_issues=$(dns_audit 2>/dev/null); then
+                    optional_result "DNS" fail "上游泄露架构($dns_issues) · 点「一键修复」"
+                else
+                    optional_result "DNS" ok "走隧道 · 上游已审计"
+                fi ;;
             # 这一项脚本修不了(见 fix() 里的说明),界面因此不再给它「修复」按钮。
             # 既然不给按钮,「怎么办」就必须写在这一行里 —— 否则用户既没有按钮,
             # 也不知道下一步做什么,只能对着一个红叉发呆。
@@ -5518,7 +5618,19 @@ ASEOF
             echo "FIX:读取内核代理组失败,组名校验跳过(若修复仍失败请检查客户端是否在线)"
         fi
         echo "FIX:写入全局扩展脚本(保留已有 main 与无关配置)..."
-        local rules_result verify_err need_reload=0
+        local rules_result verify_err need_reload=0 dns_changed=0
+        # DNS 上游体检:泄露架构(fallback 并发/明文上游/国内递归解析海外)当场修。
+        # 托管块进 Merge.yaml(全局 merge,订阅更新覆盖后仍生效),与置顶规则互不干扰。
+        local dns_issues dns_result
+        if dns_issues=$(dns_audit 2>/dev/null); then
+            echo "FIX:DNS 上游存在泄露架构($dns_issues)"
+            if dns_result=$(write_dns_merge 2>&1); then
+                echo "FIX:DNS 修复块 ✓ $dns_result"
+                dns_changed=1
+            else
+                echo "FIX:DNS 修复块 ✗ $dns_result"
+            fi
+        fi
         if ! rules_result=$(write_merge_rules 2>&1); then
             echo "FIX:置顶规则 ✗ $rules_result"
             return 1
@@ -5532,9 +5644,15 @@ ASEOF
                 # 「UDP 3478 规则没置顶 ✗ · 点「一键修复」」永远同时出现,
                 # 用户再点几次都停在原地。先问一次内核,只有它也认了才省下重启。
                 if verify_err=$(clash_rules verify 2>&1); then
-                    # 重启不是免费的:内核重起、TUN 重建那十几秒里所有走 TUN 的
-                    # 请求都会失败,而 fix 后面紧跟着就用 curl 验 WebRTC 和出口。
-                    echo "FIX:置顶规则 ✓ 规则与内核都已就绪,未重启客户端"
+                    if [ "$dns_changed" -eq 1 ]; then
+                        # DNS 修复块必须重启内核才生效,「无变化」的规则文件救不了它。
+                        echo "FIX:DNS 修复块已写入,正在重启客户端使 DNS 生效..."
+                        need_reload=1
+                    else
+                        # 重启不是免费的:内核重起、TUN 重建那十几秒里所有走 TUN 的
+                        # 请求都会失败,而 fix 后面紧跟着就用 curl 验 WebRTC 和出口。
+                        echo "FIX:置顶规则 ✓ 规则与内核都已就绪,未重启客户端"
+                    fi
                 else
                     case "$verify_err" in
                         *未按策略置顶*)
@@ -5584,6 +5702,15 @@ ASEOF
                 return 1
             fi
             echo "FIX:置顶规则 ✓ 已验证内核实际加载"
+            # DNS 修复块经重启后必须真正生效:运行配置重新生成后再审一次。
+            if [ "$dns_changed" -eq 1 ]; then
+                sleep 2
+                if dns_issues=$(dns_audit 2>/dev/null); then
+                    echo "FIX:DNS ⚠ 重启后运行配置仍是泄露架构($dns_issues)"
+                else
+                    echo "FIX:DNS ✓ 重启后上游架构已审计通过"
+                fi
+            fi
         fi
     elif [ "$PROXY_MODE" != "flclash" ] && ! route_ok; then
         echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
