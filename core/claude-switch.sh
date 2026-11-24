@@ -2295,6 +2295,28 @@ runtime_dns_section() {
     awk '/^dns:/{f=1;print;next} f&&/^[^[:space:]#]/{exit} f{print}' "$cfg"
 }
 
+# 从 DNS 段提取某个列表键的条目。块形式(逐行 `  - xxx`)与内联数组
+# (`fallback: [8.8.4.4]`)都支持 —— 只认块形式会把内联写法判成「空」,
+# 老架构漏掉点名、干净的内联配置被误报 fail(2026-11-23 审计发现)。
+dns_list_entries() {
+    local section="$1" key="$2"
+    printf '%s\n' "$section" | awk -v key="$key" '
+        $0 ~ "^  " key ":" {
+            if (match($0, /\[.*\]/)) {
+                inline = substr($0, RSTART + 1, RLENGTH - 2)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", inline)
+                gsub(/^"|"$/, "", inline)
+                n = split(inline, parts, /,[[:space:]]*/)
+                for (i = 1; i <= n; i++) if (parts[i] != "") print parts[i]
+                exit
+            }
+            block = 1; next
+        }
+        block && /^  [a-zA-Z]/ { exit }
+        block && /^  - / { print $2 }
+    '
+}
+
 # DNS 上游体检:只审计能从配置文本机械确定的泄露形态(2026-11-23 实测的泄露类):
 #   1. fallback 非空 —— nameserver+fallback 并发查询,海外域名必进国内递归(泄露源头);
 #   2. nameserver 含明文 UDP 上游 —— 运营商可见、可劫持;
@@ -2305,10 +2327,9 @@ dns_audit() {
     local section issues="" ns plain="" foreign="" u fb
     if [ "$PROXY_MODE" != "clash-verge" ]; then return 1; fi
     section=$(runtime_dns_section 2>/dev/null) || return 1
-    # fallback 列表条目(2 空格缩进的子键,列出后遇下一个同级键停)
-    fb=$(printf '%s\n' "$section" | awk '/^  fallback:/{f=1;next} f&&/^  [a-zA-Z]/{exit} f&&/^  - /{print $2}')
+    fb=$(dns_list_entries "$section" fallback)
     [ -n "$fb" ] && issues="${issues}fallback 并发查询未清空(泄露源头) "
-    ns=$(printf '%s\n' "$section" | awk '/^  nameserver:/{f=1;next} f&&/^  [a-zA-Z]/{exit} f&&/^  - /{print $2}')
+    ns=$(dns_list_entries "$section" nameserver)
     if [ -z "$ns" ]; then
         issues="${issues}nameserver 为空 "
     else

@@ -97,6 +97,7 @@ class DnsAuditTests(unittest.TestCase):
             "CLASH_DIR=%s" % shlex.quote(str(clash_dir)),
             "PROXY_MODE=%s" % shlex.quote(proxy_mode),
             extract("runtime_dns_section"),
+            extract("dns_list_entries"),
             extract("dns_audit"),
             extract("write_dns_merge"),
             'dns_audit; echo "audit_rc=$?"; write_dns_merge; echo "merge_rc=$?"',
@@ -111,6 +112,29 @@ class DnsAuditTests(unittest.TestCase):
         self.assertIn("audit_rc=0", run.stdout)
         self.assertIn("fallback 并发查询未清空", run.stdout)
         self.assertIn("无海外加密上游", run.stdout)
+
+    def test_inline_array_old_arch_reports_real_entries(self):
+        """内联数组写法(罕见但合法):必须点名真实条目,不能报「nameserver 为空」。
+
+        2026-11-23 审计发现:旧提取只认块形式,内联老架构漏点名、
+        内联干净配置被误报 fail。不漏放行(fail 仍成立、fix 仍能救),
+        但原因要写对。
+        """
+        run, _ = self.run_harness(
+            "dns:\n"
+            "  nameserver: [https://doh.pub/dns-query]\n"
+            "  fallback: [8.8.4.4]\n")
+        self.assertIn("audit_rc=0", run.stdout)
+        self.assertIn("fallback 并发查询未清空", run.stdout)
+        self.assertIn("无海外加密上游", run.stdout)
+        self.assertNotIn("nameserver 为空", run.stdout)
+
+    def test_inline_array_clean_arch_passes(self):
+        run, _ = self.run_harness(
+            "dns:\n"
+            "  nameserver: [https://8.8.8.8/dns-query]\n"
+            "  fallback: []\n")
+        self.assertIn("audit_rc=1", run.stdout)
 
     def test_plaintext_upstream_is_reported(self):
         run, _ = self.run_harness(PLAINTEXT_ARCH)
