@@ -6169,6 +6169,242 @@ announcements_check() {
     echo "$clean"
 }
 
+# ---------- App 自更新(release 通道) ----------
+# 边界:换装全程「同卷 rename」保证原子 —— 任何时刻磁盘上都存在一个完整
+# 可启动的 bundle;绝不 kill 正在运行的 App(进程映像已在内存,下次启动即新版)。
+# 与核心脚本更新(self_update,main 快照通道)是两个独立步骤,各自校验各自回滚,
+# App 下载失败不影响核心照常更新。信任根 = GitHub releases 本身,
+# 传输校验 = SHA256SUMS-release.txt(与安装包同一份清单)。
+APP_BUNDLE_NAME="Claude 环境检查器.app"
+APP_UPDATE_REPO="${CLAUDE_SWITCHER_UPDATE_REPO:-huanfine/claude-switcher}"
+APP_UPDATE_MIN_DISK_MB=500    # 发版包 + 解压 + 旧版备份的余量
+APP_UPDATE_FAIL_LIMIT=2       # 连续失败到该次数即熔断,防止发版事故反复重试
+APP_UPDATE_FAILS="$BASE/app-update-fails"
+APP_UPDATE_DISABLED="$BASE/app-update-disabled"
+
+app_find_bundle() {
+    # 按序探测已装 App;输出路径,找不到返回非 0(明确报错,不猜)
+    local d
+    for d in "/Applications" "$HOME/Applications" "$HOME/Desktop"; do
+        if [ -d "$d/$APP_BUNDLE_NAME" ]; then
+            printf '%s\n' "$d/$APP_BUNDLE_NAME"
+            return 0
+        fi
+    done
+    return 1
+}
+
+app_installed_version() {
+    # argv[1]: bundle 路径;stdout: 版本号。Info.plist 缺字段 → 0.0.0
+    # (方案 §5:视为最老版本,走一次换装即自愈)
+    plutil -extract CFBundleShortVersionString raw "$1/Contents/Info.plist" 2>/dev/null || echo "0.0.0"
+}
+
+app_version_cmp() {
+    # 输出 -1/0/1:语义化比较,数字段比较、- 后缀(-dev 等)忽略。
+    # "1.8.2" > "1.8.10" 这类字符串陷阱必须按数值比。
+    python3 - "${1%%-*}" "${2%%-*}" <<'PY'
+import sys
+def nums(v):
+    return [int(x) if x.isdigit() else 0 for x in v.split(".")]
+a, b = nums(sys.argv[1]), nums(sys.argv[2])
+print("-1" if a < b else ("1" if a > b else "0"))
+PY
+}
+
+latest_release_version() {
+    # releases/latest 302 重定向免 API 认证;从 Location 头剥 tag。
+    # 校验 tag 形态(纯字母数字._-),剥掉前导 v。
+    local loc tag
+    loc=$(curl -fssIL --max-time 20 -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$APP_UPDATE_REPO/releases/latest" 2>/dev/null) || return 1
+    tag="${loc##*/}"
+    case "$tag" in
+        ""|v|*[!0-9A-Za-z._-]*) return 1 ;;
+    esac
+    printf '%s\n' "${tag#v}"
+}
+
+app_auto_update_enabled() {
+    # checks.json 的 app_auto_update,默认开;显式 false 才关。
+    # 配置损坏按开处理(更新失败会自检回滚+熔断,方向安全)。
+    python3 - "$BASE/checks.json" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        doc = json.load(f)
+except Exception:
+    print("1"); raise SystemExit
+v = doc.get("app_auto_update")
+print("0" if v is False else "1")
+PY
+}
+
+app_update_busy() {
+    # 只读探测:检查/修复/账号切换任一进行中即视为忙。只 pgrep 不 kill,
+    # 匹配的是核心脚本自己的命令行,不会误伤别的进程。
+    pgrep -f 'claude-switch\.sh (check|checkdetail|fix|switch)( |$)' >/dev/null 2>&1
+}
+
+app_sync_version_txt() {
+    # version.txt = 已装 App 的 Info.plist 版本。这是「安装版本」的唯一诚实来源:
+    # 手装形态(App 先于本机制存在)从这里补齐,报告的 core_version 不再是 unknown。
+    local bundle="$1" ver
+    ver=$(app_installed_version "$bundle")
+    case "$ver" in
+        ""|0.0.0) return 0 ;;   # 读不到就不写,不造假数据
+    esac
+    printf '%s\n' "$ver" > "$BASE/version.txt"
+    chmod 600 "$BASE/version.txt" 2>/dev/null
+}
+
+app_self_update() {
+    # 用法:update-app [--check] | 内部:app_self_update --auto(update --auto 末尾调用)
+    local mode="${1:-}"
+    [ "$mode" = "--auto" ] || mode="manual"
+    local check=0
+    [ "${2:-}" = "--check" ] && check=1
+
+    # 熔断哨兵:连续 2 轮换装失败后停用自动通道,防止发版事故反复重试。
+    # 手动更新是显式意志,允许带哨兵执行,成功即清除。
+    if [ -f "$APP_UPDATE_DISABLED" ]; then
+        if [ "$mode" = "--auto" ]; then
+            echo "SKIP:App 自动更新通道已熔断停用,需手动执行 update-app 或删 $APP_UPDATE_DISABLED 重置"
+            return 0
+        fi
+        echo "INFO:自动通道此前已熔断,本次为手动更新;成功后将自动解除"
+    fi
+
+    # 自动模式还受设置开关约束;手动是显式意志,不受限
+    if [ "$mode" = "--auto" ] && [ "$(app_auto_update_enabled)" != "1" ]; then
+        echo "SKIP:app_auto_update 已关闭"
+        return 0
+    fi
+
+    local bundle
+    if ! bundle=$(app_find_bundle); then
+        echo "SKIP:未找到已安装的 App(${APP_BUNDLE_NAME},/Applications ~/Applications ~/Desktop 均无)"
+        return 0
+    fi
+
+    # version.txt 自愈:无论是否需要更新,先让安装版本落盘(方案 §5 兼容项)
+    app_sync_version_txt "$bundle"
+
+    local local_ver remote_ver cmp
+    local_ver=$(app_installed_version "$bundle")
+    if ! remote_ver=$(latest_release_version); then
+        echo "FAIL:获取远端最新版本失败(releases/latest 不可达),本轮跳过"
+        return 1
+    fi
+    cmp=$(app_version_cmp "$local_ver" "$remote_ver")
+    if [ "$cmp" -ge 0 ]; then
+        echo "OK:App 已是最新($local_ver)"
+        return 0
+    fi
+    echo "INFO:App 有更新 $local_ver → $remote_ver"
+    if [ "${check}" -eq 1 ]; then
+        return 0
+    fi
+
+    # busy guard:检查/修复/账号切换进行中 → 本轮跳过(自动模式静默等下轮,
+    # 手动模式明确告知)。换装虽是原子操作,但避开并发窗口省掉一切边界情况。
+    if app_update_busy; then
+        echo "SKIP:检查/修复/切换进行中,本轮跳过 App 更新"
+        return 0
+    fi
+
+    # 磁盘余量:发版包 + 解压 + 旧版备份。必须用 df -m(MB) —— df -g 给的是
+    # GB 数,拿 GB 数跟 MB 阈值比,199GB 会被误判成「不足 500MB」。
+    local free_mb
+    free_mb=$(df -m "$HOME" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -z "$free_mb" ] || [ "$free_mb" -lt "$APP_UPDATE_MIN_DISK_MB" ]; then
+        echo "FAIL:磁盘余量不足(需 ${APP_UPDATE_MIN_DISK_MB}MB,现有 ${free_mb:-未知}MB),本轮跳过"
+        return 1
+    fi
+
+    # 下载 + 校验:app-only zip 的 sha256 对照随 release 的 SHA256SUMS-release.txt;
+    # 失败重试一次,再失败放弃本轮(12h 后自然重试)
+    local base_url="https://github.com/$APP_UPDATE_REPO/releases/download/v$remote_ver"
+    local zip_name="ClaudeSwitcher-$remote_ver-macos-universal-app-only.zip"
+    local tmpd tries zip_ok
+    tmpd=$(mktemp -d)
+    zip_ok=0
+    for tries in 1 2; do
+        if curl -fsSL --max-time 300 "$base_url/$zip_name" -o "$tmpd/app.zip" \
+            && curl -fsSL --max-time 60 "$base_url/SHA256SUMS-release.txt" -o "$tmpd/sums.txt" \
+            && [ -s "$tmpd/app.zip" ] && [ -s "$tmpd/sums.txt" ]; then
+            local want got
+            want=$(grep " $zip_name\$" "$tmpd/sums.txt" | awk '{print $1}')
+            got=$(shasum -a 256 "$tmpd/app.zip" | awk '{print $1}')
+            if [ -n "$want" ] && [ "$got" = "$want" ]; then
+                zip_ok=1; break
+            fi
+            echo "WARN:第 $tries 次下载校验不符(got=$got want=$want)"
+        else
+            echo "WARN:第 $tries 次下载失败"
+        fi
+    done
+    if [ "$zip_ok" -ne 1 ]; then
+        echo "FAIL:发版包下载/校验两次未过,放弃本轮"
+        rm -rf "$tmpd"
+        return 1
+    fi
+
+    if ! unzip -q "$tmpd/app.zip" -d "$tmpd/unzipped" 2>/dev/null \
+        || [ ! -d "$tmpd/unzipped/$APP_BUNDLE_NAME" ]; then
+        echo "FAIL:解压失败或包内结构异常,放弃本轮"
+        rm -rf "$tmpd"
+        return 1
+    fi
+    # 下载通道会带 quarantine 属性,不清掉会撞 Gatekeeper(与安装器同一做法)
+    xattr -dr com.apple.quarantine "$tmpd/unzipped/$APP_BUNDLE_NAME" 2>/dev/null
+
+    # 原子换装:同卷 rename × 2,任何时刻都存在完整可启动的 bundle
+    local oldb="$bundle.old-$$"
+    if ! mv "$bundle" "$oldb" 2>/dev/null; then
+        echo "FAIL:旧 bundle 改名失败(权限?),放弃本轮"
+        rm -rf "$tmpd"
+        return 1
+    fi
+    if ! mv "$tmpd/unzipped/$APP_BUNDLE_NAME" "$bundle" 2>/dev/null; then
+        mv "$oldb" "$bundle"
+        echo "FAIL:新 bundle 就位失败,已回滚"
+        rm -rf "$tmpd"
+        return 1
+    fi
+
+    # 最小自检:二进制可执行 + 签名有效 + Info.plist 版本 = 目标
+    local newver ok=1
+    newver=$(app_installed_version "$bundle")
+    [ -x "$bundle/Contents/MacOS/ClaudeSwitcher" ] || { ok=0; echo "WARN:自检失败:二进制不存在或不可执行"; }
+    [ "$ok" -eq 1 ] && ! codesign -v "$bundle" >/dev/null 2>&1 && { ok=0; echo "WARN:自检失败:codesign 校验不过"; }
+    [ "$ok" -eq 1 ] && [ "$newver" != "$remote_ver" ] && { ok=0; echo "WARN:自检失败:版本号 $newver ≠ 目标 $remote_ver"; }
+    if [ "$ok" -ne 1 ]; then
+        rm -rf "$bundle"
+        mv "$oldb" "$bundle"
+        local fails
+        fails=$(( $(cat "$APP_UPDATE_FAILS" 2>/dev/null || echo 0) + 1 ))
+        printf '%s\n' "$fails" > "$APP_UPDATE_FAILS"
+        chmod 600 "$APP_UPDATE_FAILS" 2>/dev/null
+        if [ "$fails" -ge "$APP_UPDATE_FAIL_LIMIT" ]; then
+            touch "$APP_UPDATE_DISABLED"
+            echo "FAIL:换装自检未通过已回滚;连续 $fails 轮失败,App 自动更新通道已熔断停用(手动 update-app 可解除)"
+        else
+            echo "FAIL:换装自检未通过,已回滚到旧版(连续失败 $fails/$APP_UPDATE_FAIL_LIMIT)"
+        fi
+        rm -rf "$tmpd"
+        return 1
+    fi
+
+    # 成功:清失败计数、解除熔断(手动成功=通道恢复)、写 version.txt
+    rm -rf "$oldb" "$tmpd" "$APP_UPDATE_FAILS"
+    rm -f "$APP_UPDATE_DISABLED"
+    printf '%s\n' "$remote_ver" > "$BASE/version.txt"
+    chmod 600 "$BASE/version.txt" 2>/dev/null
+    echo "OK:App 已更新到 $remote_ver;正在运行的还是旧界面,下次启动即新版"
+    return 0
+}
+
 # 账号快照加密导出/导入(macOS):AES-256 加密 DMG,密码只经 stdin 传递
 # 一次性隔离浏览器:独立临时 profile,禁用非代理 UDP,关闭后销毁;URL 仅允许 http/https
 # Claude Code CLI 体检:只读检测安装方式/版本/多份安装冲突,不执行卸载或重装
@@ -7399,9 +7635,14 @@ case "$operation" in
     get-client) get_client ;;
     fake-prefix) printf '%s\n' "${FAKE_PREFIX:-198.18.}" ;;
     restart-clash) restart_clash ;;
-    update) lease_revoke; self_update "${2:-}" ;;
-    update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
+    update) lease_revoke; self_update "${2:-}"
+        # App 自更新(阶段二):--auto 时接在核心更新之后,同一份 update.log;
+        # self_update --auto 的 exec 重定向是进程级的,子调用输出自然落日志。
+        # 两个步骤互不阻塞:App 下载失败不影响核心已完成的更新。
+        if [ "${2:-}" = "--auto" ]; then app_self_update --auto ""; fi ;;
+    update-check) self_update --check; app_self_update "" "--check" ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     announcements) announcements_check "${2:-}" ;;  # 公告:check [--force] / read
+    update-app) app_self_update "manual" "${2:-}" ;;  # App 自更新:[] 或 --check
     open-safe) open_safe "${2:-}" ;;
     cli-info) cli_info ;;
     snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;
