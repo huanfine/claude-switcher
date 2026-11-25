@@ -6018,6 +6018,157 @@ fingerprint() {
     echo "CanvasWebGL=info:原生检查读不到 Claude Electron 的渲染特征,请打开 Web 检测页 https://huanfine.github.io/claude-switcher/ 查看 Canvas/WebGL 指纹"
 }
 
+# ---------- 公告(只读拉取) ----------
+# 边界:公告是纯只读功能 —— 只发 GET、只写自己的缓存文件,
+# 不碰 env.json / Merge.yaml / 巡检,网络失败时静默降级用旧缓存。
+# 数据源:仓库 data/announcements.json(raw.githubusercontent 为主,
+# jsDelivr 兜底);缓存 ~/.claude-switcher/announcements-cache.json(0600)。
+# schema 校验在核心侧把关(坏数据明确报错,不写缓存),版本过滤留给 App
+# (核心不知道 App 版本,min/max_app_version 由界面侧自行剔除)。
+ANNOUNCEMENTS_URL="https://raw.githubusercontent.com/huanfine/claude-switcher/main/data/announcements.json"
+ANNOUNCEMENTS_URL_FALLBACK="https://cdn.jsdelivr.net/gh/huanfine/claude-switcher@main/data/announcements.json"
+ANNOUNCEMENTS_CACHE="$BASE/announcements-cache.json"
+ANNOUNCEMENTS_TTL=21600   # 6 小时;频控用,App 每次启动读缓存不再触发网络
+
+announcements_validate() {
+    # stdin: 源 JSON;argv[1]: 命中的源 URL(写进缓存供取证)
+    # stdout: 清洗后的缓存 JSON;校验失败非 0 且不输出
+    # 注意:脚本必须经 -c 执行,不能用 `python3 - <<EOF` —— heredoc 会把
+    # stdin 占掉,管道进来的公告数据就到不了 json.load(sys.stdin)。
+    local _py
+    _py=$(cat <<'PYEOF'
+import json, sys
+from datetime import datetime, timezone
+
+now = datetime.now(timezone.utc)
+source = sys.argv[1] if len(sys.argv) > 1 else ""
+
+def parse_ts(s):
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t = s.strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        d = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d
+
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.stderr.write("公告数据不是合法 JSON\n")
+    sys.exit(1)
+
+if not isinstance(doc, dict) or doc.get("schema") != 1:
+    sys.stderr.write("公告 schema 不支持(需要 schema=1)\n")
+    sys.exit(1)
+items = doc.get("items")
+if not isinstance(items, list):
+    sys.stderr.write("公告 items 缺失或不是数组\n")
+    sys.exit(1)
+
+allowed = ("info", "warn", "critical")
+seen, clean = set(), []
+for it in items:
+    if not isinstance(it, dict):
+        sys.stderr.write("公告项不是对象\n")
+        sys.exit(1)
+    for k in ("id", "severity", "title"):
+        v = it.get(k)
+        if not isinstance(v, str) or not v.strip():
+            sys.stderr.write("公告项缺少必填字段: %s\n" % k)
+            sys.exit(1)
+    if it["severity"] not in allowed:
+        sys.stderr.write("公告 severity 非法: %s\n" % it["severity"])
+        sys.exit(1)
+    if it["id"] in seen:
+        continue
+    seen.add(it["id"])
+    exp = parse_ts(it.get("expires_at"))
+    if exp is not None and exp <= now:
+        continue
+    clean.append(it)
+
+out = {"schema": 1, "fetched_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "source": source, "items": clean}
+sys.stdout.write(json.dumps(out, ensure_ascii=False))
+PYEOF
+) || return 1
+    python3 -c "$_py" "$1"
+}
+
+announcements_check() {
+    # 子命令:check [--force](TTL 内不打网络) / read(只读缓存,不联网)
+    local sub="${1:-check}"
+    local force=""
+    case "$sub" in
+        read)
+            if [ -f "$ANNOUNCEMENTS_CACHE" ]; then
+                cat "$ANNOUNCEMENTS_CACHE"
+            else
+                printf '{"schema":1,"fetched_at":"","source":"","items":[]}\n'
+            fi
+            return 0 ;;
+        check|"") ;;
+        --force) force=1 ;;
+        *)
+            echo "FAIL:announcements 支持 check [--force] | read" >&2
+            return 1 ;;
+    esac
+
+    # TTL 频控:缓存够新直接用,不打网络(App 启动时的调用走这条)
+    if [ -z "$force" ] && [ -f "$ANNOUNCEMENTS_CACHE" ]; then
+        local age now_ts mtime
+        now_ts=$(date +%s)
+        mtime=$(stat -f %m "$ANNOUNCEMENTS_CACHE" 2>/dev/null || echo 0)
+        age=$(( now_ts - mtime ))
+        if [ "$age" -ge 0 ] && [ "$age" -lt "$ANNOUNCEMENTS_TTL" ]; then
+            cat "$ANNOUNCEMENTS_CACHE"
+            return 0
+        fi
+    fi
+
+    # 拉取:raw → jsDelivr 两级降级
+    local raw="" src="" url
+    for url in "$ANNOUNCEMENTS_URL" "$ANNOUNCEMENTS_URL_FALLBACK"; do
+        if raw=$(curl -fsSL --max-time 15 "$url" 2>/dev/null) && [ -n "$raw" ]; then
+            src="$url"
+            break
+        fi
+    done
+    if [ -z "$raw" ]; then
+        # 网络两级全挂:降级用旧缓存(允许过期),连旧缓存都没有才报错
+        if [ -f "$ANNOUNCEMENTS_CACHE" ]; then
+            cat "$ANNOUNCEMENTS_CACHE"
+            return 0
+        fi
+        echo "FAIL:公告拉取失败且无本地缓存" >&2
+        return 1
+    fi
+
+    # 校验 + 清洗:坏数据明确报错、不写缓存(旧缓存保持不动)
+    local clean
+    if ! clean=$(printf '%s' "$raw" | announcements_validate "$src"); then
+        echo "FAIL:公告数据校验未通过,保持旧缓存" >&2
+        return 1
+    fi
+
+    # 原子落盘
+    local tmp="$ANNOUNCEMENTS_CACHE.tmp.$$"
+    if ! printf '%s\n' "$clean" > "$tmp"; then
+        rm -f "$tmp" 2>/dev/null
+        echo "FAIL:公告缓存写入失败" >&2
+        return 1
+    fi
+    mv "$tmp" "$ANNOUNCEMENTS_CACHE"
+    chmod 600 "$ANNOUNCEMENTS_CACHE" 2>/dev/null
+    echo "$clean"
+}
+
 # 账号快照加密导出/导入(macOS):AES-256 加密 DMG,密码只经 stdin 传递
 # 一次性隔离浏览器:独立临时 profile,禁用非代理 UDP,关闭后销毁;URL 仅允许 http/https
 # Claude Code CLI 体检:只读检测安装方式/版本/多份安装冲突,不执行卸载或重装
@@ -7250,6 +7401,7 @@ case "$operation" in
     restart-clash) restart_clash ;;
     update) lease_revoke; self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
+    announcements) announcements_check "${2:-}" ;;  # 公告:check [--force] / read
     open-safe) open_safe "${2:-}" ;;
     cli-info) cli_info ;;
     snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;

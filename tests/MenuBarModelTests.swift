@@ -542,6 +542,75 @@ struct MenuBarModelTests {
                 vm.loadIncidents()
                 try expect(vm.incidents.count == 1, "缺列的行应被丢掉")
                 try expect(vm.incidents.first?.kind == "代理断开", "保留的那条应完整")
+            case "announcements_parse_and_filter":
+                // 公告缓存 → 界面列表:schema/字段守门、版本过滤、severity 排序
+                let payload: [String: Any] = [
+                    "schema": 1,
+                    "items": [
+                        ["id": "2026-01-01-info", "severity": "info", "title": "通知",
+                         "body_md": "", "min_app_version": "1.8.12", "max_app_version": ""],
+                        ["id": "2026-01-02-crit", "severity": "critical", "title": "紧急",
+                         "body_md": "x", "min_app_version": "", "max_app_version": ""],
+                        ["id": "2026-01-03-old", "severity": "warn", "title": "旧版可见",
+                         "body_md": "", "min_app_version": "9.9.9", "max_app_version": ""],
+                        // 缺 title 必须丢弃,不能让界面崩
+                        ["id": "2026-01-04-bad", "severity": "info"],
+                    ] as [[String: Any]],
+                ]
+                let data = try JSONSerialization.data(withJSONObject: payload)
+                let parsed = AnnouncementStore.parseCache(data, appVersion: "1.8.13")
+                try expect(parsed.count == 2, "应只剩 2 条(min 过滤 + 坏数据丢弃),实际 \(parsed.count)")
+                try expect(parsed[0].severity == "critical", "critical 必须排最前")
+                try expect(parsed[1].id == "2026-01-01-info", "第二条应是 info")
+                // schema 非 1 → 整包拒绝
+                let badSchema = try JSONSerialization.data(withJSONObject: ["schema": 2, "items": []])
+                try expect(AnnouncementStore.parseCache(badSchema, appVersion: "1.8.13").isEmpty,
+                           "schema 非 1 必须整包拒绝")
+                // 非法 JSON → 空,不是崩
+                try expect(AnnouncementStore.parseCache(Data("{{{".utf8), appVersion: "1.8.13").isEmpty,
+                           "坏 JSON 必须返回空列表")
+            case "announcements_version_gate":
+                // 版本门:边界值(含/不含)、-dev 后缀、空版本不误杀
+                try expect(AnnouncementStore.versionOK(minV: "1.8.12", maxV: "", current: "1.8.13"),
+                           "当前高于 min 应可见")
+                try expect(!AnnouncementStore.versionOK(minV: "1.8.13", maxV: "", current: "1.8.12"),
+                           "当前低于 min 应被滤掉")
+                try expect(!AnnouncementStore.versionOK(minV: "", maxV: "1.8.10", current: "1.8.12"),
+                           "高于 max 应被滤掉")
+                try expect(AnnouncementStore.versionOK(minV: "", maxV: "1.8.12", current: "1.8.12"),
+                           "等于 max 应可见(闭区间)")
+                try expect(AnnouncementStore.versionCompare("1.8.13-dev", "1.8.13") == 0,
+                           "-dev 后缀应被忽略")
+                try expect(AnnouncementStore.versionCompare("1.8.2", "1.8.10") == -1,
+                           "必须按数值比较,不是字符串(2 < 10 但 \"2\" > \"10\")")
+                try expect(AnnouncementStore.versionOK(minV: "1.8.12", maxV: "", current: ""),
+                           "拿不到版本时不应误杀公告")
+            case "announcements_unread_and_critical_gate":
+                // 未读判定 + critical 限频:24h 至多打扰一次
+                let a = Announcement(id: "x", severity: "critical", title: "t", body: "", link: "")
+                let b = Announcement(id: "y", severity: "info", title: "t", body: "", link: "")
+                let seen: Set<String> = [AnnouncementStore.sha256Hex("y")]
+                let unread = AnnouncementStore.unreadIDs(items: [a, b], seen: seen)
+                try expect(unread == ["x"], "已读 y 不该再算未读,实际 \(unread)")
+                let sev = ["x": "critical", "y": "info"]
+                try expect(AnnouncementStore.shouldAutoOpenCritical(now: 1000, last: nil,
+                                                                   unread: unread, severities: sev),
+                           "首次 critical 未读应允许弹窗")
+                try expect(!AnnouncementStore.shouldAutoOpenCritical(now: 1000 + 3600, last: 1000,
+                                                                     unread: unread, severities: sev),
+                           "24h 内已弹过就不该再弹")
+                try expect(AnnouncementStore.shouldAutoOpenCritical(now: 1000 + 24 * 3600, last: 1000,
+                                                                    unread: unread, severities: sev),
+                           "过 24h 应允许再次弹窗")
+                // 只有 info 未读 → 永不自动弹窗
+                let infoOnly = AnnouncementStore.unreadIDs(items: [b], seen: [])
+                try expect(!AnnouncementStore.shouldAutoOpenCritical(now: 1000, last: nil,
+                                                                     unread: infoOnly,
+                                                                     severities: ["y": "info"]),
+                           "info 级不应触发自动弹窗")
+                try expect(AnnouncementStore.severityRank("critical") < AnnouncementStore.severityRank("warn")
+                           && AnnouncementStore.severityRank("warn") < AnnouncementStore.severityRank("info"),
+                           "severity 排序权重:critical < warn < info")
             case "incidents_missing_file":
                 let vm = f.vm()
                 vm.loadIncidents()

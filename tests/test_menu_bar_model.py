@@ -39,6 +39,9 @@ SCENARIOS = (
     "switch_scans_and_applies_better_node", "switch_survives_node_apply_failure",
     "switch_prefers_slot_bound_node", "slot_node_binding_round_trip",
     "stale_core_scan_explains_upgrade",
+    # 公告功能:缓存解析/版本门/未读与 critical 限频(纯函数契约)
+    "announcements_parse_and_filter", "announcements_version_gate",
+    "announcements_unread_and_critical_gate",
     # 菜单栏品牌图标：两态同一枚盾牌 + Claude 星芒，拦截态额外感叹号徽章
     "menu_bar_brand_icon",
 )

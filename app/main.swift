@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import UniformTypeIdentifiers
+import CryptoKit
 
 // MARK: - 模型
 
@@ -471,6 +472,10 @@ final class VM: ObservableObject {
     @Published private(set) var lastCheckSummary = "尚未检查"
     @Published var updateText = ""
     @Published var showUpdateSheet = false
+    /// 公告:critical 未读且过限频时由 store 回调置真,弹公告页(24h 至多一次)。
+    @Published var showCriticalNotice = false
+    /// 公告仓库:启动读缓存渲染,后台调核心 `announcements check` 刷新(TTL 内不打网络)。
+    let announcements = AnnouncementStore()
     @Published private(set) var coreMissing = false
     @Published private(set) var currentClient = ""
     /// Claude 桌面版此刻是否在运行。
@@ -641,6 +646,21 @@ final class VM: ObservableObject {
         started = true
         killOrphanWatch()
         refresh()
+        bootstrapAnnouncements()
+    }
+
+    /// 公告链路:先把缓存里的旧公告渲染出来(纯读盘,零网络),
+    /// 再后台调核心脚本刷新(TTL 内脚本直接回缓存,不打网络)。
+    /// 拉不到就用旧缓存;测试进程不碰真实 HOME 下的缓存文件。
+    private func bootstrapAnnouncements() {
+        #if CLAUDE_SWITCHER_TESTS
+        #else
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        announcements.reload(appVersion: version)
+        announcements.refreshAsync(core: core, appVersion: version) { [weak self] in
+            self?.showCriticalNotice = true
+        }
+        #endif
     }
 
     /// App 被强杀或崩溃时,它起的巡检走不到 applicationWillTerminate,会留成孤儿。
@@ -666,7 +686,7 @@ final class VM: ObservableObject {
     /// 给核心脚本的进程环境。保留 App 继承到的全部变量,只把系统/brew 的
     /// 标准工具目录补进 PATH —— 不覆盖用户已有的顺序,避免把系统 curl 换成
     /// 某个同名工具。python3 由核心脚本自己按绝对路径解析,不依赖这里。
-    private static func coreProcessEnvironment() -> [String: String] {
+    static func coreProcessEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         var parts = (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
             .split(separator: ":", omittingEmptySubsequences: true).map(String.init)
@@ -3111,7 +3131,8 @@ struct ContentView: View {
         .animation(.easeInOut(duration: Motion.micro), value: vm.fixNotice)
         .sheet(isPresented: $showAIPrompt) { AIPromptSheet(text: vm.aiPrompt) }
         .sheet(isPresented: $vm.showSettingsSheet) { CheckSettingsView(vm: vm) }
-        .sheet(isPresented: $showNotice) { NoticeView() }
+        .sheet(isPresented: $showNotice) { NoticeView(vm: vm) }
+        .sheet(isPresented: $vm.showCriticalNotice) { NoticeView(vm: vm) }
         .sheet(isPresented: $showFingerprint) { FingerprintView(text: vm.fingerprint) }
         .sheet(isPresented: $showHistory) { IncidentHistorySheet(vm: vm) }
         .sheet(isPresented: $showLatency) { LatencyInsightSheet(vm: vm) }
@@ -3173,8 +3194,18 @@ struct ContentView: View {
             ClaudeIconButton(systemName: "gearshape", help: "检查设置与诊断日志") {
                 vm.showSettingsSheet = true
             }
-            ClaudeIconButton(systemName: "info.circle", help: "安全防护体系公告") {
+            ClaudeIconButton(systemName: "info.circle", help: "安全边界说明与公告") {
                 showNotice = true
+                vm.announcements.markAllRead()
+            }
+            .overlay(alignment: .topTrailing) {
+                // 未读红点:缓存里有公告、seen 里没有。点开公告页即整批已读。
+                if vm.announcements.hasUnread {
+                    Circle()
+                        .fill(Color(red: 0.85, green: 0.25, blue: 0.20))
+                        .frame(width: 7, height: 7)
+                        .offset(x: 3, y: -1)
+                }
             }
         }
         .padding(.leading, 86)   // 让开红绿灯
@@ -5158,19 +5189,190 @@ struct AIPromptSheet: View {
     }
 }
 
-// MARK: - 公告页
+// MARK: - 公告(announcements)
+
+/// 单条公告。数据源:核心脚本拉取并校验后的缓存
+/// (~/.claude-switcher/announcements-cache.json),App 只读文件、不联网 ——
+/// 「脚本写、界面读」分层。min/max_app_version 过滤是 App 的职责
+/// (核心不知道 App 版本)。
+struct Announcement: Equatable {
+    let id: String
+    let severity: String   // info | warn | critical(核心侧已白名单校验)
+    let title: String
+    let body: String
+    let link: String
+}
+
+final class AnnouncementStore: ObservableObject {
+    @Published private(set) var items: [Announcement] = []
+    @Published private(set) var hasUnread = false
+
+    static let cacheFile = NSHomeDirectory() + "/.claude-switcher/announcements-cache.json"
+    static let seenFile = NSHomeDirectory() + "/.claude-switcher/announcements-seen"
+    static let criticalLastFile = NSHomeDirectory() + "/.claude-switcher/announcements-critical-last"
+    /// critical 未读自动弹窗的限频:同一批 critical 至多 24 小时打扰一次。
+    static let criticalPopupInterval: TimeInterval = 24 * 3600
+
+    // ---- 纯函数(测试钉契约的地方,不做任何 IO) ----
+
+    static func severityRank(_ s: String) -> Int {
+        switch s {
+        case "critical": return 0
+        case "warn": return 1
+        default: return 2
+        }
+    }
+
+    /// 点分隔数值比较("1.8.13" vs "1.8.2");非数字段按 0 处理,后缀(-dev 等)忽略。
+    static func versionCompare(_ a: String, _ b: String) -> Int {
+        func nums(_ v: String) -> [Int] {
+            (v.split(separator: "-").first.map(String.init) ?? v)
+                .split(separator: ".").map { Int($0) ?? 0 }
+        }
+        let x = nums(a), y = nums(b)
+        for i in 0..<max(x.count, y.count) {
+            let l = i < x.count ? x[i] : 0
+            let r = i < y.count ? y[i] : 0
+            if l != r { return l < r ? -1 : 1 }
+        }
+        return 0
+    }
+
+    static func versionOK(minV: String, maxV: String, current: String) -> Bool {
+        let cur = current.trimmingCharacters(in: .whitespaces)
+        guard !cur.isEmpty else { return true }   // 拿不到版本就不误杀公告
+        let minClean = minV.trimmingCharacters(in: .whitespaces)
+        let maxClean = maxV.trimmingCharacters(in: .whitespaces)
+        if !minClean.isEmpty && versionCompare(cur, minClean) < 0 { return false }
+        if !maxClean.isEmpty && versionCompare(cur, maxClean) > 0 { return false }
+        return true
+    }
+
+    static func parseCache(_ data: Data, appVersion: String) -> [Announcement] {
+        guard let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              doc["schema"] as? Int == 1,
+              let raw = doc["items"] as? [[String: Any]] else { return [] }
+        var out: [Announcement] = []
+        for it in raw {
+            guard let id = it["id"] as? String, !id.isEmpty,
+                  let severity = it["severity"] as? String,
+                  let title = it["title"] as? String else { continue }
+            let minV = it["min_app_version"] as? String ?? ""
+            let maxV = it["max_app_version"] as? String ?? ""
+            guard versionOK(minV: minV, maxV: maxV, current: appVersion) else { continue }
+            out.append(Announcement(id: id, severity: severity, title: title,
+                                    body: it["body_md"] as? String ?? "",
+                                    link: it["link"] as? String ?? ""))
+        }
+        return out.sorted {
+            if severityRank($0.severity) != severityRank($1.severity) {
+                return severityRank($0.severity) < severityRank($1.severity)
+            }
+            return $0.id > $1.id   // 同级按 id 降序(带日期前缀,新的在前)
+        }
+    }
+
+    static func sha256Hex(_ s: String) -> String {
+        SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func unreadIDs(items: [Announcement], seen: Set<String>) -> [String] {
+        items.filter { !seen.contains(sha256Hex($0.id)) }.map { $0.id }
+    }
+
+    static func loadSeen() -> Set<String> {
+        guard let raw = try? String(contentsOfFile: seenFile, encoding: .utf8) else { return [] }
+        return Set(raw.split(separator: "\n").map(String.init))
+    }
+
+    /// critical 未读 + 距上次自动弹窗超过限频 → 允许打扰。
+    static func shouldAutoOpenCritical(now: TimeInterval, last: TimeInterval?, unread: [String],
+                                       severities: [String: String]) -> Bool {
+        guard unread.contains(where: { severities[$0] == "critical" }) else { return false }
+        guard let last = last else { return true }
+        return now - last >= criticalPopupInterval
+    }
+
+    // ---- 实例方法(IO) ----
+
+    /// 从缓存重读并刷新未读状态。主线程调用(改 @Published)。
+    func reload(appVersion: String) {
+        guard let data = FileManager.default.contents(atPath: Self.cacheFile) else {
+            items = []; hasUnread = false; return
+        }
+        items = Self.parseCache(data, appVersion: appVersion)
+        let unread = Self.unreadIDs(items: items, seen: Self.loadSeen())
+        hasUnread = !unread.isEmpty
+        pendingCritical = unread.filter { severityOf($0) == "critical" }
+    }
+
+    private func severityOf(_ id: String) -> String {
+        items.first { $0.id == id }?.severity ?? ""
+    }
+    private var pendingCritical: [String] = []
+
+    /// 有未读 critical 且过限频 → 返回 true 并记录本次时间;否则 false。
+    func takeCriticalAutoOpen(now: TimeInterval) -> Bool {
+        let last = try? FileManager.default.attributesOfItem(atPath: Self.criticalLastFile)[.modificationDate] as? Date
+        let lastTS = last.map { $0.timeIntervalSince1970 }
+        let ok = Self.shouldAutoOpenCritical(now: now, last: lastTS, unread: pendingCritical,
+                                             severities: Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0.severity) }))
+        guard ok else { return false }
+        FileManager.default.createFile(atPath: Self.criticalLastFile, contents: Data())
+        return true
+    }
+
+    /// 打开公告页即整批标记已读。
+    func markAllRead() {
+        guard !items.isEmpty else { hasUnread = false; return }
+        let seen = Self.loadSeen()
+        var lines = seen
+        for it in items { lines.insert(Self.sha256Hex(it.id)) }
+        guard lines != seen else { hasUnread = false; return }
+        let text = lines.sorted().joined(separator: "\n") + "\n"
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: (Self.seenFile as NSString).deletingLastPathComponent,
+                                withIntermediateDirectories: true)
+        fm.createFile(atPath: Self.seenFile, contents: Data(text.utf8),
+                      attributes: [.posixPermissions: 0o600])
+        hasUnread = false
+    }
+
+    /// 后台调核心脚本 `announcements check`(TTL 内脚本直接回缓存,不打网络),
+    /// 完成后回主线程重读。失败静默 —— 公告是软功能,拉不到就继续用旧缓存。
+    func refreshAsync(core: String, appVersion: String, onAutoOpen: (() -> Void)? = nil) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: core)
+            p.arguments = ["announcements", "check"]
+            p.environment = VM.coreProcessEnvironment()
+            try? p.run()
+            p.waitUntilExit()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.reload(appVersion: appVersion)
+                if self.takeCriticalAutoOpen(now: Date().timeIntervalSince1970) {
+                    onAutoOpen?()
+                }
+            }
+        }
+    }
+}
 
 struct NoticeView: View {
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject var vm: VM
 
+    // 静态段是「产品边界说明」,不是营销位:每条都写清做到了什么、
+    // 边界在哪(SECURITY.md / drill),措辞口径与 SECURITY.md 对齐。
     let sections: [(String, String)] = [
-        ("Full-Tunnel 全流量接管", "基于 TUN 虚拟网卡的内核级流量劫持，配合 Fake-IP DNS 解析机制，包括 UDP 在内的全部出站流量在网络栈底层被强制路由至加密隧道，应用层无法旁路。"),
-        ("Environment Audit 环境一致性审计", "每次启动前执行 16 项环境指纹审计：Egress IP 归属地与 ASN 属性、时区与 Geo-location 一致性、Locale、IPv6 双栈旁路、DNS Leak、WebRTC/STUN 多节点交叉探测等。硬性安全项失败即 Block-on-Fail；仅显式配置的非关键项可跳过或降级，skip 不表示通过。"),
+        ("Full-Tunnel 全流量接管", "基于 TUN 虚拟网卡接管全部出站流量（含 UDP），配合 Fake-IP DNS；strict-route 下旁路直连的路已封死，残余边界见 SECURITY.md。"),
+        ("Environment Audit 环境一致性审计", "每次启动前执行 16 项环境指纹审计：Egress IP 归属地与 ASN 属性、时区与 Geo-location 一致性、Locale、IPv6 双栈旁路、DNS Leak（含上游架构审计）、WebRTC/STUN 多节点交叉探测等。硬性安全项失败即 Block-on-Fail；仅显式配置的非关键项可跳过或降级，skip 不表示通过。"),
         ("Kill-Switch 断网急停", "常驻守护进程每 10 秒复查一次隧道健康度，中断即刻终止受保护进程，把裸连窗口压到秒级。进程级急停，非防火墙级保证，边界详见 SECURITY.md。"),
-        ("Pinned Routing 域名置顶路由", "目标服务全家族域名及其生态依赖（Turnstile 人机验证、Telemetry 遥测、Payment 支付、Support 组件）置顶锁定代理路由，优先级高于任何第三方分流规则集，免疫规则库误判。"),
-        ("Session Isolation 会话隔离快照", "多账号采用完整快照隔离：各账号持有独立的 Device Fingerprint、OAuth Credential 与本地状态，切换即物理交换数据卷，账号间零交叉污染。"),
-        ("Drift Self-Healing 配置漂移自愈", "针对系统时区漂移、代理组件升级导致的配置重置等常见问题，内置 Watchdog 周期性校验并自动回滚至基线状态，全程留痕、可审计。"),
-        ("Anti-Tracking 反追踪卫生", "验证链接（Magic Link）闭环于受保护环境内打开；邮件追踪像素（Tracking Pixel）经由邮箱服务商代理层屏蔽；全程固定单一住宅出口，不产生 Geo 跳变。"),
+        ("Pinned Routing 域名置顶路由", "Claude 全家族域名及其生态依赖（Turnstile 人机验证、遥测、支付、支持组件）置顶走固定代理路由，优先级高于订阅自带的任何分流规则集——规则库误判或订阅更新覆盖都改变不了它们的走向。"),
+        ("Session Isolation 会话隔离快照", "各账号持有独立的设备指纹、登录凭据与本地数据；切换时整目录原子换位（APFS 写时复制，不重复拷贝未变更数据），账号间不共享任何本地状态。"),
+        ("Drift Self-Healing 配置漂移自愈", "系统时区、地区格式、置顶规则被其他软件或订阅更新改掉时，巡检按基线周期校验并自动回滚；每次干预都落 watch.log / incidents.log，可回查。"),
+        ("链接与追踪像素", "验证链接（Magic Link）只在一次性隔离浏览器内打开；邮件追踪像素经固定住宅出口加载，不产生 Geo 跳变。"),
     ]
 
     var body: some View {
@@ -5179,8 +5381,8 @@ struct NoticeView: View {
             VStack(spacing: 0) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("安全防护体系公告").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
-                        Text("Security Architecture Bulletin").font(Type.microFont).foregroundColor(ClaudeTheme.muted)
+                        Text("安全边界说明").font(Type.titleFont).foregroundColor(ClaudeTheme.ink)
+                        Text("Security Boundaries").font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
@@ -5192,11 +5394,41 @@ struct NoticeView: View {
 
                 ScrollView {
                     VStack(spacing: 10) {
-                        Text("本产品面向对账号环境一致性有严格要求的专业用户，按 Fail-Closed（故障即断）原则设计，针对目标平台的 Risk Control 体系提供全链路防护。请注意：16 项检查全绿只证明流量此刻走了代理，证明不了代理断开时不会直连——后者只有故障演练（drill）能验证，演练结论会常驻显示在主界面。")
+                        Text("本产品按 Fail-Closed（故障即断）原则设计，用于对出口身份一致性有严格要求的场景。请注意：16 项检查全绿只证明流量此刻走了代理，证明不了代理断开时不会直连——后者只有故障演练（drill）能验证，演练结论会常驻显示在主界面。")
                             .font(Type.bodyFont)
                             .foregroundColor(ClaudeTheme.muted)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.bottom, 6)
+
+                        if !vm.announcements.items.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("公告").font(Type.bodyStrongFont).foregroundColor(ClaudeTheme.ink)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            ForEach(vm.announcements.items, id: \.id) { a in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(spacing: 8) {
+                                        Text(badgeText(a.severity))
+                                            .font(Type.microFont)
+                                            .foregroundColor(.white)
+                                            .padding(.horizontal, 7).padding(.vertical, 2)
+                                            .background(RoundedRectangle(cornerRadius: 5).fill(badgeColor(a.severity)))
+                                        Text(a.title).font(Type.bodyStrongFont).foregroundColor(ClaudeTheme.ink)
+                                    }
+                                    if !a.body.isEmpty {
+                                        Text(a.body.replacingOccurrences(of: "**", with: ""))
+                                            .font(Type.microFont)
+                                            .foregroundColor(ClaudeTheme.muted)
+                                            .lineSpacing(Type.microLineGap)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(12)
+                                .background(ClaudeTheme.card)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
 
                         ForEach(Array(sections.enumerated()), id: \.offset) { idx, s in
                             VStack(alignment: .leading, spacing: 6) {
@@ -5208,17 +5440,28 @@ struct NoticeView: View {
                             .background(ClaudeTheme.card)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                         }
-
-                        Text("本防护体系基于对目标平台风控机制的持续逆向分析与实战经验迭代。")
-                            .font(Type.microFont)
-                            .foregroundColor(ClaudeTheme.muted)
-                            .padding(.top, 8)
                     }
                     .padding(.horizontal, 20).padding(.bottom, 20)
                 }
             }
         }
         .frame(width: 460, height: 620)
+    }
+
+    private func badgeText(_ severity: String) -> String {
+        switch severity {
+        case "critical": return "紧急"
+        case "warn": return "注意"
+        default: return "通知"
+        }
+    }
+
+    private func badgeColor(_ severity: String) -> Color {
+        switch severity {
+        case "critical": return Color(red: 0.75, green: 0.22, blue: 0.18)
+        case "warn": return Color(red: 0.80, green: 0.48, blue: 0.15)
+        default: return Color(red: 0.35, green: 0.40, blue: 0.46)
+        }
     }
 }
 
