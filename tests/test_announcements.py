@@ -288,6 +288,17 @@ curl() {
         sh = CORE.read_text(encoding="utf-8")
         self.assertIn('chmod 600 "$ANNOUNCEMENTS_CACHE"', sh)
 
+    def test_fetch_is_get_only_never_uploads(self):
+        """验收 6:全程零上传 —— 假 curl 记录的每一次调用都不得带 POST 痕迹。"""
+        run = self.run_harness({"schema": 1, "items": [GOOD_ITEM]},
+                               curl_env={"CURL_FAIL_PRIMARY": 1})  # 走满降级链,调用最多
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls_file = Path(self.tmp) / "curl-calls"
+        self.assertTrue(calls_file.exists(), "至少应有一次 curl 调用")
+        calls = calls_file.read_text(encoding="utf-8")
+        for banned in ("-d ", "--data", "-F ", "--form", "-T ", "--upload-file", "-X POST"):
+            self.assertNotIn(banned, calls, f"公告拉取必须纯 GET,发现 {banned}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -520,6 +520,9 @@ final class VM: ObservableObject {
     /// 安全基线会被这里的每次「保存设置」静默清空，而界面上完全看不出来。
     @Published var strictChecks: Set<String> = []
     @Published var loggingEnabled = true
+    /// App 自动更新开关(checks.json 的 app_auto_update,默认开)。
+    /// 老核心不回这个字段 → 读不到当 true(核心侧语义:损坏按开,方向安全)。
+    @Published var appAutoUpdate = true
     @Published var settingsMessage = ""
     @Published private(set) var settingsBusy = false
     /// 只读节点扫描的结果。不放进 isBusy:扫描期间巡检照常驻守,界面也
@@ -1871,6 +1874,7 @@ final class VM: ObservableObject {
             self.disabledChecks = Set(disabled)
             self.allowOptionalFailures = allow
             self.loggingEnabled = logging
+            self.appAutoUpdate = (config["app_auto_update"] as? Bool) ?? true
             // strict 是可选项：老核心不回这个字段，读不到就当空，不能因此判整份配置无效。
             let strict = (config["strict"] as? [String]) ?? []
             self.strictChecks = Set(strict.filter { name in
@@ -1894,6 +1898,9 @@ final class VM: ObservableObject {
             // 原样带回：关掉一项和把它设成硬门槛是两件事，不能互相吞掉；
             // 漏掉这一行等于每次保存都把安全基线清空一次。
             "strict": Self.optionalChecks.map { $0.key }.filter { strictChecks.contains($0) },
+            // app_auto_update 缺省 true(核心 DEFAULTS 同值):保存不能丢这个键,
+            // 否则用户关掉的 App 自动更新会在下次保存时被静默打开。
+            "app_auto_update": appAutoUpdate,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: config, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return }
@@ -1911,6 +1918,7 @@ final class VM: ObservableObject {
         allowOptionalFailures = false
         strictChecks = []
         loggingEnabled = true
+        appAutoUpdate = true
         settingsMessage = "已恢复默认选项，点击保存后生效"
     }
 
@@ -4813,6 +4821,9 @@ struct CheckSettingsView: View {
                                     .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                                 Toggle("记录脱敏客户端日志", isOn: $vm.loggingEnabled)
                                 Text("仅记录版本、命令、退出码、耗时和检查状态，不记录 IP、凭据或账号内容。")
+                                    .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
+                                Toggle("App 自动更新", isOn: $vm.appAutoUpdate)
+                                Text("每 12 小时随核心更新一并检查：发现新版发版包会下载校验后原子换装，失败自动回滚；连续两轮失败会停用自动通道。更新不会打断你正在用的窗口，下次启动即新版。")
                                     .font(Type.microFont).foregroundColor(ClaudeTheme.muted)
                             }
                             .padding(.vertical, 6)

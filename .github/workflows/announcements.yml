@@ -1,0 +1,62 @@
+name: announcements-check
+
+# 公告数据文件的发布门禁:坏 JSON 进了 main,用户端会「公告暂不可用」,
+# 虽然核心校验会拒载,但这里挡在发布之前更省事(照 release gate 同款思路)。
+on:
+  push:
+    paths:
+      - "data/announcements.json"
+  pull_request:
+    paths:
+      - "data/announcements.json"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate announcements.json
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate schema
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          from datetime import datetime, timezone
+
+          with open("data/announcements.json", encoding="utf-8") as f:
+              doc = json.load(f)
+
+          if not isinstance(doc, dict) or doc.get("schema") != 1:
+              sys.exit("schema 必须是 1")
+          items = doc.get("items")
+          if not isinstance(items, list):
+              sys.exit("items 必须是数组")
+          allowed = ("info", "warn", "critical")
+          seen = set()
+          now = datetime.now(timezone.utc)
+          for it in items:
+              for k in ("id", "severity", "title"):
+                  v = it.get(k)
+                  if not isinstance(v, str) or not v.strip():
+                      sys.exit(f"公告项缺少必填字段 {k}: {it}")
+              if it["severity"] not in allowed:
+                  sys.exit(f"severity 非法: {it['severity']}")
+              if it["id"] in seen:
+                  sys.exit(f"id 重复: {it['id']}")
+              seen.add(it["id"])
+              exp = it.get("expires_at")
+              if isinstance(exp, str) and exp.strip():
+                  t = exp.strip()
+                  if t.endswith("Z"):
+                      t = t[:-1] + "+00:00"
+                  d = datetime.fromisoformat(t)
+                  if d.tzinfo is None:
+                      d = d.replace(tzinfo=timezone.utc)
+                  if d <= now:
+                      print(f"NOTE: {it['id']} 已过期,建议从 items 里移除")
+          print(f"OK: {len(items)} 条公告,schema 合法")
+          PY

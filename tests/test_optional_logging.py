@@ -86,15 +86,37 @@ esac''')
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         # strict 也一并落盘(空表示「没有哪项被升成安全基线」)。
         # 它缺席会让「设过安全基线」这件事在文件里无从体现,下次读回来只在内存里有。
+        # app_auto_update 默认 True:保存时不带会被核心补上默认值,
+        # 缺省语义 = 自动更新开(方案 2026-11-25 §4.2,方向安全)。
         self.assertEqual(json.loads(self.settings.read_text(encoding="utf-8")),
                          {"disabled": ["DNS"], "allowOptionalFailures": True,
-                          "logging": False, "strict": []})
+                          "logging": False, "strict": [], "app_auto_update": True})
         self.assertEqual(stat.S_IMODE(self.settings.stat().st_mode), 0o600)
         run = self.support("config")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("DNS", run.stdout)
         self.assertIn("allowOptionalFailures=1", run.stdout)
         self.assertIn("logging=0", run.stdout)
+
+    def test_app_auto_update_contract(self):
+        """App 自动更新开关:bool 契约、显式 false 生效、非法类型拒绝、缺席默认开。"""
+        run = self.support("config-set", json.dumps(
+            {"disabled": [], "allowOptionalFailures": False, "logging": True,
+             "strict": [], "app_auto_update": False}))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(json.loads(self.settings.read_text(encoding="utf-8"))["app_auto_update"],
+                         False, "显式 false 必须落盘")
+
+        for bad in ("yes", 1, None):
+            with self.subTest(bad=bad):
+                self.write_settings({"app_auto_update": bad})
+                run = self.support("config")
+                self.assertNotEqual(run.returncode, 0, f"非 bool 必须拒绝: {bad!r}")
+
+        # 缺席 → 默认开(方向安全:更新失败有自检回滚+熔断兜底)
+        self.write_settings({"disabled": [], "logging": True})
+        run = self.support("config-get")
+        self.assertEqual(json.loads(run.stdout)["app_auto_update"], True)
 
     def test_disabled_checks_skip_probes_and_never_report_ok(self):
         self.prepare_checkdetail()

@@ -74,7 +74,7 @@ ALL_CHECKS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "�
               "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性",
               "DNS泄露")
 DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True,
-            "strict": []}
+            "strict": [], "app_auto_update": True}
 LOG_LIMIT = 512 * 1024
 
 # 检查报告契约。文本行仍然是人读的兼容层,JSON 才是机器契约:
@@ -219,7 +219,7 @@ def validate(value):
     if set(strict) & set(disabled):
         fail()   # 既关掉又要求当硬门槛,自相矛盾
     result["strict"] = [name for name in OPTIONAL if name in strict]
-    for key in ("allowOptionalFailures", "logging"):
+    for key in ("allowOptionalFailures", "logging", "app_auto_update"):
         if key in value:
             if type(value[key]) is not bool:
                 fail()
