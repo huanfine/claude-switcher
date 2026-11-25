@@ -7501,7 +7501,12 @@ help() {
 
 维护
   update               更新核心脚本(校验 SHA256,自检失败自动回滚)
-  update-check         只检查有没有新版本,不写入
+  update-check         只检查有没有新版本,不写入(核心 + App 一起报)
+  update-app [--check] 更新 App 界面(release 通道):下载校验后原子换装,
+                       失败自动回滚;连续两轮失败会熔断停用自动通道,
+                       手动执行成功即解除;不打断正在运行的窗口
+  announcements [check|read]
+                       公告拉取(6 小时频控)与缓存读取;坏数据报错不静默
   snapshot-export <A–H> <file>        导出某个账号的快照
   snapshot-import <file> <A–H>        导入快照到某个账号
   export-diagnostics <file>           导出脱敏诊断包(不含 IP、凭据、账号内容)

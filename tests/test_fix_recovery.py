@@ -52,8 +52,10 @@ class AppReceiptTests(unittest.TestCase):
         self.assertIn("DispatchQueue.main.async { self?.applyFixLine(line) }", self.swift)
 
     def test_process_gets_explicit_path(self):
-        self.assertIn("p.environment = Self.coreProcessEnvironment()", self.swift)
-        helper = self.swift.split("private static func coreProcessEnvironment()", 1)[1]
+        self.assertIn("p.environment = VM.coreProcessEnvironment()", self.swift)
+        # coreProcessEnvironment 原为 private,公告功能(AnnouncementStore 同文件
+        # 调用)改为 internal;定位 marker 不再带 private。
+        helper = self.swift.split("static func coreProcessEnvironment()", 1)[1]
         helper = helper.split("\n    }", 1)[0]
         for directory in ("/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin",
                           "/usr/sbin", "/sbin"):
