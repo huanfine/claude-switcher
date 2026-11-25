@@ -1784,13 +1784,13 @@ final class VM: ObservableObject {
         let autoOK = info["GATE"] == "auto-ok"
         if info["PREFERRED_MATCH"] == "0" && !pref.isEmpty {
             rows[idx].state = .warn
-            rows[idx].detail = "已偏离固定节点 \(pref) · 点「扫描可用节点」重新应用"
+            rows[idx].detail = "已偏离固定出口 \(pref) · 点「扫描候选出口」重新应用"
         } else if info["PREFERRED_MATCH"] == "1" && !pref.isEmpty {
             rows[idx].state = .ok
             rows[idx].detail = "已固定在 \(pref) · 后续检查都基于这条线路"
         } else if !best.isEmpty, let delta = Int(info["DELTA"] ?? "") {
             rows[idx].state = .warn
-            let hint = autoOK ? "点「扫描可用节点」→「应用最优节点」自动切换" : "到客户端手动切换"
+            let hint = autoOK ? "点「扫描候选出口」→「切换到该出口」自动切换" : "到客户端手动切换"
             rows[idx].detail = "有更干净的节点 \(best)(\(info["BEST_SCORE"] ?? "?") 分,比当前高 \(delta) 分) · \(hint)"
                 + Self.nodeScanEvidence(info)
         } else if info["ELIGIBLE"] == "0" {
@@ -2260,7 +2260,7 @@ final class VM: ObservableObject {
     private func applyNodeForSwitch(bound: String, done: @escaping (Bool) -> Void) {
         // 扫一轮实测 13s 上下。不给话就是「点完槽位卡，界面僵在那儿」——
         // 切换本身只要一两秒，这段时间全花在扫描上，必须说清楚在等什么。
-        banner = "正在扫描可用节点…"
+        banner = "正在扫描候选出口…"
         run(["node-scan"], timeout: 90) { [weak self] result in
             guard let self else { done(true); return }
             self.banner = ""
@@ -3936,13 +3936,13 @@ struct ContentView: View {
                     Button(candidate.label) { vm.bindSlotNode(t, leaf: candidate.leaf) }
                 }
                 if candidates.isEmpty && current.isEmpty {
-                    Button("先扫描可用节点…") { vm.scanNodes() }
+                    Button("先扫描候选出口…") { vm.scanNodes() }
                 }
             }
             if !bound.isEmpty {
                 Button("解除绑定（\(bound)）") { vm.clearSlotNode(t) }
             }
-            Button("重新扫描节点…") { vm.scanNodes() }
+            Button("重新扫描候选出口…") { vm.scanNodes() }
         } label: {
             Image(systemName: bound.isEmpty ? "link.badge.plus" : "link")
                 .font(.system(size: 10, weight: .semibold))
@@ -5015,16 +5015,16 @@ struct NodeScanSheet: View {
             }
             HStack(spacing: 8) {
                 if vm.canApplyBestNode {
-                    Text("门禁允许自动应用 · 停守护、只切一次、复查出口")
+                    Text("门禁允许自动切换 · 停守护、只切一次、复查出口")
                         .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
                 } else {
-                    Text("Claude 在跑或巡检仍驻守时只生成报告,不会自动切换节点")
+                    Text("Claude 在跑或巡检仍驻守时只生成报告,不会自动切换出口")
                         .font(Type.microFont).foregroundColor(ClaudeTheme.faint)
                 }
                 Spacer()
                 if vm.canApplyBestNode {
                     Button { vm.applyBestNode() } label: {
-                        Text(vm.isBusy ? "应用中…" : "应用最优节点")
+                        Text(vm.isBusy ? "切换中…" : "切换到该出口")
                     }
                     .buttonStyle(.bordered)
                     .disabled(vm.isBusy || vm.nodeScanBusy)
