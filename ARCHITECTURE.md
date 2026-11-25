@@ -100,7 +100,7 @@ lease                → claude-switcher-lease/1
 | `client_language` / `asn` | 客户端语言 / ASN属性 | defaults 读取 / ASN 归属 | 软 |
 | `ip_purity` | IP纯净度 | 4 源并行 + PTR，类型基线 − 连续扣分；类型只看结构证据 | 软 |
 | `ecosystem` | 生态可达性 | claude.ai 与 api.anthropic.com 各一次 | 软 |
-| `better_node` | 更优节点 | 只读扫描报告文件，检查预算内零网络请求 | 软 |
+| `dns_leak` | DNS泄露 | 上游解析器架构审计（fallback 并发 / 明文上游 / 国内递归，仅 Clash Verge 可读运行配置）+ 内核加密解析实测 | 软 |
 
 结论五态 `ok / warn / config / fail / skip`。`config`（环境层没就绪）与 `fail`（实测不达标）
 分开是有意为之：两者的修复动作不同，混为一谈会把用户支去改错误的东西。`skip` 不算通过。

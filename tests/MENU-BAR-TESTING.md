@@ -29,11 +29,11 @@ cat > _trash/menu-bar-demo/fake-core.sh <<'SH'
 #!/bin/bash
 case "$1" in
   checkdetail)
-    for key in 代理内核 TUN网卡 出口IP IP一致 时区 地区 IPv6 DNS WebRTC 保镖 规则置顶 客户端语言 ASN属性 IP纯净度 生态可达性 更优节点; do
+    for key in 代理内核 TUN网卡 出口IP IP一致 时区 地区 IPv6 DNS WebRTC 保镖 规则置顶 客户端语言 ASN属性 IP纯净度 生态可达性 DNS泄露; do
       case "$key" in
         ASN属性) echo "$key=warn:演示机房" ;;
         IP纯净度) echo "$key=ok:评分 88/100 · 住宅宽带(演示数据)" ;;
-        更优节点) echo "$key=ok:已固定在演示节点" ;;
+        DNS泄露) echo "$key=ok:上游架构审计通过 · 内核加密解析可达" ;;
         *) echo "$key=ok:演示数据" ;;
       esac
     done ;;

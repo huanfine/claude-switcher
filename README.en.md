@@ -35,7 +35,7 @@ repository, command-line script, and build artifact name.
 - **16-point preflight audit** — proxy core, TUN interface, exit country, IP
   stability, time zone, locale, IPv6, DNS tunnel, WebRTC candidates, bodyguard
   status, pinned routing, client language, ASN type, IP purity score, Claude
-  reachability, and better-node availability. Results are `ok` / `fail` /
+  reachability, and DNS leak detection (upstream resolver architecture audit). Results are `ok` / `fail` /
   `config` / `warn` / `skip`; both `fail` and `config` block launch, and `skip`
   never counts as a pass.
 - **Snapshot switching (A–H)** — archives and restores whole account
@@ -339,9 +339,10 @@ generic "script failed":
   exit wiped every `FIX:` receipt and showed only "script failed (exit 1)", which
   looked like nothing had been repaired. Receipts are now kept, remaining items
   needing manual action are named, and a fresh check runs afterwards.
-- **Items a script cannot fix**: exit IP, ASN, IP purity, ecosystem reachability
-  and "better node" require switching lines/nodes; the button will not turn them
-  green.
+- **Items a script cannot fix**: exit IP, ASN, IP purity and ecosystem
+  reachability depend on your line/subscription; the button will not turn them
+  green. DNS leak (item 16) can be fixed by one-click repair (managed DNS block
+  in Merge.yaml). Node scanning and slot pinning live in `node-scan` / `slot-node`.
 
 For troubleshooting, use "Export diagnostics" in the app: `1.8.7-dev` adds a
 `last-fix.log` with the step-by-step `FIX:` output of the last repair (IPs, local
@@ -397,9 +398,9 @@ back at the same button.
 3. Sign in once for each additional account; later switches keep sessions
    independent — for both the desktop app and the `claude` CLI. Exit the CLI
    before switching (it writes to the directory being swapped).
-4. To pin an exit to a slot, scan once from the "更优节点 / Better node" row,
-   then use the link icon in the top-right corner of a slot card and pick a
-   candidate from the report (`slot-node set <A-H> <node>` on the command line).
+4. To pin an exit to a slot, run `node-scan` first, then use the link icon in
+   the top-right corner of a slot card and pick a candidate from the report
+   (`slot-node set <A-H> <node>` on the command line).
 5. After changing to a node in another country, run
    `~/.local/bin/claude-switch.sh set-region`.
 
