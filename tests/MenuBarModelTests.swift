@@ -1126,6 +1126,54 @@ struct MenuBarModelTests {
                 try expect(blockedOpaque != normalOpaque,
                            "两态的孔不能是同一块，实际 \(blockedOpaque) vs \(normalOpaque)")
                 try expect(blockedAlpha != normalAlpha, "两态图标不能长得一模一样")
+            case "startup_race_schedules_retry":
+                // 开机竞态:首查出口 fail 但代理内核 ok,要挂提示并自动补查一次;
+                // 补查之后(哪怕还是 fail)不得续命成无限重查。
+                try f.audit(["出口IP": "fail"])
+                VM.startupRaceRetryDelay = 0.3
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(f.calls == ["checkdetail --json", "get-client", "status"],
+                           "首查不应立即重复,实际 \(f.calls)")
+                try expect(vm.startupRaceHint.contains("自动重查"),
+                           "竞态判定应挂出提示,实际 \(vm.startupRaceHint)")
+                try spin { f.rawCalls.filter { $0.hasPrefix("checkdetail") }.count >= 2 && !vm.isBusy }
+                try expect(f.calls.filter { $0.hasPrefix("checkdetail") }.count == 2,
+                           "只应自动补查一次,实际 \(f.calls)")
+                try expect(vm.startupRaceHint.isEmpty, "补查开始后提示应退场")
+                pump(0.6)
+                try expect(f.calls.filter { $0.hasPrefix("checkdetail") }.count == 2,
+                           "补查不能续命,实际 \(f.calls)")
+            case "startup_race_needs_core_ok":
+                // 代理内核自己都 fail 时,出口 fail 是真故障,不能拿「还在启动」当遮羞布;
+                // 非首轮落定(手动重查)也不触发,哪怕它赶巧全绿。
+                try f.audit(["代理内核": "fail", "出口IP": "fail"])
+                VM.startupRaceRetryDelay = 0.3
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.startupRaceHint.isEmpty, "内核 fail 时不应挂竞态提示,实际 \(vm.startupRaceHint)")
+                pump(0.6)
+                try expect(f.calls == ["checkdetail --json", "get-client", "status"],
+                           "内核 fail 时不应自动补查,实际 \(f.calls)")
+                try f.audit()
+                vm.refresh(); try f.idle(vm)
+                try expect(vm.phase == .ready, "手动重查全绿应通过")
+                try expect(vm.startupRaceHint.isEmpty, "非首轮落定不应触发竞态提示")
+                pump(0.6)
+                try expect(f.calls.filter { $0.hasPrefix("checkdetail") }.count == 2,
+                           "手动重查不应带出自动补查,实际 \(f.calls)")
+            case "startup_race_manual_refresh_cancels":
+                // 用户自己点了重新检查,挂着的自动补查要撤,不能到点再来一次。
+                try f.audit(["出口IP": "fail"])
+                VM.startupRaceRetryDelay = 1.0
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.startupRaceHint.contains("自动重查"), "应先挂出补查提示")
+                vm.refresh(); try f.idle(vm)
+                try expect(vm.startupRaceHint.isEmpty, "手动重查应撤掉提示")
+                pump(1.5)
+                try expect(f.calls.filter { $0.hasPrefix("checkdetail") }.count == 2,
+                           "手动重查后不应再有自动补查,实际 \(f.calls)")
             default:
                 throw TestFailure(description: "未知测试场景：\(name)")
             }

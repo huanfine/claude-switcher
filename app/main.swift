@@ -578,6 +578,21 @@ final class VM: ObservableObject {
     /// 已经有落定过的一轮。首轮没有任何旧值可显示,行是一条条落下来的;
     /// 之后每轮保留旧值就地更新 —— 让整列推倒重来会闪,那才是抽搐。
     @Published private(set) var hasSettledOnce = false
+    // ---- 启动竞态重查 ----
+    // 开机自启时 Clash Verge 的启动链路(应用→内核→TUN→节点握手)要 1~3 分钟,
+    // App 首查可能撞上内核没就绪的窗口期:探测打到直连/异常出口,出口类项目 fail,
+    // 而代理内核本身是 ok 的。2026-11-25 实测:11:02 出口IP=fail、11:05 全绿,
+    // 期间用户什么都没动。这不是环境坏了,是查得太早 —— 满足「首查 + 内核 ok +
+    // 出口类 fail」时提示一句,并自动延迟重查一次。只补一次:真故障不该靠
+    // 反复重查续命,fail-closed 的结论不能被「多试几轮」稀释。
+    @Published private(set) var startupRaceHint = ""
+    private var startupRaceHandled = false
+    private var startupRacePending: DispatchWorkItem?
+    /// 重查延迟。测试调小;生产 75 秒落在「代理仍在启动」的典型窗口(30~90s)中段。
+    static var startupRaceRetryDelay: TimeInterval = 75
+    /// 出口身份类行(显示名)。竞态撞上的就是这几项:出口 IP 直接 fail,
+    /// 一致性/ASN/纯净度跟着异常。DNS/WebRTC 是隐私面,不参与这个判定。
+    static let startupRaceExitRows: Set<String> = ["出口 IP", "IP 与上次一致", "ASN 属性", "IP 纯净度"]
     /// 巡检是不是正守着。界面上的「驻守中」呼吸动画只看这一个开关。
     @Published private(set) var guarding = false
     /// 本次驻守从什么时候开始。用来显示「已驻守 2 小时 14 分」。
@@ -869,6 +884,10 @@ final class VM: ObservableObject {
 
     func refresh() {
         guard !isBusy else { return }
+        // 用户自己点了重新检查,挂着的启动竞态重查就该撤:再触发就是重复检查。
+        startupRacePending?.cancel()
+        startupRacePending = nil
+        startupRaceHint = ""
         hideAfterSwitch?.cancel()
         // 重新检查前先撤掉旧的守护:否则它会在检查过程中按旧结论把 Claude 关掉。
         stopWatch()
@@ -883,6 +902,31 @@ final class VM: ObservableObject {
         if !coreAvailable() { markCoreMissing(); return }
         isBusy = true
         checkEnvironment { _ in self.isBusy = false }
+    }
+
+    /// 首查收尾时判定是否启动竞态,满足就提示并调度一次延迟重查。
+    /// 条件刻意收窄:只认「首查落定 + 代理内核 ok + 出口身份类有 fail」。
+    /// 内核自己都 fail 时重查毫无意义;非首轮的 fail 是真实环境变化,该让用户看。
+    func scheduleStartupRaceRetryIfNeeded(firstSettled: Bool) {
+        guard firstSettled, !startupRaceHandled else { return }
+        let coreOK = rows.first(where: { $0.name == "代理内核" })?.state == .ok
+        let failedExits = rows
+            .filter { Self.startupRaceExitRows.contains($0.name) && $0.state == .fail }
+            .map(\.name)
+        guard coreOK, !failedExits.isEmpty else { return }
+        startupRaceHandled = true
+        let seconds = Int(Self.startupRaceRetryDelay)
+        startupRaceHint = "代理可能仍在启动中（\(failedExits.joined(separator: "、"))未通过），\(seconds) 秒后自动重查一次"
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.startupRacePending = nil
+            // 到点时用户正在忙(修复/切换/手动重查),这次补查作废,不往忙线上插队。
+            guard !self.isBusy else { self.startupRaceHint = ""; return }
+            self.startupRaceHint = ""
+            self.refresh()
+        }
+        startupRacePending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.startupRaceRetryDelay, execute: work)
     }
 
     // ---- 运行期巡检 ----
@@ -1387,6 +1431,9 @@ final class VM: ObservableObject {
     /// 两条解析路径汇合后的共用收尾:巡检、摘要、账号状态。
     private func finishCheck(passed: Bool, configRows: [String], failedRows: [String],
                              reportBacked: Bool, done: @escaping (Bool) -> Void) {
+        // 先记下「这是不是首轮落定」:下一行就会把 hasSettledOnce 置真,
+        // 启动竞态判定要的是查之前的状态,不是收尾之后的状态。
+        let firstSettled = !hasSettledOnce
         // 通过之后才开守护;不通过时把旧的撤掉,免得它拿旧结论继续放行。
         if passed { startWatch() } else { stopWatch() }
         lastCheckSummary = passed
@@ -1433,6 +1480,8 @@ final class VM: ObservableObject {
                 // 界面看起来像永远没查完。
                 self.rechecking = []
                 self.hasSettledOnce = true
+                // 首查撞上代理启动窗口期(出口 fail、内核 ok):提示 + 延迟补查一次。
+                self.scheduleStartupRaceRetryIfNeeded(firstSettled: firstSettled)
                 // 这一轮刚往 rtt.log 追加了一条采样,顺手读回来 ——
                 // 不读的话洞察窗要等下次刷新才看到新点。
                 self.loadRTT()
@@ -3637,6 +3686,22 @@ struct ContentView: View {
     private var noticeStrip: AnyView? {
         if vm.isBusy && !vm.banner.isEmpty && (vm.phase == .fixing || vm.phase == .switching) {
             return nil   // hero 已经把这句说清楚了,不重复
+        }
+        if !vm.startupRaceHint.isEmpty {
+            return AnyView(
+                HStack(spacing: 10) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(Type.microLabelFont)
+                        .foregroundColor(ClaudeTheme.brand)
+                    Text(vm.startupRaceHint)
+                        .font(Type.bodyFont)
+                        .foregroundColor(ClaudeTheme.ink)
+                    Spacer(minLength: 8)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(ClaudeTheme.inset)
+            )
         }
         if !vm.fixNotice.isEmpty {
             return AnyView(

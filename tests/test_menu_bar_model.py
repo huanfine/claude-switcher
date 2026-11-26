@@ -44,6 +44,10 @@ SCENARIOS = (
     "announcements_unread_and_critical_gate",
     # 菜单栏品牌图标：两态同一枚盾牌 + Claude 星芒，拦截态额外感叹号徽章
     "menu_bar_brand_icon",
+    # 启动竞态补查:首查出口 fail+内核 ok 挂提示并只补查一次;内核 fail 不补、
+    # 非首轮不补、手动重查撤销挂着的补查
+    "startup_race_schedules_retry", "startup_race_needs_core_ok",
+    "startup_race_manual_refresh_cancels",
 )
 
 
