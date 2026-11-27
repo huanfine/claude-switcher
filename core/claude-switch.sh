@@ -5931,6 +5931,16 @@ self_update() {
         rm -rf "$tmpd"; return 0
     fi
 
+    # 回归基线:换核心**之前**,用旧核心把各项状态快照下来。自检随后改成
+    # 「回归对比」——只有「旧核心 ok 的项,新核心跑出 fail」才回滚。2026-11-20~27
+    # 他机实测教训:地区漂移一项 fail 就把更新回滚了 7 天 14+ 轮;DNS泄露=fail
+    # 更是自锁——能修它的核心(新核心才有这项检查和修复)因为它的存在装不上。
+    # 环境问题回滚解决不了:旧核心 fail 的项,装回旧核心照样 fail。
+    baseline=""
+    if [ -f "$BIN/claude-switch.sh" ]; then
+        baseline=$("${BASH:-/bin/bash}" "$BIN/claude-switch.sh" checkdetail 2>/dev/null || true)
+    fi
+
     # 备份现有核心脚本
     [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
 
@@ -5966,19 +5976,55 @@ self_update() {
     fi
     rm -rf "$tmpd"
 
-    # 更新后自检:root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
+    # 更新后自检(回归对比):root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
     if [ "$(id -u)" -eq 0 ]; then
         owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
         if [ -n "$owner" ]; then out=$(sudo -H -u "$owner" "$BIN/claude-switch.sh" checkdetail 2>&1); else out=""; fi
     else
         out=$("$BIN/claude-switch.sh" checkdetail 2>&1)
     fi
-    if [ -z "$out" ] || echo "$out" | grep -q '=fail'; then
+    # 「无输出」仍然回滚:一行结论都拿不到说明新核心本身起不来,与环境无关。
+    if [ -z "$out" ]; then
         [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
-        echo "FAIL:新版自检未通过,已自动回滚"
+        printf '%s|%s\n' "$(date '+%F %T')" "自检无输出" > "$BASE/update-rollback.txt" 2>/dev/null
+        chmod 600 "$BASE/update-rollback.txt" 2>/dev/null
+        echo "FAIL:新版自检无输出,已自动回滚"
         return 1
     fi
-    echo "OK:更新完成 $(date '+%Y-%m-%d')"
+    # 回归判定:逐项比对新核心与基线。只有「基线 ok → 新核心 fail」才回滚;
+    # 基线 fail/warn/skip/config 的项(环境漂移、旧核心同样 fail)和基线里
+    # 没有的新检查项(旧核心看不见,回滚只会让它继续没人管)都不阻塞更新,
+    # 但要如实交代,不能静默。
+    regressed=""; new_fails=""
+    while IFS= read -r line; do
+        case "$line" in *=*) ;; *) continue ;; esac
+        item=${line%%=*}
+        state=${line#*=}; state=${state%%:*}
+        [ -n "$item" ] && [ "$state" = "fail" ] || continue
+        new_fails="${new_fails}${item}、"
+        if [ -n "$baseline" ]; then
+            bstate=$(printf '%s\n' "$baseline" | awk -F= -v k="$item" '$1==k{sub(/:.*/,"",$2); print $2; exit}')
+        else
+            bstate="ok"  # 旧核心跑不出基线(缺文件/起不来):退回保守一票否决
+        fi
+        [ "$bstate" = "ok" ] && regressed="${regressed}${item}、"
+    done <<< "$out"
+    if [ -n "$regressed" ]; then
+        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+        regressed=${regressed%、}
+        printf '%s|%s\n' "$(date '+%F %T')" "新核心让原本 ok 的项失败了:${regressed}" > "$BASE/update-rollback.txt" 2>/dev/null
+        chmod 600 "$BASE/update-rollback.txt" 2>/dev/null
+        echo "FAIL:新核心让原本 ok 的项失败了(${regressed}),已自动回滚"
+        return 1
+    fi
+    # 成功即清掉上一次的回滚痕迹:App 靠这个文件的存在展示「上次更新被回滚」。
+    rm -f "$BASE/update-rollback.txt" 2>/dev/null
+    if [ -n "$new_fails" ]; then
+        new_fails=${new_fails%、}
+        echo "OK:更新完成(注意:${new_fails} 仍为 fail——旧核心同样 fail 或本次首次检出,属环境问题而非新核心退化,不回滚;可点一键修复)"
+    else
+        echo "OK:更新完成 $(date '+%Y-%m-%d')"
+    fi
     return 0
 }
 

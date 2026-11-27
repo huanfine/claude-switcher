@@ -472,6 +472,11 @@ final class VM: ObservableObject {
     @Published private(set) var lastCheckSummary = "尚未检查"
     @Published var updateText = ""
     @Published var showUpdateSheet = false
+    /// 上次自动更新被回滚的痕迹(核心写 ~/.claude-switcher/update-rollback.txt,
+    /// 更新成功即删除)。没有它,回滚只有 exit=1 一条日志,用户永远不知道
+    /// 自己的机器为什么一直停在旧核心上——2026-11-27 他机实测:环境 fail
+    /// 一票否决的自检让更新静默回滚了 7 天。
+    @Published private(set) var updateRollbackNotice: String?
     /// 公告:critical 未读且过限频时由 store 回调置真,弹公告页(24h 至多一次)。
     @Published var showCriticalNotice = false
     /// 公告仓库:启动读缓存渲染,后台调核心 `announcements check` 刷新(TTL 内不打网络)。
@@ -882,6 +887,23 @@ final class VM: ObservableObject {
         incidents = parsed.reversed()
     }
 
+    /// 读上次更新回滚的痕迹。文件由核心在回滚时写、更新成功时删,
+    /// 所以「文件在」=「最后一次更新尝试失败了」。读不到就清提示,
+    /// 下一次刷新自然跟上核心那边的变化。
+    func loadUpdateRollback() {
+        let path = NSHomeDirectory() + "/.claude-switcher/update-rollback.txt"
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let line = raw.split(separator: "\n").last,
+              !line.isEmpty else {
+            updateRollbackNotice = nil
+            return
+        }
+        // 行格式:时间|原因。原因可能自带细节(哪些项退化了)。
+        let parts = line.split(separator: "|", maxSplits: 1).map(String.init)
+        let reason = parts.count == 2 ? parts[1] : String(line)
+        updateRollbackNotice = "上次自动更新被回滚：\(reason)。点「检查更新」可手动重试，环境修好后会自动恢复更新"
+    }
+
     func refresh() {
         guard !isBusy else { return }
         // 用户自己点了重新检查,挂着的启动竞态重查就该撤:再触发就是重复检查。
@@ -899,6 +921,7 @@ final class VM: ObservableObject {
         stopReason = ""
         loadIncidents()
         loadRTT()
+        loadUpdateRollback()
         if !coreAvailable() { markCoreMissing(); return }
         isBusy = true
         checkEnvironment { _ in self.isBusy = false }
@@ -3697,6 +3720,29 @@ struct ContentView: View {
                         .font(Type.bodyFont)
                         .foregroundColor(ClaudeTheme.ink)
                     Spacer(minLength: 8)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(ClaudeTheme.inset)
+            )
+        }
+        if let rollback = vm.updateRollbackNotice {
+            return AnyView(
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
+                        .font(Type.microLabelFont)
+                        .foregroundColor(ClaudeTheme.brand)
+                    Text(rollback)
+                        .font(Type.bodyFont)
+                        .foregroundColor(ClaudeTheme.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button { vm.checkUpdate(); vm.showUpdateSheet = true } label: {
+                        Text("检查更新")
+                            .font(Type.labelFont)
+                            .foregroundColor(ClaudeTheme.brandText)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 9)

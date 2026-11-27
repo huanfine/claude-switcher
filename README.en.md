@@ -112,9 +112,15 @@ repository, command-line script, and build artifact name.
   Fallback` that only holds two fixed IPs), the scan reports a conclusion
   instead of an error: no manually comparable candidates, keep the current
   state — switching there just swaps the exit IP.
-- **Automatic updates** — a user-level LaunchAgent checks every 12 hours,
-  verifies artifact hashes against `SHA256SUMS`, and rolls back if the
-  post-update self-check fails. `touch ~/.claude-switcher/update-hold`
+- **Automatic updates** — a user-level LaunchAgent checks every 12 hours
+  and verifies artifact hashes against `SHA256SUMS`. The post-update
+  self-check is a **regression comparison**: a baseline is captured with the
+  old core first, and an update only rolls back when an item that used to be
+  `ok` fails under the new core. Problems the environment already had (or
+  ones only the new core can detect) do not block the update — they are
+  reported honestly instead, and a rollback reason is written to
+  `~/.claude-switcher/update-rollback.txt` (the app shows an
+  "update was rolled back" notice). `touch ~/.claude-switcher/update-hold`
   makes the automatic updater report without touching anything
   (a manual `update` still runs).
 - **Diagnostics and inspection** — standalone proxy transport diagnosis, device
