@@ -253,12 +253,23 @@ exec /bin/mv "$@"
 # bash 函数定义在调用时解析,后定义者胜出,于是基线(旧核心)与自检(新核心)
 # 各自输出我们指定的固定行,不必跑真探测。
 DISPATCH_ANCHOR = 'operation="${1:-}"'
+CHECK_NAMES = (
+    "代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
+    "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度", "生态可达性",
+    "DNS泄露",
+)
 
 
-def inject_checkdetail(content, lines):
+def audit_lines(overrides=None, omit=()):
+    states = {name: "ok:fixture" for name in CHECK_NAMES}
+    states.update(overrides or {})
+    return [f"{name}={states[name]}" for name in CHECK_NAMES if name not in omit]
+
+
+def inject_checkdetail(content, lines, exit_code=0):
     override = "checkdetail(){ printf '%s\\n' " + " ".join(
-        f"'{line}'" for line in lines) + "; }"
-    assert DISPATCH_ANCHOR in content, "dispatch 锚点不在核心里,sed 注入会失效"
+        f"'{line}'" for line in lines) + f"; return {exit_code}; }}"
+    assert DISPATCH_ANCHOR in content, "dispatch 锚点不在核心里,注入会失效"
     return content.replace(DISPATCH_ANCHOR, DISPATCH_ANCHOR + "\n" + override, 1)
 
 
@@ -327,10 +338,9 @@ class SelfCheckRegressionTests(unittest.TestCase):
         痕迹文件是 App「上次更新被回滚」提示的唯一事实来源——没有它,
         回滚只剩 exit=1 一条日志,用户永远不知道机器为什么停在旧核心。
         """
-        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"),
-                                   ["代理内核=ok:基线通过"])
+        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines())
         remote = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"),
-                                    ["代理内核=fail:注入的真退化"])
+                                    audit_lines({"代理内核": "fail:注入的真退化"}))
         self.install_local(local)
         self.serve_remote(remote)
         run = self.run_update()
@@ -351,15 +361,13 @@ class SelfCheckRegressionTests(unittest.TestCase):
         """
         record = self.home / ".claude-switcher" / "update-rollback.txt"
         record.write_text("2026-11-20 20:54:22|地区=fail(旧逻辑的历史回滚)", encoding="utf-8")
+        baseline_states = {"代理内核": "fail:环境本来就坏",
+                           "地区": "fail:漂移,两边都一样", "ASN属性": "warn:照旧"}
+        remote_states = dict(baseline_states, **{"DNS泄露": "fail:新核心首次检出"})
         local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"),
-                                   ["代理内核=fail:环境本来就坏",
-                                    "地区=fail:漂移,两边都一样",
-                                    "ASN属性=warn:照旧"])
+                                   audit_lines(baseline_states, omit=("DNS泄露",)))
         remote = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"),
-                                    ["代理内核=fail:环境本来就坏",
-                                     "地区=fail:漂移,两边都一样",
-                                     "ASN属性=warn:照旧",
-                                     "DNS泄露=fail:新核心首次检出"])
+                                    audit_lines(remote_states))
         self.install_local(local)
         self.serve_remote(remote)
         run = self.run_update()
@@ -370,6 +378,88 @@ class SelfCheckRegressionTests(unittest.TestCase):
                          "更新没有落地:本地核心应已是远端内容")
         self.assertIn("DNS泄露", combined, "首次检出的 fail 要如实交代,不能静默")
         self.assertFalse(record.exists(), "更新成功后必须清掉回滚痕迹")
+
+    def test_environment_migration_failure_rolls_back(self):
+        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines())
+        remote_source = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines())
+        marker = 'elif action == "env-migrate" and len(args) == 2:'
+        self.assertIn(marker, remote_source)
+        remote_source = remote_source.replace(
+            marker, marker + '\n        fail("fixture migration failure")', 1)
+        self.install_local(local)
+        self.serve_remote(remote_source)
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"), local)
+        self.assertIn("环境配置迁移失败", self.rollback_record())
+
+    def test_nonzero_self_check_rolls_back_even_with_valid_json(self):
+        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines())
+        remote = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"),
+                                    audit_lines(), exit_code=7)
+        self.install_local(local)
+        self.serve_remote(remote)
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"), local)
+        self.assertIn("退出码非零", run.stdout)
+
+    def test_partial_json_report_rolls_back(self):
+        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines())
+        remote = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"),
+                                    audit_lines(omit=("DNS泄露",)))
+        self.install_local(local)
+        self.serve_remote(remote)
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"), local)
+        self.assertIn("报告契约无效", run.stdout)
+
+    def test_ok_to_config_is_regression(self):
+        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines())
+        remote = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"),
+                                    audit_lines({"地区": "config:环境层未就绪"}))
+        self.install_local(local)
+        self.serve_remote(remote)
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"), local)
+        self.assertIn("地区", self.rollback_record())
+
+    def test_preexisting_config_does_not_block_update(self):
+        states = {"地区": "config:环境层未就绪"}
+        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines(states))
+        remote = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines(states))
+        self.install_local(local)
+        self.serve_remote(remote)
+        run = self.run_update()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"), remote)
+
+    def test_duplicate_report_rows_roll_back(self):
+        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines())
+        remote = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"),
+                                    audit_lines() + ["地区=ok:重复行"])
+        self.install_local(local)
+        self.serve_remote(remote)
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"), local)
+        self.assertIn("报告契约无效", run.stdout)
+
+    def test_wrong_report_fingerprint_rolls_back(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        before, marker, after = source.rpartition('"config_fingerprint": fingerprint,')
+        self.assertTrue(marker, "报告指纹字段不在核心里")
+        source = before + '"config_fingerprint": "0" * 64,' + after
+        local = inject_checkdetail(SCRIPT.read_text(encoding="utf-8"), audit_lines())
+        remote = inject_checkdetail(source, audit_lines())
+        self.install_local(local)
+        self.serve_remote(remote)
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"), local)
+        self.assertIn("报告契约无效", run.stdout)
 
 
 if __name__ == "__main__":

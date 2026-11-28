@@ -95,7 +95,7 @@ class ReportTests(unittest.TestCase):
             "%s=skip:用户已禁用\n" % name for name in
             ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
              "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "IP纯净度",
-             "生态可达性", "更优节点")))
+             "生态可达性", "DNS泄露")) + "未来检查=ok:未知项不能替代稳定检查\n")
         self.assertEqual(doc["verdict"], "incomplete")
         self.assertEqual(doc["summary"]["skipped"], 16)
 

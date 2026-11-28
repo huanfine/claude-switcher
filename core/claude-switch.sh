@@ -604,7 +604,8 @@ def build_report(text, core_path=""):
     evidence_missing = [item["name"] for item in checks
                         if item["critical"] and item["state"] == "ok"
                         and not item["evidence"]]
-    verified = [item for item in checks if item["state"] in ("ok", "warn")]
+    verified = [item for item in checks if item.get("known") is True
+                and item["state"] in ("ok", "warn")]
     if duplicates or blockers:
         verdict = "violated"
     elif not verified or missing_critical:
@@ -672,6 +673,132 @@ def build_report(text, core_path=""):
                         "drill": drill}} if probes or drill else {})),
     }
 
+
+
+def validate_update_report(document, core_path, now=None):
+    if not isinstance(document, dict):
+        raise ValueError("报告必须是 JSON 对象")
+    if document.get("schema") != REPORT_SCHEMA or document.get("protocol") != REPORT_PROTOCOL:
+        raise ValueError("报告 schema 或 protocol 不匹配")
+    if not isinstance(document.get("report_id"), str) or not document["report_id"]:
+        raise ValueError("报告缺少 report_id")
+    checks = document.get("checks")
+    if not isinstance(checks, list):
+        raise ValueError("报告 checks 必须是列表")
+    specs = {cid: (name, critical) for cid, name, critical in CHECK_SPECS}
+    seen, seen_names, by_id = set(), set(), {}
+    for item in checks:
+        if not isinstance(item, dict):
+            raise ValueError("检查项必须是对象")
+        cid = item.get("id")
+        if not isinstance(cid, str) or not cid or cid in seen:
+            raise ValueError("检查项 ID 为空或重复")
+        seen.add(cid)
+        if item.get("state") not in ("ok", "warn", "fail", "skip", "config"):
+            raise ValueError("检查项状态无效: " + cid)
+        if not isinstance(item.get("name"), str) or not item["name"]:
+            raise ValueError("检查项缺少名称: " + cid)
+        if item["name"] in seen_names:
+            raise ValueError("检查项名称重复: " + item["name"])
+        seen_names.add(item["name"])
+        if cid in specs:
+            name, critical = specs[cid]
+            if item["name"] != name or item.get("critical") is not critical:
+                raise ValueError("检查项名称或关键性不匹配: " + cid)
+            if item.get("known") is not True:
+                raise ValueError("稳定检查项缺少 known 标记: " + cid)
+        by_id[cid] = item
+    missing = [cid for cid, _, _ in CHECK_SPECS if cid not in by_id]
+    if missing:
+        labels = [cid + "(" + specs[cid][0] + ")" for cid in missing]
+        raise ValueError("报告缺少稳定检查项: " + ",".join(labels))
+
+    ordered = [by_id[cid] for cid, _, _ in CHECK_SPECS if cid in by_id]
+    ordered.extend(item for cid, item in by_id.items() if cid not in specs)
+    blockers = [item["name"] for item in ordered if item["state"] in ("fail", "config")]
+    critical_blockers = [item["name"] for item in ordered
+                         if item.get("critical") is True and item["state"] in ("fail", "config")]
+    advisories = [item["name"] for item in ordered if item["state"] == "warn"]
+    skipped = [item["name"] for item in ordered if item["state"] == "skip"]
+    evidence_missing = [item["name"] for item in ordered
+                        if item.get("critical") is True and item["state"] == "ok"
+                        and not item.get("evidence")]
+    verified = [item for item in ordered if item.get("known") is True
+                and item["state"] in ("ok", "warn")]
+    expected_names = [name for _, name, _ in CHECK_SPECS]
+    present_names = {item["name"] for item in ordered}
+    missing_names = [name for name in expected_names if name not in present_names]
+    missing_critical = [name for _, name, critical in CHECK_SPECS
+                        if critical and name not in present_names]
+    if not isinstance(document.get("summary"), dict):
+        raise ValueError("报告缺少 summary")
+    duplicates = document["summary"].get("duplicates", [])
+    if duplicates:
+        raise ValueError("报告存在重复检查项")
+    if missing_names or missing_critical:
+        raise ValueError("报告检查项不完整")
+    verdict = "violated" if blockers else ("incomplete" if not verified else "established")
+    if verdict == "incomplete":
+        raise ValueError("报告没有已验证的检查项")
+    if document.get("verdict") != verdict:
+        raise ValueError("报告 verdict 与检查项不一致")
+    computed = {
+        "expected": len(CHECK_SPECS), "total": len(ordered),
+        "passed": sum(1 for item in ordered if item["state"] == "ok"),
+        "warning": len(advisories),
+        "failed": sum(1 for item in ordered if item["state"] == "fail"),
+        "config": sum(1 for item in ordered if item["state"] == "config"),
+        "skipped": len(skipped), "blockers": blockers,
+        "critical_blockers": critical_blockers, "advisories": advisories,
+        "skipped_names": skipped, "missing": missing_names,
+        "missing_critical": missing_critical, "evidence_missing": evidence_missing,
+        "duplicates": [], "unknown": [item["name"] for item in ordered
+                                      if item.get("known") is not True],
+    }
+    for key, value in computed.items():
+        if document["summary"].get(key) != value:
+            raise ValueError("报告 summary 不一致: " + key)
+
+    now = now or datetime.datetime.now().astimezone()
+    try:
+        created = parse_timestamp(document.get("created_at"))
+        expires = parse_timestamp(document.get("expires_at"))
+    except ValueError:
+        raise ValueError("报告时间格式无效")
+    if expires <= created or expires <= now:
+        raise ValueError("报告已过期或有效期无效")
+    try:
+        environment = env_read()
+    except ValueError:
+        environment = {}
+    config = report_config()
+    fingerprint, core_sha = report_fingerprint(environment, config, core_path)
+    if not core_sha or document.get("core_sha256") != core_sha:
+        raise ValueError("报告核心哈希不匹配")
+    if document.get("config_fingerprint") != fingerprint:
+        raise ValueError("报告配置指纹不匹配")
+    reported_env = document.get("environment")
+    if not isinstance(reported_env, dict):
+        raise ValueError("报告缺少 environment")
+    for key in ("proxy_mode", "proxy_group", "country", "timezone", "locale"):
+        if reported_env.get(key, "") != environment.get(key, ""):
+            raise ValueError("报告环境值不匹配: " + key)
+    return document
+
+
+def update_regression(baseline_text, document, core_path):
+    validate_update_report(document, core_path)
+    baseline, duplicates = parse_report_checks(baseline_text)
+    if duplicates or not baseline:
+        raise ValueError("基线检查项为空或重复")
+    states = {item["name"]: item["state"] for item in baseline if item.get("known")}
+    current = {item["name"]: item["state"] for item in document["checks"]
+               if item.get("known")}
+    regressed = [name for _, name, _ in CHECK_SPECS
+                 if states.get(name) == "ok" and current.get(name) in ("fail", "config")]
+    new_fails = [name for _, name, _ in CHECK_SPECS
+                 if current.get(name) in ("fail", "config")]
+    return regressed, new_fails
 
 def write_log(args):
     config = load_config()
@@ -955,6 +1082,22 @@ def main(args):
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(doc, ensure_ascii=False, indent=2) + "\n")
         print("OK:" + str(out))
+    elif action == "validate-update-report" and len(args) == 3:
+        try:
+            document = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+            validate_update_report(document, args[2])
+        except (OSError, UnicodeError, ValueError) as error:
+            fail(str(error))
+        print("OK:更新自检报告契约有效")
+    elif action == "update-regression" and len(args) == 4:
+        try:
+            baseline = Path(args[1]).read_text(encoding="utf-8")
+            document = json.loads(Path(args[2]).read_text(encoding="utf-8"))
+            regressed, new_fails = update_regression(baseline, document, args[3])
+        except (OSError, UnicodeError, ValueError) as error:
+            fail(str(error))
+        print("REGRESSED=" + ",".join(regressed))
+        print("NEW_FAILS=" + ",".join(new_fails))
     elif action == "report" and len(args) in (1, 2, 3):
         # 只读转换:不重新探测,不修改 last-check.txt。
         path = Path(args[1]) if len(args) >= 2 and args[1] else paths()[0] / "last-check.txt"
@@ -5971,14 +6114,28 @@ PY
         rm -rf "$tmpd"; return 0
     fi
 
-    # 回归基线:换核心**之前**,用旧核心把各项状态快照下来。自检随后改成
-    # 「回归对比」——只有「旧核心 ok 的项,新核心跑出 fail」才回滚。2026-11-20~27
-    # 他机实测教训:地区漂移一项 fail 就把更新回滚了 7 天 14+ 轮;DNS泄露=fail
-    # 更是自锁——能修它的核心(新核心才有这项检查和修复)因为它的存在装不上。
-    # 环境问题回滚解决不了:旧核心 fail 的项,装回旧核心照样 fail。
-    baseline=""
+    # 基线必须由旧核心在真实用户身份下取得;空基线不能当作「原本全部 ok」。
+    owner=""
+    if [ "$(id -u)" -eq 0 ]; then
+        owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
+        if [ -z "$owner" ]; then
+            echo "FAIL:无法确定更新所属用户,已中止"; rm -rf "$tmpd"; return 1
+        fi
+    fi
+    baseline=""; baseline_rc=1
     if [ -f "$BIN/claude-switch.sh" ]; then
-        baseline=$("${BASH:-/bin/bash}" "$BIN/claude-switch.sh" checkdetail 2>/dev/null || true)
+        if [ "$(id -u)" -eq 0 ]; then
+            if baseline=$(sudo -H -u "$owner" "${BASH:-/bin/bash}" "$BIN/claude-switch.sh" checkdetail 2>/dev/null); then
+                baseline_rc=0
+            fi
+        else
+            if baseline=$("${BASH:-/bin/bash}" "$BIN/claude-switch.sh" checkdetail 2>/dev/null); then
+                baseline_rc=0
+            fi
+        fi
+    fi
+    if [ "$baseline_rc" -ne 0 ] || [ -z "$baseline" ]; then
+        echo "FAIL:无法取得可信的更新回归基线,已中止"; rm -rf "$tmpd"; return 1
     fi
 
     # 同目录候选保证 rename 不跨文件系统;正式核心只由一次原子换装覆盖。
@@ -6010,6 +6167,16 @@ PY
         fi
         printf '%s|core|%s\n' "$(date '+%F %T')" "$reason" > "$BASE/update-rollback.txt" || return 1
         chmod 600 "$BASE/update-rollback.txt" || return 1
+    }
+    rollback_update() {
+        local reason="$1"
+        if rollback_core "$reason"; then
+            echo "FAIL:$reason,已自动回滚"
+        else
+            echo "FAIL:$reason;回滚未完成,旧核心备份保留在 $BIN/claude-switch.sh.bak"
+        fi
+        rm -rf "$tmpd"
+        return 1
     }
 
     if [ -L "$BIN/claude-switch.sh.bak" ] || \
@@ -6048,8 +6215,9 @@ PY
     candidate=""; installed=1
     PM=""; PG=""; CT=""; TZV=""; LCT=""
     if [ -f "$BIN/claude-switch.sh.bak" ]; then
-        "${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support env-migrate "$BIN/claude-switch.sh.bak" >/dev/null 2>&1 || \
-            echo "WARN:环境配置迁移失败,请运行 claude-switch.sh env-set 手动补齐"
+        if ! "${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support env-migrate "$BIN/claude-switch.sh.bak" >/dev/null 2>&1; then
+            rollback_update "环境配置迁移失败" || return 1
+        fi
     fi
     envdump=$("${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support env 2>/dev/null)
     PM=$(printf '%s\n' "$envdump" | sed -n 's/^proxy_mode=//p')
@@ -6071,53 +6239,48 @@ PY
             echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
         fi
     fi
-    rm -rf "$tmpd"
+    update_support() {
+        if [ "$(id -u)" -eq 0 ] && [ -n "$owner" ]; then
+            sudo -H -u "$owner" "${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support "$@"
+        else
+            "${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support "$@"
+        fi
+    }
 
-    # 更新后自检(回归对比):root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
-    if [ "$(id -u)" -eq 0 ]; then
-        owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
-        if [ -n "$owner" ]; then out=$(sudo -H -u "$owner" "$BIN/claude-switch.sh" checkdetail 2>&1); else out=""; fi
+    # JSON 正文与进度诊断分文件接收,任一路混入另一路都会让契约校验失败。
+    selfcheck_stdout="$tmpd/new-report.json"
+    selfcheck_stderr="$tmpd/new-check.err"
+    if [ "$(id -u)" -eq 0 ] && [ -n "$owner" ]; then
+        if sudo -H -u "$owner" "$BIN/claude-switch.sh" checkdetail --json \
+            >"$selfcheck_stdout" 2>"$selfcheck_stderr"; then
+            selfcheck_rc=0
+        else
+            selfcheck_rc=$?
+        fi
     else
-        out=$("$BIN/claude-switch.sh" checkdetail 2>&1)
-    fi
-    # 「无输出」仍然回滚:一行结论都拿不到说明新核心本身起不来,与环境无关。
-    if [ -z "$out" ]; then
-        if rollback_core "新版自检无输出"; then
-            echo "FAIL:新版自检无输出,已自动回滚"
+        if "$BIN/claude-switch.sh" checkdetail --json \
+            >"$selfcheck_stdout" 2>"$selfcheck_stderr"; then
+            selfcheck_rc=0
         else
-            echo "FAIL:新版自检无输出;回滚未完成,旧核心备份保留在 $BIN/claude-switch.sh.bak"
+            selfcheck_rc=$?
         fi
-        return 1
     fi
-    # 回归判定:逐项比对新核心与基线。只有「基线 ok → 新核心 fail」才回滚;
-    # 基线 fail/warn/skip/config 的项(环境漂移、旧核心同样 fail)和基线里
-    # 没有的新检查项(旧核心看不见,回滚只会让它继续没人管)都不阻塞更新,
-    # 但要如实交代,不能静默。
-    regressed=""; new_fails=""
-    while IFS= read -r line; do
-        case "$line" in *=*) ;; *) continue ;; esac
-        item=${line%%=*}
-        state=${line#*=}; state=${state%%:*}
-        [ -n "$item" ] && [ "$state" = "fail" ] || continue
-        new_fails="${new_fails}${item}、"
-        if [ -n "$baseline" ]; then
-            bstate=$(printf '%s\n' "$baseline" | awk -F= -v k="$item" '$1==k{sub(/:.*/,"",$2); print $2; exit}')
-        else
-            bstate="ok"  # 旧核心跑不出基线(缺文件/起不来):退回保守一票否决
-        fi
-        [ "$bstate" = "ok" ] && regressed="${regressed}${item}、"
-    done <<< "$out"
+    [ "$selfcheck_rc" -eq 0 ] || rollback_update "新版自检退出码非零($selfcheck_rc)" || return 1
+    if ! update_support validate-update-report "$selfcheck_stdout" "$BIN/claude-switch.sh" >/dev/null; then
+        rollback_update "新版自检报告契约无效" || return 1
+    fi
+    printf '%s\n' "$baseline" > "$tmpd/baseline.txt" || rollback_update "无法保存更新回归基线" || return 1
+    if ! regression=$(update_support update-regression "$tmpd/baseline.txt" \
+        "$selfcheck_stdout" "$BIN/claude-switch.sh"); then
+        rollback_update "新版自检基线或回归判定无效" || return 1
+    fi
+    regressed=$(printf '%s\n' "$regression" | sed -n 's/^REGRESSED=//p')
+    new_fails=$(printf '%s\n' "$regression" | sed -n 's/^NEW_FAILS=//p')
     if [ -n "$regressed" ]; then
-        regressed=${regressed%/}
-        reason="新核心让原本 ok 的项失败了:${regressed}"
-        if rollback_core "$reason"; then
-            echo "FAIL:$reason,已自动回滚"
-        else
-            echo "FAIL:$reason;回滚未完成,旧核心备份保留在 $BIN/claude-switch.sh.bak"
-        fi
-        return 1
+        rollback_update "新核心让原本 ok 的项失败或配置退化:${regressed}" || return 1
     fi
     cleanup_update_files
+    rm -rf "$tmpd"
     # 成功即清掉上一次的回滚痕迹:App 靠这个文件的存在展示「上次更新被回滚」。
     rm -f "$BASE/update-rollback.txt" 2>/dev/null
     if [ -n "$new_fails" ]; then
@@ -7742,9 +7905,9 @@ case "$operation" in
             {
                 echo "# $(date '+%F %T') pid=$$ 开始"
                 checkdetail
-                rc=$?
                 echo "# 结束"
             } 2>&1 | tee "$OUT_FILE"
+            rc=${PIPESTATUS[0]}
             # 输出里有出口 IP;umask 077 只影响新文件,老安装留下的 644 在这里一并收紧。
             chmod 600 "$OUT_FILE" 2>/dev/null || true
             summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip|config)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
@@ -7794,7 +7957,7 @@ case "$operation" in
             if [ "${2:-}" = "--auto" ]; then app_self_update --auto ""; fi
         else
             rc=$?
-            return "$rc"
+            exit "$rc"
         fi ;;
     update-check) self_update --check; app_self_update "" "--check" ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     announcements) announcements_check "${2:-}" ;;  # 公告:check [--force] / read
@@ -7815,7 +7978,10 @@ case "$operation" in
         echo "运行 claude-switch.sh help 查看全部命令" >&2
         exit 2 ;;
 esac
-rc=$?
+case "$operation" in
+    checkdetail) ;;
+    *) rc=$? ;;
+esac
 case "$operation" in
     get-check-config|set-check-config|export-diagnostics) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
