@@ -7089,7 +7089,8 @@ open_safe() {
 # 加密归档降级格式:当 DiskImages 服务异常(create/attach/verify 全部卡住或
 # 报 Resource busy)时,不再赌 hdiutil,改用 openssl + tar。文件仍沿用用户给定
 # 的路径,靠首行 magic 与 DMG 区分;导入端两种都认。
-SNAPSHOT_ARCHIVE_MAGIC="CLAUDE-SWITCHER-ARCHIVE-1"
+SNAPSHOT_ARCHIVE_MAGIC="CLAUDE-SWITCHER-ARCHIVE-2"
+SNAPSHOT_ARCHIVE_MAGIC_V1="CLAUDE-SWITCHER-ARCHIVE-1"
 
 # ---------- 快照导出/导入辅助 ----------
 # hdiutil 在部分系统版本上会卡住(实测 macOS 27 的 `create -srcfolder` 既可能
@@ -7140,8 +7141,179 @@ _snapshot_detach() {
     ! _snapshot_mounted "$real"
 }
 
-# 把 stage 目录写成 "magic + AES-256-CBC(tar.gz)"。密码走 stdin 第一行,
-# 不落 argv;PBKDF2 迭代次数写死在命令里,避免不同机器导出/导入参数不一致。
+# 认证封装先校验 HMAC,再解密;密码经独立 fd 传给 Python 与 openssl。
+_snapshot_archive_v2() {
+    local action="$1" input="$2" output="$3" tmo="$4"
+    command -v "${CLAUDE_SWITCHER_PYTHON:-python3}" >/dev/null 2>&1 || return 1
+    _snapshot_timeout "$tmo" "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$action" "$input" "$output" \
+        3<<<"$5" 4<<<"$5" <<'PY'
+import base64
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+MAGIC = b"CLAUDE-SWITCHER-ARCHIVE-2\n"
+AUTH_LABEL = b"claude-switcher-archive-v2-auth\0"
+AUTH_ITERATIONS = 250000
+ENCRYPTION_ITERATIONS = 200000
+MAX_HEADER = 8192
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+def derive(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password, AUTH_LABEL + salt,
+                               AUTH_ITERATIONS, dklen=32)
+
+def write_archive(plain_path, output, password):
+    salt = os.urandom(16)
+    header = canonical({
+        "auth_iterations": AUTH_ITERATIONS,
+        "auth_kdf": "pbkdf2-hmac-sha256",
+        "cipher": "aes-256-cbc",
+        "encryption_iterations": ENCRYPTION_ITERATIONS,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "version": 2,
+    })
+    directory = os.path.dirname(os.path.abspath(output))
+    encrypted_fd, encrypted_path = tempfile.mkstemp(prefix=".claude-snapshot-encrypted-", dir=directory)
+    temporary = None
+    try:
+        with open(plain_path, "rb") as source, os.fdopen(encrypted_fd, "wb") as encrypted:
+            os.chmod(encrypted_path, 0o600)
+            subprocess.run(
+                ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter",
+                 str(ENCRYPTION_ITERATIONS), "-md", "sha256", "-salt",
+                 "-pass", "fd:4"],
+                stdin=source, stdout=encrypted, stderr=subprocess.DEVNULL,
+                pass_fds=(4,), check=True,
+            )
+        mac = hmac.new(derive(password, salt), digestmod=hashlib.sha256)
+        mac.update(MAGIC + header + b"\n")
+        with open(encrypted_path, "rb") as encrypted:
+            while True:
+                chunk = encrypted.read(1024 * 1024)
+                if not chunk:
+                    break
+                mac.update(chunk)
+        tag = mac.hexdigest().encode("ascii")
+        fd, temporary = tempfile.mkstemp(prefix=".claude-snapshot-", dir=directory)
+        with os.fdopen(fd, "wb") as out, open(encrypted_path, "rb") as encrypted:
+            os.chmod(temporary, 0o600)
+            out.write(MAGIC + header + b"\n" + tag + b"\n")
+            shutil.copyfileobj(encrypted, out, 1024 * 1024)
+            out.flush()
+            os.fsync(out.fileno())
+        os.link(temporary, output)
+    finally:
+        os.unlink(encrypted_path)
+        if temporary:
+            os.unlink(temporary)
+
+def read_line(stream, limit):
+    line = stream.readline(limit + 1)
+    if not line.endswith(b"\n") or len(line) - 1 > limit:
+        raise ValueError("归档认证失败(密码错误或文件被篡改)")
+    return line[:-1]
+
+def decode_archive(source, output, password):
+    temporary = None
+    try:
+        with open(source, "rb") as f:
+            if read_line(f, len(MAGIC)) + b"\n" != MAGIC:
+                raise ValueError("归档认证失败(密码错误或文件被篡改)")
+            raw_header = read_line(f, MAX_HEADER)
+            tag = read_line(f, 64)
+            header = json.loads(raw_header.decode("ascii"))
+            if not isinstance(header, dict):
+                raise ValueError("invalid header")
+            expected = {
+                "auth_iterations": AUTH_ITERATIONS,
+                "auth_kdf": "pbkdf2-hmac-sha256",
+                "cipher": "aes-256-cbc",
+                "encryption_iterations": ENCRYPTION_ITERATIONS,
+                "version": 2,
+            }
+            if any(header.get(key) != value for key, value in expected.items()):
+                raise ValueError("unsupported archive parameters")
+            try:
+                salt = base64.b64decode(header["salt"], validate=True)
+            except Exception:
+                raise ValueError("invalid salt") from None
+            if len(salt) != 16:
+                raise ValueError("invalid salt")
+            blob = f.read(8)
+            if blob != b"Salted__":
+                raise ValueError("invalid encrypted envelope")
+            blob += f.read(8)
+            mac = hmac.new(derive(password, salt), digestmod=hashlib.sha256)
+            mac.update(MAGIC + raw_header + b"\n")
+            mac.update(blob)
+            envelope_size = len(blob)
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                envelope_size += len(chunk)
+                mac.update(chunk)
+            if envelope_size < 32 or (envelope_size - 16) % 16:
+                raise ValueError("invalid encrypted envelope")
+            if len(tag) != 64 or not hmac.compare_digest(tag, mac.hexdigest().encode("ascii")):
+                raise ValueError("归档认证失败(密码错误或文件被篡改)")
+            f.seek(len(MAGIC) + len(raw_header) + 1 + 65)
+            fd, temporary = tempfile.mkstemp(prefix="claude-snapshot-plain-",
+                                             dir=os.path.dirname(os.path.abspath(output)))
+            with os.fdopen(fd, "wb") as out, f:
+                os.chmod(temporary, 0o600)
+                result = subprocess.run(
+                    ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter",
+                     str(ENCRYPTION_ITERATIONS), "-md", "sha256", "-pass", "fd:4"],
+                    stdin=f, stdout=out, stderr=subprocess.DEVNULL, pass_fds=(4,), check=False,
+                )
+            if result.returncode != 0:
+                raise ValueError("归档解密失败")
+            os.replace(temporary, output)
+            temporary = None
+    except ValueError as exc:
+        if str(exc) == "归档解密失败":
+            raise
+        if not str(exc).startswith("归档认证失败"):
+            raise ValueError("归档认证失败(密码错误或文件被篡改)") from None
+        raise
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+try:
+    action, source, output = sys.argv[1:4]
+    with os.fdopen(3, "rb") as f:
+        password_line = f.readline()
+    if not password_line.endswith(b"\n"):
+        raise ValueError("invalid password input")
+    password = password_line[:-1]
+    if not password:
+        raise ValueError("empty password")
+    if action == "write":
+        write_archive(source, output, password)
+    elif action == "decode":
+        decode_archive(source, output, password)
+    else:
+        raise ValueError("unsupported action")
+except Exception as exc:
+    message = str(exc) or exc.__class__.__name__
+    print(message, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 _snapshot_archive_write() {
     local stage="$1" out="$2" pass="$3" tmo="$4" plain rc
     command -v openssl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || return 1
@@ -7149,22 +7321,101 @@ _snapshot_archive_write() {
     if ! tar -czf "$plain" -C "$stage" . 2>/dev/null; then
         rm -f "$plain"; return 1
     fi
-    if ! printf '%s\n' "$SNAPSHOT_ARCHIVE_MAGIC" > "$out"; then
-        rm -f "$plain" "$out"; return 1
-    fi
-    { printf '%s\n' "$pass"; cat "$plain"; } | _snapshot_timeout "$tmo" \
-        openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass stdin >>"$out" 2>/dev/null
+    _snapshot_archive_v2 write "$plain" "$out" "$tmo" "$pass"
     rc=$?
     rm -f "$plain"
-    [ "$rc" -eq 0 ] || { rm -f "$out"; return 1; }
+    [ "$rc" -eq 0 ] || return 1
     return 0
 }
 
+_snapshot_archive_decode() {
+    _snapshot_archive_v2 decode "$1" "$3" "$4" "$2"
+}
+
+_snapshot_tar_preflight() {
+    "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$1" <<'PY'
+import sys
+import tarfile
+from pathlib import PurePosixPath
+
+MAX_MEMBERS = 1000000
+MAX_MEMBER_SIZE = 50 * 1024 ** 3
+MAX_TOTAL_SIZE = 100 * 1024 ** 3
+
+files = set()
+directories = set()
+total = 0
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as archive:
+        for count, member in enumerate(archive, 1):
+            if count > MAX_MEMBERS:
+                raise ValueError("archive member limit exceeded")
+            if not (member.isfile() or member.isdir()):
+                raise ValueError("unsupported archive member")
+            path = PurePosixPath(member.name)
+            if not member.name or path.is_absolute() or ".." in path.parts:
+                raise ValueError("unsafe archive path")
+            name = "." if str(path) == "." else str(path).rstrip("/")
+            if name in files or name in directories:
+                raise ValueError("duplicate archive member")
+            for parent in path.parents:
+                parent_name = "." if str(parent) == "." else str(parent).rstrip("/")
+                if parent_name in files:
+                    raise ValueError("conflicting archive member")
+            if member.isfile():
+                if member.size < 0 or member.size > MAX_MEMBER_SIZE:
+                    raise ValueError("archive member too large")
+                total += member.size
+                if total > MAX_TOTAL_SIZE:
+                    raise ValueError("archive expanded size limit exceeded")
+                files.add(name)
+            else:
+                directories.add(name)
+except (tarfile.TarError, EOFError, OSError, ValueError) as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+_snapshot_tree_preflight() {
+    "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$1" <<'PY'
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+marker = os.path.join(root, ".claude-switcher-snapshot.json")
+try:
+    info = os.lstat(marker)
+    if not stat.S_ISREG(info.st_mode) or info.st_size >= 64 * 1024:
+        raise ValueError("invalid snapshot marker")
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise ValueError("snapshot contains a symbolic link")
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(entry.path)
+                elif not stat.S_ISREG(info.st_mode):
+                    raise ValueError("snapshot contains an unsupported file type")
+except (OSError, ValueError) as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 _snapshot_archive_check() {
-    local file="$1" pass="$2" tmo="$3"
-    { printf '%s\n' "$pass"; tail -c +$(( ${#SNAPSHOT_ARCHIVE_MAGIC} + 2 )) "$file"; } | \
-        _snapshot_timeout "$tmo" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass stdin 2>/dev/null | \
-        tar -tzf - >/dev/null 2>&1
+    local file="$1" pass="$2" tmo="$3" plain
+    plain=$(mktemp "${TMPDIR:-/tmp}/claude-snapshot-plain.XXXXXX" 2>/dev/null) || return 1
+    if ! _snapshot_archive_decode "$file" "$pass" "$plain" "$tmo" || \
+       ! _snapshot_tar_preflight "$plain"; then
+        rm -f "$plain"; return 1
+    fi
+    rm -f "$plain"
+    return 0
 }
 
 snapshot_export() {
@@ -7279,16 +7530,17 @@ EOF
     # CoreDeviceService 拖住;加密归档不挂载任何卷,失败面小得多。
     archive_backend=0
     if [ "$created" != 1 ]; then
-        if _snapshot_archive_write "$stage" "$out" "$pass" "$tmo" && \
-           _snapshot_archive_check "$out" "$pass" "$tmo"; then
-            created=1; archive_backend=1
-        else
-            rm -f "$out"
+        if _snapshot_archive_write "$stage" "$out" "$pass" "$tmo"; then
+            if _snapshot_archive_check "$out" "$pass" "$tmo"; then
+                created=1; archive_backend=1
+            else
+                rm -f "$out"
+            fi
         fi
     fi
     rm -rf "$stage"
     if [ "$created" != 1 ]; then
-        rm -f "$out"; rm -f "$errlog"; unset pass pass2
+        rm -f "$errlog"; unset pass pass2
         echo "FAIL:创建加密镜像失败${primary_err:+ (直接创建: $primary_err)}${fallback_err:+ (降级创建: $fallback_err)}"
         return 1
     fi
@@ -7306,7 +7558,7 @@ EOF
     unset pass pass2
     chmod 600 "$out"
     if [ "$archive_backend" = 1 ]; then
-        echo "OK:账号$target 已加密导出到 $out(兼容归档格式:本机磁盘映像服务不可用)"
+        echo "OK:账号$target 已加密导出到 $out(认证归档格式:本机磁盘映像服务不可用)"
     else
         echo "OK:账号$target 已加密导出到 $out"
     fi
@@ -7329,24 +7581,45 @@ snapshot_import() {
     attached=0
     local tmo="${CLAUDE_SWITCHER_SNAPSHOT_TIMEOUT:-180}"
     errlog=$(mktemp "${TMPDIR:-/tmp}/claude-snapshot.XXXXXX" 2>/dev/null) || errlog=""
-    archive_magic=$(head -c $(( ${#SNAPSHOT_ARCHIVE_MAGIC} + 1 )) "$file" 2>/dev/null || true)
+    archive_magic=$(head -c $(( ${#SNAPSHOT_ARCHIVE_MAGIC_V1} + 1 )) "$file" 2>/dev/null || true)
+    legacy_archive=0
     if [ "$archive_magic" = "$SNAPSHOT_ARCHIVE_MAGIC" ]; then
-        # 导出端在 DiskImages 不可用时写的兼容归档:tar.gz + AES-256-CBC。
         if ! command -v openssl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
             unset pass; rm -f "$errlog"; rm -rf "$mnt"
-            echo "FAIL:缺少 openssl/tar,无法读取兼容归档"; return 1
+            echo "FAIL:缺少 openssl/tar,无法读取认证归档"; return 1
         fi
         plain=$(mktemp "${TMPDIR:-/tmp}/claude-snapshot-plain.XXXXXX" 2>/dev/null) || plain=""
-        if [ -z "$plain" ] || ! { printf '%s\n' "$pass"; tail -c +$(( ${#SNAPSHOT_ARCHIVE_MAGIC} + 2 )) "$file"; } | \
+        if [ -z "$plain" ] || ! _snapshot_archive_decode "$file" "$pass" "$plain" "$tmo" 2>"${errlog:-/dev/null}"; then
+            rm -f "$plain" "$errlog"; rm -rf "$mnt"; unset pass
+            echo "FAIL:密码错误、归档认证失败或文件被篡改"; return 1
+        fi
+        if ! _snapshot_tar_preflight "$plain" 2>"${errlog:-/dev/null}"; then
+            rm -f "$plain" "$errlog"; rm -rf "$mnt"; unset pass
+            echo "FAIL:归档含不安全成员或超出解压限制"; return 1
+        fi
+        if ! tar -xzf "$plain" -C "$mnt" 2>"${errlog:-/dev/null}"; then
+            rm -f "$plain" "$errlog"; rm -rf "$mnt"; unset pass
+            echo "FAIL:归档解压失败"; return 1
+        fi
+        rm -f "$plain" "$errlog"
+        unset pass
+    elif [ "$archive_magic" = "$SNAPSHOT_ARCHIVE_MAGIC_V1" ]; then
+        legacy_archive=1
+        if ! command -v openssl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+            unset pass; rm -f "$errlog"; rm -rf "$mnt"
+            echo "FAIL:缺少 openssl/tar,无法读取旧版归档"; return 1
+        fi
+        plain=$(mktemp "${TMPDIR:-/tmp}/claude-snapshot-plain.XXXXXX" 2>/dev/null) || plain=""
+        if [ -z "$plain" ] || ! { printf '%s\n' "$pass"; tail -c +$(( ${#SNAPSHOT_ARCHIVE_MAGIC_V1} + 2 )) "$file"; } | \
             _snapshot_timeout "$tmo" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass stdin \
             >"$plain" 2>"${errlog:-/dev/null}"; then
             rm -f "$plain" "$errlog"; rm -rf "$mnt"; unset pass
             echo "FAIL:密码错误或归档损坏"; return 1
         fi
-        if ! tar -xzf "$plain" -C "$mnt" 2>"${errlog:-/dev/null}"; then
-            extract_err=$(_snapshot_err "$errlog")
+        if ! _snapshot_tar_preflight "$plain" 2>"${errlog:-/dev/null}" || \
+           ! tar -xzf "$plain" -C "$mnt" 2>"${errlog:-/dev/null}"; then
             rm -f "$plain" "$errlog"; rm -rf "$mnt"; unset pass
-            echo "FAIL:归档解压失败${extract_err:+ ($extract_err)}"; return 1
+            echo "FAIL:旧版归档含不安全成员或解压失败"; return 1
         fi
         rm -f "$plain" "$errlog"
         unset pass
@@ -7381,6 +7654,11 @@ snapshot_import() {
         rm -rf "$BASE/accounts/$target.new"
     }
 
+    if ! _snapshot_tree_preflight "$mnt"; then
+        cleanup_import
+        echo "FAIL:快照含符号链接、特殊文件或无效元数据"; return 1
+    fi
+
     marker="$mnt/.claude-switcher-snapshot.json"
     if [ ! -f "$marker" ]; then
         cleanup_import
@@ -7389,10 +7667,13 @@ snapshot_import() {
     if ! "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$marker" "$target" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as f: meta = json.load(f)
-assert meta.get("format") == "claude-switcher-snapshot"
-assert meta.get("version") == 1
-assert meta.get("account") in tuple("ABCDEFGH")
-sys.exit(0 if meta.get("account") == sys.argv[2] else 1)
+valid = (
+    isinstance(meta, dict)
+    and meta.get("format") == "claude-switcher-snapshot"
+    and meta.get("version") == 1
+    and meta.get("account") in tuple("ABCDEFGH")
+)
+sys.exit(0 if valid and meta.get("account") == sys.argv[2] else 1)
 PY
     then
         cleanup_import
@@ -7411,6 +7692,9 @@ PY
         echo "FAIL:写入账号目录失败"; return 1
     fi
     cleanup_import
+    if [ "$legacy_archive" = 1 ]; then
+        echo "WARN:旧格式归档没有完整性认证,已成功导入;请在源机器重新导出以获得篡改保护"
+    fi
     echo "OK:已导入为账号$target(切换时生效)"
 }
 
