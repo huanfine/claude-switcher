@@ -9,8 +9,13 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Full cross-platform checks
+    uses: ./.github/workflows/checks.yml
+
   release:
     name: Build and publish
+    needs: test
     runs-on: macos-15
     env:
       GH_TOKEN: ${{ github.token }}

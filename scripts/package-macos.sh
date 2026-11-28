@@ -199,7 +199,7 @@ chmod +x "$KIT_ROOT/INSTALL.command" "$KIT_ROOT/installer/install.command" \
 for ITEM in \
     README.md README.en.md AGENTS.md SECURITY.md LICENSE SHA256SUMS VERSION \
     INSTALL.command README-INSTALL.txt installer/install.command \
-    core/claude-switch.sh daemons/claude-bodyguard.sh installer/安装.command \
+    core/claude-switch.sh core/stun-probe.py daemons/claude-bodyguard.sh installer/安装.command \
     app/main.swift assets/icon-2048.png docs/screenshot.png \
     scripts/upgrade-core.sh scripts/diagnose-fix.sh scripts/diagnose-install.sh; do
     if [ ! -e "$KIT_ROOT/$ITEM" ]; then
