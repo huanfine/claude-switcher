@@ -957,32 +957,33 @@ final class VM: ObservableObject {
     // 会拿着错误的出口继续发请求。watch 补的就是这一段:脚本负责判定和关进程,
     // 界面只负责把原因显示出来。
     private var watchActive = false
-    private var watchStopping = false
+    private var watchGeneration: UInt64 = 0
     private var watchProcess: Process?
 
     private func startWatch() {
         guard !watchActive else { return }
+        watchGeneration &+= 1
+        let generation = watchGeneration
         watchActive = true
-        watchStopping = false
         guarding = true
         guardSince = Date()
         lastBeat = nil
         run(["watch", "10", "6"], timeout: 0,
             onLine: { [weak self] line in
-                self?.handleWatchLine(line)
+                guard let self, self.watchGeneration == generation else { return }
+                self.handleWatchLine(line)
             },
             onStart: { [weak self] p in
-                self?.watchProcess = p
+                guard let self, self.watchGeneration == generation else { return }
+                self.watchProcess = p
             }) { [weak self] _ in
-            guard let self else { return }
+            guard let self, self.watchGeneration == generation else { return }
             self.watchActive = false
             self.watchProcess = nil
             self.guarding = false
             self.guardSince = nil
             self.lastBeat = nil
-            // 我们自己停的(重新检查/退出)不报警;意外退出必须报 —— 守护断了
-            // 就意味着从现在起没人盯着出口,界面不能还挂着「通过」。
-            guard !self.watchStopping else { return }
+            // stopWatch 会先递增代际,所以能进这里的只可能是当代守护意外退出。
             self.phase = .failed
             if self.banner.isEmpty { self.banner = "巡检已停止，请重新检查" }
         }
@@ -1008,8 +1009,11 @@ final class VM: ObservableObject {
         guard line.hasPrefix("STOP:") else { return }
         let reason = String(line.dropFirst(5))
         stopReason = reason
-        watchStopping = true
+        watchGeneration &+= 1
         watchActive = false
+        guarding = false
+        guardSince = nil
+        lastBeat = nil
         // 不动 isBusy:巡检停 Claude 与界面上的修复/切换是两条线,
         // 清掉忙碌标记会让 refresh 的互斥失效,可能并发跑出两个检查。
         phase = .failed
@@ -1068,8 +1072,8 @@ final class VM: ObservableObject {
     }
 
     func stopWatch() {
+        watchGeneration &+= 1
         guard watchActive else { return }
-        watchStopping = true
         watchActive = false
         guarding = false
         guardSince = nil

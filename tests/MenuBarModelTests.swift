@@ -86,13 +86,33 @@ private final class Fixture {
           fix) delay fix; if [ -f "$root/fix-output" ]; then cat "$root/fix-output"; else echo 'FIX:演示修复完成'; fi; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
           watch)
+            # 测试可控完成:旧代先不退出,等新守护起来后再释放它的行与完成回调。
+            n=1
+            while [ -e "$root/watch-$n" ]; do n=$((n + 1)); done
+            mkdir "$root/watch-$n"
+            instance="$n"
+            echo $$ > "$root/watch-pid-$instance"
+            echo $$ > "$root/watch-pid"
+            if [ -f "$root/watch-hold-$instance" ]; then trap '' TERM; fi
             # 常驻,直到测试写出 watch-stop 才吐 STOP 行。真脚本靠 curl 判定,
             # 这里只需要验证「界面收到 STOP: 之后怎么反应」。
             # 必须自带寿命上限:场景进程退出后这个子进程会变孤儿,活得越久
             # fork 越多,后面场景就越容易超时失败 —— 表现为「随机某个断言挂了」。
-            echo $$ > "$root/watch-pid"
             n=0
             while [ "$n" -lt 50 ]; do
+              if [ -f "$root/watch-release-$instance" ]; then
+                if [ -f "$root/watch-stop-$instance" ]; then
+                  reason_file="$root/watch-stop-$instance"
+                  printf '%s\t%s\t%s\n' "$(date '+%F %T')" "出口变化" "$(cat "$reason_file")" >> "$root/incidents.log"
+                  echo "STOP:$(cat "$reason_file")"
+                fi
+                exit 3
+              fi
+              if [ -f "$root/watch-stop-$instance" ]; then
+                printf '%s\t%s\t%s\n' "$(date '+%F %T')" "出口变化" "$(cat "$root/watch-stop-$instance")" >> "$root/incidents.log"
+                echo "STOP:$(cat "$root/watch-stop-$instance")"
+                exit 3
+              fi
               if [ -f "$root/watch-stop" ]; then
                 # 真脚本在 stop_claude_now 里写这一行,这里照着写,界面才读得到。
                 printf '%s\t%s\t%s\n' "$(date '+%F %T')" "出口变化" "$(cat "$root/watch-stop")" >> "$root/incidents.log"
@@ -505,6 +525,51 @@ struct MenuBarModelTests {
                 vm.refresh(); try f.idle(vm)
                 try expect(vm.phase == .ready, "重新检查后仍应就绪")
                 try expect(vm.lastCheckSummary == "通过", "重新检查应重新得出结论")
+            case "watch_stale_completion_cannot_clear_new_guard":
+                // 旧进程被 TERM 后不立即退出。等新守护起来再释放旧完成回调,
+                // 旧 run() 的 done 不能把新一代的 guarding/phase 一起清掉。
+                try f.write("watch-hold-1", "1")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try spin { f.rawCalls.filter { $0.hasPrefix("watch ") }.count == 1
+                    && FileManager.default.fileExists(atPath: f.root.appendingPathComponent("watch-pid-1").path) }
+                vm.refresh(); try f.idle(vm)
+                try spin { f.rawCalls.filter { $0.hasPrefix("watch ") }.count == 2
+                    && FileManager.default.fileExists(atPath: f.root.appendingPathComponent("watch-pid-2").path) }
+                try f.write("watch-release-1", "1")
+                pump(0.35)
+                try expect(vm.guarding, "旧守护完成回调清掉了新守护的 guarding")
+                try expect(vm.phase == .ready && vm.lastCheckSummary == "通过", "旧完成回调改变了新检查结论")
+            case "watch_stale_line_cannot_fail_new_guard":
+                // 行回调可能比完成回调更晚。旧 STOP 已经出队时,新一代正在守护,
+                // 它不能把新界面改成拦截态。
+                try f.write("watch-hold-1", "1")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try spin { f.rawCalls.filter { $0.hasPrefix("watch ") }.count == 1
+                    && FileManager.default.fileExists(atPath: f.root.appendingPathComponent("watch-pid-1").path) }
+                vm.refresh(); try f.idle(vm)
+                try spin { f.rawCalls.filter { $0.hasPrefix("watch ") }.count == 2
+                    && FileManager.default.fileExists(atPath: f.root.appendingPathComponent("watch-pid-2").path) }
+                try f.write("watch-stop-1", "旧守护的出口变化")
+                try f.write("watch-release-1", "1")
+                pump(0.35)
+                try expect(vm.guarding && vm.phase == .ready, "旧 STOP 行打断了新守护")
+                try expect(!vm.intercepted && vm.stopReason.isEmpty, "旧 STOP 行写进了新一代拦截状态")
+                try expect(vm.lastCheckSummary == "通过", "旧 STOP 行覆盖了新检查摘要")
+            case "watch_stale_completion_cannot_restart_after_quit":
+                // App 退出后只允许旧回调静默消失,不能改 phase,更不能借副作用重启。
+                try f.write("watch-hold-1", "1")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try spin { f.rawCalls.filter { $0.hasPrefix("watch ") }.count == 1
+                    && FileManager.default.fileExists(atPath: f.root.appendingPathComponent("watch-pid-1").path) }
+                let delegate = AppDelegate(vm: vm)
+                delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+                try f.write("watch-release-1", "1")
+                pump(0.35)
+                try expect(!vm.guarding && vm.phase == .ready, "退出后的旧完成回调改了界面状态")
+                try expect(f.rawCalls.filter { $0.hasPrefix("watch ") }.count == 1, "退出后的旧回调重启了守护")
             case "watch_stop_kills_process":
                 // 「发了 SIGTERM」不等于「进程停了」。实测 bash 卡在 sleep 里时能拖到
                 // 下一轮,这期间新守护撞上旧的,两边各拿一份基线判出口。
