@@ -31,6 +31,18 @@ FUNCTIONS = (
     "archive_cli",
     "restore_cli",
     "require_lease_for_launch",
+    "switch_txn_support",
+    "txn_verify",
+    "txn_get",
+    "txn_mark",
+    "txn_flag",
+    "recover_switch_state",
+    "recover_switch_txn",
+    "backup_switch_live",
+    "prepare_switch_target",
+    "install_switch_target",
+    "write_current_atomic",
+    "cleanup_switch_txn",
     "switch_to",
 )
 
@@ -88,6 +100,8 @@ class MultiAccountTests(unittest.TestCase):
             "LOG": str(self.fixture / "switch.log"),
             "FIXTURE": str(self.fixture),
             "INJECT": injection,
+            "CLAUDE_SWITCHER_SOURCE": str(SOURCE),
+            "CLAUDE_SWITCHER_PYTHON": sys.executable,
             "LC_ALL": "C",
         }
         harness = r'''
@@ -98,6 +112,7 @@ copy_tree() {
     mkdir -p "$2" && cp -R "$1/." "$2/"
 }
 quit_claude() { return 0; }
+lease_revoke() { return 0; }
 open() { printf 'called' > "$FIXTURE/launched"; }
 # 夹具里没有、也不该有真的 claude 进程。用 stub 固定成「没在跑」，
 # 否则本机终端恰好开着 Claude Code 时，这批测试会随机拒绝切换。
@@ -107,7 +122,7 @@ ditto() {
         case "$1 $2" in *keep-stage*) return 44 ;; esac
     fi
     if [ "$INJECT" = "restore_error" ]; then
-        case "$2" in "$DATA"|"$DATA/") return 45 ;; esac
+        case "$2" in "$DATA.new"|"$DATA.new/") return 45 ;; esac
     fi
     command ditto "$@"
 }
@@ -313,21 +328,22 @@ ditto() {
         self.assertFalse((self.base / "keep-stage").exists())
         self.assertFalse((self.fixture / "launched").exists())
 
-    def test_restore_failure_keeps_stage_for_recovery(self):
+    def test_restore_failure_rolls_back_without_losing_stage(self):
         self.account("A").joinpath("marker").write_text("old-A", encoding="utf-8")
         self.account("B").joinpath("marker").write_text("saved-B", encoding="utf-8")
         (self.base / "current").write_text("A", encoding="utf-8")
         (self.data / "settings.json").write_text("from-A", encoding="utf-8")
+        (self.data / "marker").write_text("live-A", encoding="utf-8")
         self.write_keep("settings.json")
 
         result = self.run_shell("switch_to B", injection="restore_error")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("FAIL:", result.stdout)
-        self.assertEqual((self.base / "current").read_text().strip(), "B")
-        self.assertTrue((self.base / "keep-stage" / "settings.json").exists())
-        self.assertEqual(
-            (self.base / "keep-stage" / "settings.json").read_text(), "from-A"
-        )
+        self.assertEqual((self.base / "current").read_text().strip(), "A")
+        self.assertEqual((self.data / "settings.json").read_text(), "from-A")
+        self.assertEqual((self.data / "marker").read_text(), "live-A")
+        self.assertFalse((self.base / "keep-stage").exists())
+        self.assertFalse((self.base / "switch-txn.json").exists())
         self.assertEqual(
             (self.base / "accounts" / "A" / "settings.json").read_text(), "from-A"
         )
@@ -357,6 +373,20 @@ ditto() {
         self.assertIn("INFO:当前已是账号A", result.stdout)
         self.assertEqual((self.data / "marker").read_text(), "saved-A")
         self.assertTrue((self.fixture / "launched").exists())
+
+    def test_same_account_preserves_live_edits(self):
+        self.account("A").joinpath("marker").write_text("saved-A", encoding="utf-8")
+        (self.base / "current").write_text("A", encoding="utf-8")
+        (self.data / "marker").write_text("edited-live-A", encoding="utf-8")
+
+        result = self.run_shell("switch_to A")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("INFO:当前已是账号A", result.stdout)
+        self.assertEqual((self.data / "marker").read_text(), "edited-live-A")
+        self.assertEqual(
+            (self.base / "accounts" / "A" / "marker").read_text(), "saved-A"
+        )
+        self.assertFalse((self.base / "switch-txn.json").exists())
 
     def test_first_enrollment_also_carries_keep_paths(self):
         (self.data / "settings.json").write_text("first-run", encoding="utf-8")

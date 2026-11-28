@@ -921,6 +921,191 @@ def export_diagnostics(args):
     print("OK:诊断日志已导出（不含 IP、凭据、账号或代理配置；含脱敏后的最近一次修复逐步输出）")
 
 
+SWITCH_TXN_SCHEMA = "claude-switcher-switch-txn/1"
+SWITCH_TXN_STATES = ("prepared", "backing_up", "backed_up", "archived", "staged",
+                     "installed", "current_committed", "launch_attempted", "completed")
+SWITCH_TXN_FLAGS = ("had_data", "had_cli_dir", "had_cli_json", "backup_ready",
+                    "keep_created", "archived", "target_ready", "installed",
+                    "current_committed", "launch_attempted")
+
+
+def switch_txn_paths(base, data, cli_dir, cli_json):
+    roots = {"base": str(base), "data": str(data), "cli_dir": str(cli_dir),
+             "cli_json": str(cli_json), "cli_base": str(Path(base) / "cli")}
+    if any(not Path(value).is_absolute() for value in roots.values()):
+        raise ValueError("切换事务路径必须是绝对路径")
+    return roots
+
+
+def safe_existing_path(path):
+    """路径的每个已存在组件都不能是符号链接；缺失组件只允许位于末尾。"""
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError("切换事务路径不是绝对路径")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        import stat
+        if stat.S_ISLNK(mode):
+            raise ValueError("切换事务路径含符号链接: " + str(current))
+    return path
+
+
+def switch_txn_read(base, data, cli_dir, cli_json, require_dir=True):
+    roots = switch_txn_paths(base, data, cli_dir, cli_json)
+    base_path = safe_existing_path(roots["base"])
+    journal = safe_existing_path(base_path / "switch-txn.json")
+    try:
+        info = journal.lstat()
+    except FileNotFoundError:
+        return None
+    import stat
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("切换事务日志不是 0600 普通文件")
+    try:
+        document = json.loads(journal.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError("切换事务日志无法解析") from error
+    if not isinstance(document, dict) or document.get("schema") != SWITCH_TXN_SCHEMA:
+        raise ValueError("切换事务日志格式无效")
+    expected_keys = {"schema", "id", "state", "target", "old_current", "old_slot",
+                     "roots", "txn_dir", *SWITCH_TXN_FLAGS}
+    if set(document) != expected_keys:
+        raise ValueError("切换事务日志字段不完整或含未知字段")
+    transaction_id = document.get("id")
+    if not isinstance(transaction_id, str) or not re.fullmatch(r"[0-9a-f]{32}", transaction_id):
+        raise ValueError("切换事务 ID 无效")
+    if document.get("state") not in SWITCH_TXN_STATES:
+        raise ValueError("切换事务状态无效")
+    if document.get("target") not in tuple("ABCDEFGH"):
+        raise ValueError("切换事务目标槽位无效")
+    if document.get("old_current") not in ("none", *tuple("ABCDEFGH")):
+        raise ValueError("切换事务旧账号无效")
+    if document.get("old_slot") not in ("none", *tuple("ABCDEFGH")):
+        raise ValueError("切换事务旧槽位无效")
+    if document.get("roots") != roots:
+        raise ValueError("切换事务根目录与当前环境不一致")
+    expected_dir = str(base_path / ("switch-txn." + transaction_id))
+    if document.get("txn_dir") != expected_dir:
+        raise ValueError("切换事务备份目录无效")
+    transaction_dir = safe_existing_path(expected_dir)
+    if require_dir and document["state"] != "completed" and (
+            not transaction_dir.is_dir() or transaction_dir.is_symlink()):
+        raise ValueError("切换事务备份目录不存在或不是目录")
+    import stat
+    if transaction_dir.exists() and stat.S_IMODE(transaction_dir.stat().st_mode) != 0o700:
+        raise ValueError("切换事务备份目录权限不是 0700")
+    for flag in SWITCH_TXN_FLAGS:
+        if type(document.get(flag)) is not bool:
+            raise ValueError("切换事务标志类型无效: " + flag)
+    backup_kinds = (("had_data", "old-data", "dir"), ("had_cli_dir", "old-cli", "dir"),
+                    ("had_cli_json", "old-cli.json", "file"))
+    if require_dir and document["state"] != "completed":
+        for flag, name, kind in backup_kinds:
+            if document[flag]:
+                backup = safe_existing_path(transaction_dir / name)
+                if kind == "dir" and not backup.is_dir():
+                    raise ValueError("切换事务目录备份无效: " + name)
+                if kind == "file" and not backup.is_file():
+                    raise ValueError("切换事务文件备份无效: " + name)
+    for root in (base_path / "accounts", base_path / "cli", Path(roots["data"]).parent,
+                 Path(roots["cli_dir"]).parent, Path(roots["cli_json"]).parent):
+        safe_existing_path(root)
+    return document
+
+
+def switch_txn_write(document, exclusive=False):
+    journal = safe_existing_path(Path(document["roots"]["base"]) / "switch-txn.json")
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".switch-txn-", dir=journal.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.chmod(temporary, 0o600)
+        if exclusive:
+            os.link(temporary, journal)
+        else:
+            os.replace(temporary, journal)
+            temporary = None
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def switch_txn_action(args):
+    if len(args) < 6:
+        fail()
+    base, data, cli_dir, cli_json = args[1:5]
+    operation, *values = args[5:]
+    try:
+        if operation == "init" and len(values) == 2:
+            if switch_txn_read(base, data, cli_dir, cli_json) is not None:
+                raise ValueError("已存在未完成的切换事务")
+            base_path = Path(base)
+            base_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            safe_existing_path(base_path)
+            target, old_current = values
+            if target not in tuple("ABCDEFGH") or old_current not in ("none", *tuple("ABCDEFGH")):
+                raise ValueError("切换槽位无效")
+            old_slot = "A" if old_current == "none" else old_current
+            document = {
+                "schema": SWITCH_TXN_SCHEMA,
+                "id": uuid.uuid4().hex,
+                "state": "prepared",
+                "target": target,
+                "old_current": old_current,
+                "old_slot": old_slot,
+                "roots": switch_txn_paths(base, data, cli_dir, cli_json),
+                "txn_dir": "",
+                **{flag: False for flag in SWITCH_TXN_FLAGS},
+            }
+            transaction_dir = base_path / ("switch-txn." + document["id"])
+            transaction_dir.mkdir(mode=0o700)
+            document["txn_dir"] = str(transaction_dir)
+            switch_txn_write(document, exclusive=True)
+            print(document["id"] + "\t" + document["txn_dir"] + "\t" + old_slot)
+            return
+        document = switch_txn_read(base, data, cli_dir, cli_json,
+                                   require_dir=operation != "delete")
+        if document is None:
+            raise ValueError("切换事务不存在")
+        if operation == "verify" and not values:
+            print("OK:" + document["id"])
+        elif operation == "get" and len(values) == 1 and values[0] in (
+                "id", "txn_dir", "old_current", "old_slot", "target", "state", *SWITCH_TXN_FLAGS):
+            print(int(document[values[0]]) if isinstance(document[values[0]], bool)
+                  else document[values[0]])
+        elif operation == "mark" and len(values) == 2:
+            key, value = values
+            if key == "state":
+                if value not in SWITCH_TXN_STATES:
+                    raise ValueError("切换事务状态无效")
+                document["state"] = value
+            elif key in SWITCH_TXN_FLAGS and value in ("0", "1"):
+                document[key] = value == "1"
+            else:
+                raise ValueError("切换事务更新字段无效")
+            switch_txn_write(document)
+        elif operation == "delete" and values == [document["id"]]:
+            try:
+                Path(document["txn_dir"]).rmdir()
+            except FileNotFoundError:
+                pass
+            safe_existing_path(Path(base) / "switch-txn.json").unlink()
+        else:
+            fail()
+    except (OSError, ValueError) as error:
+        fail(str(error))
+
+
 def main(args):
     if not args:
         fail()
@@ -1134,6 +1319,8 @@ def main(args):
         except ValueError:
             fail()
         print("OK:环境配置已迁移")
+    elif action == "switch-txn":
+        switch_txn_action(args)
     elif action == "log":
         write_log(args[1:])
     elif action == "export-diagnostics":
@@ -7502,23 +7689,58 @@ archive_cli() {
 restore_cli() {
     local target="$1"
     local src="$CLI_BASE/$1" staged="$CLI_BASE/$1.new"
-    rm -rf "$staged"
+    local backup had_dir=0 had_json=0
+    case "$target" in [A-H]) ;; *) return 1 ;; esac
+    [ ! -L "$CLI_BASE" ] && [ ! -L "$src" ] && [ ! -L "$staged" ] || {
+        log "FAIL:账号$target 的 Claude Code 快照路径含符号链接"; return 1;
+    }
+    if [ -e "$staged" ]; then
+        log "FAIL:账号$target 存在待恢复的 Claude Code 暂存，拒绝覆盖"
+        return 1
+    fi
     if [ -d "$src" ]; then
         copy_tree "$src" "$staged" || { log "FAIL:账号$target 的 Claude Code 快照载入失败"; return 1; }
     else
         mkdir -p "$staged" || return 1
     fi
-    rm -rf "$CLI_DIR" 2>/dev/null
-    rm -f "$CLI_JSON" 2>/dev/null
-    if [ -d "$staged/home" ] && ! mv "$staged/home" "$CLI_DIR"; then
-        log "FAIL:账号$target 的 Claude Code 目录还原失败"
-        return 1
+    [ ! -L "$CLI_DIR" ] && [ ! -L "$CLI_JSON" ] || {
+        rm -rf "$staged"
+        log "FAIL:Claude Code 实时路径含符号链接，拒绝还原"; return 1;
+    }
+    backup=$(mktemp -d "$CLI_BASE/.restore-cli.XXXXXX") || {
+        rm -rf "$staged"; log "FAIL:无法创建 Claude Code 还原备份"; return 1;
+    }
+    chmod 700 "$backup" || { rm -rf "$staged"; rmdir "$backup"; return 1; }
+    if [ -d "$CLI_DIR" ] && ! mv "$CLI_DIR" "$backup/home"; then
+        rm -rf "$staged"; rmdir "$backup"
+        log "FAIL:无法备份 Claude Code 实时目录"; return 1
     fi
-    if [ -f "$staged/home.json" ] && ! mv "$staged/home.json" "$CLI_JSON"; then
-        log "FAIL:账号$target 的 ~/.claude.json 还原失败"
+    [ -d "$backup/home" ] && had_dir=1
+    if [ -f "$CLI_JSON" ] && ! mv "$CLI_JSON" "$backup/home.json"; then
+        [ "$had_dir" = "1" ] && mv "$backup/home" "$CLI_DIR"
+        rm -rf "$staged"; rmdir "$backup"
+        log "FAIL:无法备份 ~/.claude.json"; return 1
+    fi
+    [ -f "$backup/home.json" ] && had_json=1
+    if { [ -d "$staged/home" ] && ! mv "$staged/home" "$CLI_DIR"; } \
+       || { [ -f "$staged/home.json" ] && ! mv "$staged/home.json" "$CLI_JSON"; }; then
+        rm -rf "$CLI_DIR" 2>/dev/null
+        rm -f "$CLI_JSON" 2>/dev/null
+        if [ "$had_dir" = "1" ] && ! mv "$backup/home" "$CLI_DIR"; then
+            log "FAIL:Claude Code 目录回滚失败，备份保留在 $backup"
+            return 1
+        fi
+        if [ "$had_json" = "1" ] && ! mv "$backup/home.json" "$CLI_JSON"; then
+            log "FAIL:Claude Code 配置回滚失败，备份保留在 $backup"
+            return 1
+        fi
+        rmdir "$backup" 2>/dev/null || true
+        rm -rf "$staged"
+        log "FAIL:账号$target 的 Claude Code 状态还原失败，已恢复原状态"
         return 1
     fi
     rm -rf "$staged"
+    rm -rf "$backup"
     return 0
 }
 
@@ -7554,7 +7776,7 @@ valid_account() {
 # ---------- 跨身份保留(可选) ----------
 # 校验相对路径的每个分量都不是符号链接,避免把 DATA 外的内容带进快照
 keep_path_safe() {
-    local rel="$1" prefix="$DATA" part
+    local rel="$1" prefix="${2:-$DATA}" part
     while [ -n "$rel" ]; do
         part="${rel%%/*}"
         if [ "$part" = "$rel" ]; then rel=""; else rel="${rel#*/}"; fi
@@ -7630,9 +7852,27 @@ require_lease_for_launch() {
 }
 
 restore_keep_paths() {
-    local stage="$BASE/keep-stage"
-    [ -d "$stage" ] || return 0
-    if ! ditto "$stage/" "$DATA/"; then
+    local stage="$BASE/keep-stage" destination="${1:-$DATA}" rel keepf="$BASE/keep-in-workspace.txt"
+    [ -e "$stage" ] || [ -L "$stage" ] || return 0
+    [ -d "$stage" ] && [ ! -L "$stage" ] || {
+        log "FAIL:跨身份保留暂存路径无效: $stage"; return 1;
+    }
+    [ -d "$destination" ] && [ ! -L "$destination" ] || {
+        log "FAIL:跨身份保留目标目录无效: $destination"; return 1;
+    }
+    if [ -f "$keepf" ]; then
+        while IFS= read -r rel || [ -n "$rel" ]; do
+            rel="${rel%$'\r'}"
+            case "$rel" in ''|'#'*|[[:space:]]*'#'*) continue ;; esac
+            while [ "${rel%/}" != "$rel" ]; do rel="${rel%/}"; done
+            while [ "${rel#./}" != "$rel" ]; do rel="${rel#./}"; done
+            case "$rel" in /*|*..*) log "WARN:跨身份保留路径无效，跳过: $rel"; continue ;; esac
+            keep_path_safe "$rel" "$destination" || {
+                log "FAIL:跨身份保留目标含符号链接: $rel"; return 1;
+            }
+        done < "$keepf"
+    fi
+    if ! ditto "$stage/" "$destination/"; then
         log "FAIL:跨身份保留还原失败，暂存保留在 $stage"
         return 1
     fi
@@ -7641,122 +7881,302 @@ restore_keep_paths() {
     return 0
 }
 
+switch_txn_support() {
+    "${BASH:-/bin/bash}" "${CLAUDE_SWITCHER_SOURCE:-$0}" _support switch-txn \
+        "$BASE" "$DATA" "$CLI_DIR" "$CLI_JSON" "$@"
+}
+
+txn_verify() {
+    switch_txn_support verify >/dev/null
+}
+
+txn_get() {
+    switch_txn_support get "$1"
+}
+
+txn_mark() {
+    switch_txn_support mark "$1" "$2" >/dev/null
+}
+
+txn_flag() {
+    [ "$(txn_get "$1")" = "1" ]
+}
+
+recover_switch_state() {
+    [ -e "$BASE/switch-txn.json" ] || [ -L "$BASE/switch-txn.json" ] || return 0
+    recover_switch_txn
+}
+
+backup_switch_live() {
+    local directory had_data=0 had_dir=0 had_json=0 rollback_ok=1
+    txn_verify || return 1
+    directory=$(txn_get txn_dir) || return 1
+    txn_mark state backing_up || return 1
+    if [ -e "$DATA" ] || [ -L "$DATA" ]; then
+        [ -d "$DATA" ] && [ ! -L "$DATA" ] || { txn_mark state prepared; return 1; }
+        mv "$DATA" "$directory/old-data" || { txn_mark state prepared; return 1; }
+        had_data=1
+    fi
+    if [ -e "$CLI_DIR" ] || [ -L "$CLI_DIR" ]; then
+        if [ ! -d "$CLI_DIR" ] || [ -L "$CLI_DIR" ]; then
+            [ "$had_data" = "1" ] && { mv "$directory/old-data" "$DATA" || rollback_ok=0; }
+            [ "$rollback_ok" = "1" ] && txn_mark state prepared
+            return 1
+        fi
+        if ! mv "$CLI_DIR" "$directory/old-cli"; then
+            [ "$had_data" = "1" ] && { mv "$directory/old-data" "$DATA" || rollback_ok=0; }
+            [ "$rollback_ok" = "1" ] && txn_mark state prepared
+            return 1
+        fi
+        had_dir=1
+    fi
+    if [ -e "$CLI_JSON" ] || [ -L "$CLI_JSON" ]; then
+        if [ ! -f "$CLI_JSON" ] || [ -L "$CLI_JSON" ]; then
+            [ "$had_dir" = "1" ] && { mv "$directory/old-cli" "$CLI_DIR" || rollback_ok=0; }
+            [ "$had_data" = "1" ] && { mv "$directory/old-data" "$DATA" || rollback_ok=0; }
+            [ "$rollback_ok" = "1" ] && txn_mark state prepared
+            return 1
+        fi
+        if ! mv "$CLI_JSON" "$directory/old-cli.json"; then
+            [ "$had_dir" = "1" ] && { mv "$directory/old-cli" "$CLI_DIR" || rollback_ok=0; }
+            [ "$had_data" = "1" ] && { mv "$directory/old-data" "$DATA" || rollback_ok=0; }
+            [ "$rollback_ok" = "1" ] && txn_mark state prepared
+            return 1
+        fi
+        had_json=1
+    fi
+    txn_mark had_data "$had_data" && txn_mark had_cli_dir "$had_dir" \
+        && txn_mark had_cli_json "$had_json" && txn_mark backup_ready 1 \
+        && txn_mark state backed_up
+}
+
+write_current_atomic() {
+    local account="$1" temporary
+    [ ! -L "$BASE/current" ] || return 1
+    [ ! -e "$BASE/current" ] || [ -f "$BASE/current" ] || return 1
+    if [ "$account" = "none" ]; then
+        rm -f "$BASE/current"
+        return $?
+    fi
+    temporary=$(mktemp "$BASE/.current.XXXXXX") || return 1
+    chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+    if ! printf '%s' "$account" > "$temporary" \
+       || ! mv -f "$temporary" "$BASE/current"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    return 0
+}
+
+prepare_switch_target() {
+    local target="$1" data_new="$DATA.new" cli_new="$CLI_BASE/$1.new"
+    [ ! -e "$data_new" ] && [ ! -L "$data_new" ] || return 1
+    [ ! -e "$cli_new" ] && [ ! -L "$cli_new" ] || return 1
+    [ ! -L "$BASE/accounts/$target" ] && [ ! -L "$CLI_BASE/$target" ] || return 1
+    if [ -d "$BASE/accounts/$target" ]; then
+        copy_tree "$BASE/accounts/$target" "$data_new" || return 1
+    else
+        mkdir -p "$data_new" || return 1
+    fi
+    if [ -d "$CLI_BASE/$target" ]; then
+        copy_tree "$CLI_BASE/$target" "$cli_new" || return 1
+    else
+        mkdir -p "$cli_new" || return 1
+    fi
+    restore_keep_paths "$data_new"
+}
+
+install_switch_target() {
+    local target="$1" data_new="$DATA.new" cli_new="$CLI_BASE/$1.new"
+    [ -d "$data_new" ] && [ ! -L "$data_new" ] || return 1
+    [ -d "$cli_new" ] && [ ! -L "$cli_new" ] || return 1
+    [ ! -e "$DATA" ] && [ ! -L "$DATA" ] || return 1
+    [ ! -e "$CLI_DIR" ] && [ ! -L "$CLI_DIR" ] || return 1
+    [ ! -e "$CLI_JSON" ] && [ ! -L "$CLI_JSON" ] || return 1
+    mv "$data_new" "$DATA" || return 1
+    if [ -d "$cli_new/home" ]; then
+        mv "$cli_new/home" "$CLI_DIR" || return 1
+    fi
+    if [ -f "$cli_new/home.json" ]; then
+        mv "$cli_new/home.json" "$CLI_JSON" || return 1
+    fi
+    rm -rf "$cli_new" || return 1
+    txn_mark installed 1 && txn_mark state installed
+}
+
+cleanup_switch_txn() {
+    local directory transaction_id
+    txn_verify || return 1
+    directory=$(txn_get txn_dir) || return 1
+    transaction_id=$(txn_get id) || return 1
+    case "$directory" in "$BASE"/switch-txn.*) ;; *) return 1 ;; esac
+    [ ! -L "$directory" ] || return 1
+    rm -rf "$directory" || return 1
+    switch_txn_support delete "$transaction_id" >/dev/null
+}
+
+recover_switch_txn() {
+    local directory old_current had_data had_dir had_json restored=1
+    txn_verify || { echo "FAIL:切换事务无法验证，保留全部现场: $BASE/switch-txn.json"; return 1; }
+    if [ "$(txn_get state)" = "completed" ]; then
+        cleanup_switch_txn
+        return $?
+    fi
+    if [ "$(txn_get state)" = "prepared" ] && ! txn_flag backup_ready; then
+        if txn_flag keep_created; then
+            [ ! -L "$BASE/keep-stage" ] && rm -rf "$BASE/keep-stage" || return 1
+        fi
+        cleanup_switch_txn
+        return $?
+    fi
+    txn_flag backup_ready || {
+        echo "FAIL:切换尚未完成实时状态备份，拒绝自动恢复: $BASE/switch-txn.json"
+        return 1
+    }
+    if [ "$(txn_get state)" = "launch_attempted" ]; then
+        quit_claude || { echo "FAIL:无法退出 Claude，保留切换事务现场"; return 1; }
+    fi
+    directory=$(txn_get txn_dir) || return 1
+    old_current=$(txn_get old_current) || return 1
+    had_data=$(txn_get had_data) || return 1
+    had_dir=$(txn_get had_cli_dir) || return 1
+    had_json=$(txn_get had_cli_json) || return 1
+    [ ! -L "$DATA" ] && [ ! -L "$CLI_DIR" ] && [ ! -L "$CLI_JSON" ] || {
+        echo "FAIL:实时状态路径含符号链接，拒绝自动恢复"; return 1;
+    }
+    rm -rf "$DATA" "$CLI_DIR" || restored=0
+    rm -f "$CLI_JSON" || restored=0
+    if [ "$had_data" = "1" ]; then
+        copy_tree "$directory/old-data" "$DATA" || restored=0
+    fi
+    if [ "$had_dir" = "1" ]; then
+        copy_tree "$directory/old-cli" "$CLI_DIR" || restored=0
+    fi
+    if [ "$had_json" = "1" ]; then
+        cp -p "$directory/old-cli.json" "$CLI_JSON" || restored=0
+    fi
+    write_current_atomic "$old_current" || restored=0
+    if [ "$restored" != "1" ]; then
+        echo "FAIL:切换回滚不完整，保留事务与备份: $directory"
+        return 1
+    fi
+    if txn_flag keep_created; then
+        [ ! -L "$BASE/keep-stage" ] && rm -rf "$BASE/keep-stage" || {
+            echo "FAIL:保留路径暂存无法清理: $BASE/keep-stage"; return 1;
+        }
+    fi
+    if ! cleanup_switch_txn; then
+        echo "WARN:已恢复旧账号，但事务备份清理失败: $directory"
+        return 1
+    fi
+    echo "OK:已恢复切换前的桌面、Claude Code 与 current 状态"
+    return 0
+}
+
 switch_to() {
+    local target cur old_slot directory capture=0 archive_desktop=0 archive_code=0 t0 transaction_info
     target="${1:-}"
     valid_account "$target" || return 1
-    # 槽位现在也换 ~/.claude。终端里开着 claude 就动它,等于把正在写的目录
-    # 抽走 —— 必须让人先退出。桌面 App 能 osascript 优雅退出,CLI 没有这个口子。
     if claude_cli_running; then
         echo "FAIL:Claude Code 正在运行，请先在终端退出（切换会换掉 ~/.claude）"
         return 1
     fi
+    recover_switch_state || return 1
+    [ ! -L "$BASE/current" ] || { echo "FAIL:current 路径含符号链接"; return 1; }
     cur="none"; [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
-    just_archived=0
-
-    # 首次运行:把当前登录中的状态收编为账号A
-    if [ "$cur" = "none" ] && [ -d "$DATA" ] && [ -n "$(ls -A "$DATA" 2>/dev/null)" ]; then
-        quit_claude || { echo "FAIL:Claude 未能退出，请手动退出后重试"; return 1; }
-        if [ -s "$BASE/keep-in-workspace.txt" ]; then
-            stage_keep_paths || { echo "FAIL:跨身份保留暂存失败，已停止切换"; return 1; }
-        fi
-        archive_current A || {
-            rm -rf "$BASE/keep-stage"
-            echo "FAIL:首次账号归档失败，已停止切换"; return 1
-        }
-        archive_cli A || {
-            rm -rf "$BASE/keep-stage"
-            echo "FAIL:首次归档 Claude Code 状态失败，已停止切换"; return 1
-        }
-        just_archived=1
-        cur="A"; echo "$cur" > "$BASE/current"
-        log "首次运行:当前登录状态已收编为账号A"
-        echo "NOTE:已将当前登录收编为账号A"
-    fi
-
-    if [ "$cur" = "$target" ]; then
-        # 归档是移动语义;首次收编或上次切换中断后,先用存档恢复 DATA
-        if [ ! -d "$DATA" ]; then
-            if [ ! -d "$BASE/accounts/$target" ]; then
-                echo "FAIL:账号$target 数据目录缺失，已停止切换"; return 1
-            fi
-            if ! copy_tree "$BASE/accounts/$target" "$DATA"; then
-                echo "FAIL:账号$target 还原失败，已停止切换"; return 1
-            fi
-        fi
-        # 上次还原失败留下的 stage,在当前账号上重试合并
-        if [ -d "$BASE/keep-stage" ]; then
-            restore_keep_paths || { echo "FAIL:跨身份保留还原失败，暂存保留在 $BASE/keep-stage"; return 1; }
-        fi
-        # 中断后 ~/.claude 可能已经不在原位,从存档补回来。只在现场确实缺了
-        # 才动手 —— restore_cli 会先清空现场,不能拿它做「顺手刷新」。
-        if [ ! -d "$CLI_DIR" ] && cli_slot_has_payload "$target"; then
-            restore_cli "$target" || { echo "FAIL:账号$target 的 Claude Code 状态还原失败"; return 1; }
-        fi
-        require_lease_for_launch || return 1
-        open -a "Claude"
-        lease_revoke
-        echo "INFO:当前已是账号$target"
-        return 0
-    fi
-
-    quit_claude || { echo "FAIL:Claude 未能退出，请手动退出后重试"; return 1; }
-
-    if [ "$just_archived" = "0" ] && [ "$cur" != "none" ] && [ -d "$DATA" ]; then
-        if [ -s "$BASE/keep-in-workspace.txt" ]; then
-            stage_keep_paths || { echo "FAIL:跨身份保留暂存失败，已停止切换"; return 1; }
-        fi
-        archive_current "$cur" || {
-            rm -rf "$BASE/keep-stage"
-            echo "FAIL:账号$cur 归档失败，已停止切换"; return 1
-        }
-        archive_cli "$cur" || {
-            rm -rf "$BASE/keep-stage"
-            echo "FAIL:账号$cur 的 Claude Code 状态归档失败，已停止切换"; return 1
-        }
-    fi
-
-    rm -rf "$DATA.new"
-    t0=$(date +%s)
-    if [ -d "$BASE/accounts/$target" ]; then
-        if ! copy_tree "$BASE/accounts/$target" "$DATA.new"; then
-            log "FAIL:账号$target 存档载入失败"
-            echo "FAIL:账号$target 存档载入失败，暂存保留在 $BASE/keep-stage"
-            return 1
-        fi
-        log "已载入账号$target 存档 ($(( $(date +%s) - t0 ))s)"
-    else
-        if ! mkdir -p "$DATA.new"; then
-            log "FAIL:无法创建账号$target 数据目录"
-            echo "FAIL:无法创建账号$target 数据目录"
-            return 1
-        fi
-        log "账号$target 无存档，将以全新状态初始化"
-    fi
-    if ! { rm -rf "$DATA" && mv "$DATA.new" "$DATA"; }; then
-        log "FAIL:载入账号$target 失败"
-        echo "FAIL:载入账号$target 失败，暂存保留在 $BASE/keep-stage"
-        return 1
-    fi
-    # 目标槽位没有 Claude Code 存档时,restore_cli 会把 ~/.claude 清空 ——
-    # 这是有意的:不然没存过的槽位会接着用上一个账号的登录态,等于没隔离。
-    if ! restore_cli "$target"; then
-        log "FAIL:账号$target 的 Claude Code 状态还原失败"
-        echo "FAIL:账号$target 的 Claude Code 状态还原失败，暂存保留在 $BASE/cli"
-        return 1
-    fi
-    echo "$target" > "$BASE/current"
-
-    if [ -d "$BASE/keep-stage" ]; then
-        if ! restore_keep_paths; then
-            echo "FAIL:跨身份保留还原失败，暂存保留在 $BASE/keep-stage"
-            return 1
-        fi
-    fi
-
+    case "$cur" in none|[A-H]) ;; *) echo "FAIL:current 内容无效"; return 1 ;; esac
     require_lease_for_launch || return 1
-    open -a "Claude"
+    quit_claude || { echo "FAIL:Claude 未能退出，请手动退出后重试"; return 1; }
+    if ! transaction_info=$(switch_txn_support init "$target" "$cur"); then
+        echo "FAIL:无法创建切换事务"; return 1
+    fi
+    old_slot="${transaction_info##*$'\t'}"
+    if [ "$cur" = "none" ] && { [ -d "$DATA" ] && [ -n "$(ls -A "$DATA" 2>/dev/null)" ]; }; then
+        capture=1
+    elif [ "$cur" = "none" ] && { [ -f "$CLI_JSON" ] || { [ -d "$CLI_DIR" ] && [ -n "$(ls -A "$CLI_DIR" 2>/dev/null)" ]; }; }; then
+        capture=1
+    fi
+    if { [ "$capture" = "1" ] || [ "$cur" != "none" ]; } && [ -s "$BASE/keep-in-workspace.txt" ]; then
+        if ! stage_keep_paths; then
+            recover_switch_txn; echo "FAIL:跨身份保留暂存失败，已停止切换"; return 1
+        fi
+        [ ! -d "$BASE/keep-stage" ] || txn_mark keep_created 1
+    fi
+    if ! backup_switch_live; then
+        echo "FAIL:无法备份切换前状态"; recover_switch_txn; return 1
+    fi
+    directory=$(txn_get txn_dir) || return 1
+    [ "$(txn_get had_data)" = "1" ] && archive_desktop=1
+    { [ "$(txn_get had_cli_dir)" = "1" ] || [ "$(txn_get had_cli_json)" = "1" ]; } && archive_code=1
+    t0=$(date +%s)
+    if [ "$cur" = "$target" ] && [ "$archive_desktop" = "1" ]; then
+        copy_tree "$directory/old-data" "$DATA" || { recover_switch_txn; return 1; }
+        if [ "$(txn_get had_cli_dir)" = "1" ]; then
+            copy_tree "$directory/old-cli" "$CLI_DIR" || { recover_switch_txn; return 1; }
+        elif cli_slot_has_payload "$target"; then
+            restore_cli "$target" || { recover_switch_txn; return 1; }
+        fi
+        if [ "$(txn_get had_cli_json)" = "1" ]; then
+            cp -p "$directory/old-cli.json" "$CLI_JSON" || { recover_switch_txn; return 1; }
+        fi
+        restore_keep_paths "$DATA" || { recover_switch_txn; return 1; }
+        txn_mark installed 1 && txn_mark state installed || { recover_switch_txn; return 1; }
+    else
+        if [ "$capture" = "1" ] || [ "$cur" != "none" ]; then
+            if [ "$archive_desktop" = "1" ]; then
+                copy_tree "$directory/old-data" "$DATA" || { recover_switch_txn; return 1; }
+            fi
+            if [ "$(txn_get had_cli_dir)" = "1" ]; then
+                copy_tree "$directory/old-cli" "$CLI_DIR" || { recover_switch_txn; return 1; }
+            fi
+            if [ "$(txn_get had_cli_json)" = "1" ]; then
+                cp -p "$directory/old-cli.json" "$CLI_JSON" || { recover_switch_txn; return 1; }
+            fi
+            if [ "$archive_desktop" = "1" ] && ! archive_current "$old_slot"; then
+                recover_switch_txn; echo "FAIL:账号$old_slot 归档失败，已恢复原状态"; return 1
+            fi
+            if [ "$archive_code" = "1" ] && ! archive_cli "$old_slot"; then
+                recover_switch_txn; echo "FAIL:首次或当前账号 Claude Code 归档失败，已恢复原状态"; return 1
+            fi
+            txn_mark archived 1
+            if [ "$capture" = "1" ]; then
+                cur="$old_slot"
+                echo "NOTE:已将当前登录收编为账号$old_slot"
+            fi
+        fi
+        if ! prepare_switch_target "$target"; then
+            recover_switch_txn
+            echo "FAIL:账号$target 暂存失败，已恢复原状态"; return 1
+        fi
+        txn_mark target_ready 1 && txn_mark state staged || { recover_switch_txn; return 1; }
+        if ! install_switch_target "$target"; then
+            recover_switch_txn
+            echo "FAIL:账号$target 载入失败，已恢复原状态"; return 1
+        fi
+    fi
+    if ! write_current_atomic "$target"; then
+        recover_switch_txn
+        echo "FAIL:current 提交失败，已恢复原状态"; return 1
+    fi
+    txn_mark current_committed 1 && txn_mark state current_committed || { recover_switch_txn; return 1; }
+    if ! require_lease_for_launch; then
+        recover_switch_txn
+        echo "FAIL:启动租约已失效，已恢复原状态"; return 1
+    fi
+    txn_mark launch_attempted 1 && txn_mark state launch_attempted || { recover_switch_txn; return 1; }
+    if ! open -a "Claude"; then
+        recover_switch_txn
+        echo "FAIL:Claude 启动失败，已恢复原状态"; return 1
+    fi
+    txn_mark state completed || {
+        echo "FAIL:事务完成标记写入失败，请保留现场并重试切换: $BASE/switch-txn.json"; return 1;
+    }
     lease_revoke
+    if ! cleanup_switch_txn; then
+        echo "WARN:切换已成功，事务备份清理失败: $BASE/switch-txn.json"
+    fi
     log "已切换到账号$target 并启动 ($(( $(date +%s) - t0 ))s)"
+    if [ "$cur" = "$target" ] && [ "$capture" != "1" ]; then echo "INFO:当前已是账号$target"; fi
     echo "OK:已切换到账号$target ($(( $(date +%s) - t0 ))s)"
     return 0
 }

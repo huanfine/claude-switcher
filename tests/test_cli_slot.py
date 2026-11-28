@@ -49,7 +49,7 @@ class CliSlotTests(unittest.TestCase):
         self.cli_json = self.fixture / ".claude.json"
         self.cli_base = self.base / "cli"
 
-    def run_shell(self, body, *, cli_running="0", functions=None):
+    def run_shell(self, body, *, cli_running="0", functions=None, inject="none"):
         env = {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "HOME": str(self.fixture),
@@ -60,6 +60,7 @@ class CliSlotTests(unittest.TestCase):
             "CLI_BASE": str(self.cli_base),
             "FIXTURE": str(self.fixture),
             "CLI_RUNNING": cli_running,
+            "INJECT": inject,
             "LC_ALL": "C",
         }
         parts = [
@@ -69,6 +70,16 @@ class CliSlotTests(unittest.TestCase):
             'quit_claude() { return 0; }',
             'open() { :; }',
             'claude_cli_running() { [ "$CLI_RUNNING" = "1" ]; }',
+            '''mv() {
+  local args=("$@") last src dst
+  last=$((${#args[@]} - 1))
+  src=${args[$((last - 1))]}; dst=${args[$last]}
+  if [ "$INJECT" = "json_move_error" ] &&
+     [ "$src" = "$CLI_BASE/A.new/home.json" ] && [ "$dst" = "$CLI_JSON" ]; then
+    return 31
+  fi
+  command mv "$@"
+}''',
         ]
         parts.extend(functions or [self.has_payload, self.archive, self.restore])
         parts.append(body)
@@ -144,6 +155,20 @@ class CliSlotTests(unittest.TestCase):
         self.assertIn("DONE", run.stdout, run.stderr)
         self.assertFalse(self.cli_dir.exists(), "上一个账号的 ~/.claude 没清掉")
         self.assertFalse(self.cli_json.exists(), "上一个账号的 ~/.claude.json 没清掉")
+
+    def test_restore_rolls_back_when_home_json_move_fails(self):
+        self.seed_live("A")
+        self.run_shell("archive_cli A")
+        self.seed_live("B")
+        before_home = (self.cli_dir / "session").read_bytes()
+        before_json = self.cli_json.read_bytes()
+        run = self.run_shell("restore_cli A", inject="json_move_error")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual((self.cli_dir / "session").read_bytes(), before_home)
+        self.assertEqual(self.cli_json.read_bytes(), before_json)
+        self.assertEqual((self.cli_base / "A/home/session").read_text(), "A")
+        self.assertFalse((self.cli_base / "A.new").exists())
+        self.assertFalse(list(self.cli_base.glob(".restore-cli.*")))
 
     def test_payload_probe_sees_partial_state(self):
         """只有 ~/.claude.json、没有 ~/.claude 也算「有存档」。"""
