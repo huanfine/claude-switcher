@@ -205,7 +205,7 @@ class SlotNodeBindingTests(unittest.TestCase):
         TRASH.mkdir(exist_ok=True)
         cls.functions = "\n".join(
             function_source(name) for name in
-            ("slot_node_show", "slot_node_list", "slot_node_set", "slot_node_clear")
+            ("slot_node_show", "slot_node_list", "slot_node_set", "slot_node_clear", "slots")
         )
 
     def setUp(self):
@@ -248,6 +248,13 @@ class SlotNodeBindingTests(unittest.TestCase):
         listed = self.shell("slot_node_list").stdout.strip().splitlines()
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0].split("\t")[0], "B")
+
+    def test_list_includes_e_through_h(self):
+        for slot in ("E", "F", "G", "H"):
+            self.shell(f'slot_node_set {slot} "节点-{slot}" >/dev/null')
+        listed = self.shell("slot_node_list").stdout.strip().splitlines()
+        self.assertEqual([line.split("\t")[0] for line in listed],
+                         ["E", "F", "G", "H"])
 
     def test_clear_removes_only_that_slot(self):
         self.shell('slot_node_set A "鱼1" >/dev/null; slot_node_set B "鱼9" >/dev/null')

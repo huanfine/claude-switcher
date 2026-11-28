@@ -4,6 +4,7 @@
 """
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,21 @@ class SnapshotTransferTests(unittest.TestCase):
         self.assertEqual(restored.read_text(encoding="utf-8"), "account-a")
         self.assertFalse((home2 / ".claude-switcher" / "accounts" / "A"
                           / ".claude-switcher-snapshot.json").exists())
+
+    def test_boundary_slots_e_and_h_round_trip(self):
+        for target in ("E", "H"):
+            with self.subTest(target=target):
+                slot = self.accounts / target
+                slot.mkdir()
+                (slot / "marker.txt").write_text(target, encoding="utf-8")
+                image = self.root / f"account-{target}.dmg"
+                exported = self.export(target, image)
+                self.assertEqual(exported.returncode, 0, exported.stdout + exported.stderr)
+                shutil.rmtree(slot)
+                imported = self.import_into(target, image)
+                self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+                self.assertEqual((slot / "marker.txt").read_text(encoding="utf-8"), target)
+                self.assertFalse((slot / ".claude-switcher-snapshot.json").exists())
 
     def test_wrong_password_leaves_no_snapshot(self):
         self.assertEqual(self.export().returncode, 0)

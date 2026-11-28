@@ -5634,7 +5634,7 @@ slot_node_show() {
 
 slot_node_list() {
     local a line
-    for a in A B C D; do
+    for a in $(slots); do
         line=$(slot_node_show "$a")
         [ "$line" = "NONE" ] || printf '%s\t%s\n' "$a" "$line"
     done
@@ -7300,7 +7300,7 @@ import json, sys
 with open(sys.argv[1], encoding="utf-8") as f: meta = json.load(f)
 assert meta.get("format") == "claude-switcher-snapshot"
 assert meta.get("version") == 1
-assert meta.get("account") in ("A", "B", "C", "D")
+assert meta.get("account") in tuple("ABCDEFGH")
 sys.exit(0 if meta.get("account") == sys.argv[2] else 1)
 PY
     then
