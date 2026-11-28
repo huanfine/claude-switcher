@@ -2170,23 +2170,33 @@ def _egress_kind(entry):
 
 
 def node_scan(clash_dir, group):
+    def checked_name(value, label):
+        text = str(value)
+        if re.search(r"[\x00-\x1f\x7f]", text):
+            fail(label + "含有控制字符,拒绝枚举")
+        return text
+
     base, secret = controller_config(clash_dir)
     data = api_get(base, secret, "/proxies")
     proxies = data.get("proxies")
     if not isinstance(proxies, dict):
         fail("Clash 内核 /proxies 返回格式异常")
     entries = parse_proxy_entries(clash_dir / "clash-verge.yaml")
+    group = checked_name(group, "代理组名")
 
     builtin = {"DIRECT", "REJECT", "GLOBAL", "PASS", "COMPATIBLE"}
     is_group = lambda name: isinstance(proxies.get(name), dict) and "all" in proxies[name]
 
     def active_leaf(name, seen=None):
         seen = set() if seen is None else seen
+        name = checked_name(name, "节点名")
         item = proxies.get(name)
         if not isinstance(item, dict) or name in seen:
             return ""
         seen.add(name)
         now = str(item.get("now") or "")
+        if now:
+            now = checked_name(now, "节点名")
         if not is_group(name):
             return name
         return active_leaf(now, seen) if now else ""
@@ -2205,10 +2215,11 @@ def node_scan(clash_dir, group):
         name, best, seen, chain = group, "", set(), []
         auto = None
         while is_group(name) and name not in seen:
+            name = checked_name(name, "代理组名")
             seen.add(name)
             item = proxies[name]
             children = item.get("all") or []
-            itype = str(item.get("type", "")).lower()
+            itype = checked_name(str(item.get("type", "")), "代理组类型").lower()
             chain.append("%s(%s)" % (name, item.get("type", "")))
             if itype == "selector" and any(
                     child not in builtin and not is_group(child) for child in children):
@@ -2217,6 +2228,8 @@ def node_scan(clash_dir, group):
                 leaves = [c for c in children if c not in builtin and not is_group(c)]
                 auto = (name, item.get("type", ""), leaves)
             nxt = str(item.get("now") or "")
+            if nxt:
+                nxt = checked_name(nxt, "代理组名")
             if not nxt or not is_group(nxt):
                 break
             name = nxt
@@ -2235,10 +2248,11 @@ def node_scan(clash_dir, group):
         # 反过来催用户去点一个必然失败的按钮(2026-11-21 实测:🤖 OpenAi(Selector)
         # → 🧠 AI·干净IP(Fallback),成员是两个固定 IP)。
         if auto and auto[2]:
-            print("NOCHOICE\t" + re.sub(r"[\t\r\n]", " ", auto[0])
-                  + "\t" + re.sub(r"[\t\r\n]", " ", auto[1])
-                  + "\t" + re.sub(r"[\t\r\n]", " ", "|".join(auto[2])))
-            print("CHAIN\t" + re.sub(r"[\t\r\n]", " ", " → ".join(chain_desc)))
+            members = "|".join(checked_name(c, "节点名") for c in auto[2])
+            print("NOCHOICE\t" + checked_name(auto[0], "代理组名")
+                  + "\t" + checked_name(auto[1], "代理组类型")
+                  + "\t" + members)
+            print("CHAIN\t" + " → ".join(chain_desc))
             return
         fail("当前链路上没有可手动选择的节点组(链路:" + " → ".join(chain_desc)
              + ";若某组是 URLTest/Fallback 自动选路,切换须改回手动选择或换组)")
@@ -2246,6 +2260,7 @@ def node_scan(clash_dir, group):
     for child in item.get("all") or []:
         if child in builtin or is_group(child):
             continue
+        child = checked_name(child, "节点名")
         entry = entries.get(child)
         egress, server = _egress_kind(entry)
         udp = str((entry or {}).get("udp", "")).lower() == "true"
@@ -2253,15 +2268,11 @@ def node_scan(clash_dir, group):
                      "1" if udp else "0"))
     current = active_leaf(group)
 
-    def clean(value):
-        return re.sub(r"[\t\r\n]", " ", str(value))
-
     print("SCANv1")
-    print("GROUP\t" + clean(group))
-    print("CURRENT\t" + clean(current))
+    print("GROUP\t" + group)
+    print("CURRENT\t" + current)
     for selector, leaf, server, egress, udp in rows:
-        print("\t".join(("NODE", clean(selector), clean(leaf),
-                         clean(server), egress, udp)))
+        print("\t".join(("NODE", selector, leaf, server, egress, udp)))
 
 
 def node_select(clash_dir, group, selector, leaf):
@@ -5185,6 +5196,83 @@ preferred_node_leaf() {
     awk -F'\t' 'NF >= 2 && $2 != "" {print $2; exit}' "$PREFERRED_NODE_FILE" 2>/dev/null
 }
 
+# 扫描与显式应用共用的唯一资格口径。stdout 为空表示合格,否则是具体排除原因。
+node_candidate_gate() {
+    local egress="${1:-}" score="${2:-}" verdict="${3:-}" ptype="${4:-}"
+    local cc="${5:-}" udp="${6:-}" wpolicy="${7:-proxy}" country="${8:-}" why=""
+    case "$wpolicy" in proxy|reject) ;; *) wpolicy=proxy ;; esac
+    case "$egress" in
+        fronted) why="CDN 前置,出口未知" ;;
+        domain)  why="入口是域名,出口未知" ;;
+        missing) why="配置里没有 server" ;;
+        known)
+            case "$score" in
+                ''|*[!0-9]*) why="未评级(类型证据缺失)" ;;
+            esac
+            if [ -z "$why" ]; then
+                case "$verdict" in
+                    fail) why="硬门槛:$(purity_fail_reason "$ptype" "${score:-}" "$verdict")" ;;
+                esac
+            fi ;;
+        *) why="出口类型未知" ;;
+    esac
+    if [ -z "$why" ]; then
+        if [ -z "$cc" ]; then
+            why="国家待验证"
+        elif [ -n "$country" ] && [ "$cc" != "$country" ]; then
+            why="国家不符(${cc}≠${country})"
+        fi
+    fi
+    if [ -z "$why" ] && [ "$udp" = "0" ] && [ "$wpolicy" != "reject" ]; then
+        why="UDP 未标注"
+    fi
+    printf '%s\n' "$why"
+}
+
+node_scan_report_fresh() {
+    local file="${1:-$NODE_SCAN_FILE}" epoch now ttl
+    [ -f "$file" ] || return 1
+    epoch=$(sed -n 's/^EPOCH=//p' "$file" | head -1)
+    case "${epoch:-}" in ''|*[!0-9]*) return 1 ;; esac
+    now=$(date +%s)
+    ttl="${NODE_SCAN_TTL:-86400}"
+    case "$ttl" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$epoch" -le "$now" ] && [ $((now - epoch)) -le "$ttl" ]
+}
+
+# 只接受本次报告里唯一且合格的 selector+leaf;旧格式报告没有 CANDIDATE 行,
+# 必须重扫,不能退回「节点还在内核里」这种成员关系检查。
+node_report_candidate() {
+    local file="${1:-}" selector="${2:-}" leaf="${3:-}"
+    local count record rsel rleaf eligible reason score ip cc verdict ptype egress udp
+    local wpolicy="proxy" why=""
+    [ -f "$file" ] || { echo "FAIL:还没有扫描报告,请先运行 node-scan" >&2; return 1; }
+    node_scan_report_fresh "$file" || { echo "FAIL:扫描报告已过期或损坏,请先重新扫描" >&2; return 1; }
+    count=$(awk -F'\t' -v s="$selector" -v l="$leaf" \
+        '$1=="CANDIDATE" && $2==s && $3==l {n++} END{print n+0}' "$file")
+    [ "$count" = "1" ] || {
+        echo "FAIL:候选记录不存在或不唯一(Selector $selector / 节点 $leaf),请重新扫描" >&2; return 1; }
+    record=$(awk -F'\t' -v s="$selector" -v l="$leaf" '
+        $1=="CANDIDATE" && $2==s && $3==l {
+            if (NF != 12) exit 1
+            printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n",
+                   $2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+            exit
+        }' "$file") || { echo "FAIL:候选报告格式损坏,请重新扫描" >&2; return 1; }
+    IFS=$'\037' read -r rsel rleaf eligible reason score ip cc verdict ptype egress udp <<<"$record"
+    if [ "$eligible" != "1" ]; then
+        echo "FAIL:候选未过硬门槛(${reason:-原因缺失})" >&2; return 1
+    fi
+    if [ -f "$BASE/webrtc-policy" ]; then
+        wpolicy=$(tr -d ' \t\r\n' < "$BASE/webrtc-policy" 2>/dev/null)
+        case "$wpolicy" in proxy|reject) ;; *) wpolicy=proxy ;; esac
+    fi
+    why=$(node_candidate_gate "$egress" "$score" "$verdict" "$ptype" "$cc" "$udp" \
+        "$wpolicy" "${COUNTRY_TARGET:-}")
+    [ -z "$why" ] || { echo "FAIL:候选未过硬门槛($why)" >&2; return 1; }
+    printf '%s\t%s\t%s\t%s\t%s\n' "$rsel" "$rleaf" "$score" "$ip" "$cc"
+}
+
 # ---------- 「Claude 在不在跑」的统一判据 ----------
 # 三个入口都要认,少一个就会出现「明明开着却报未运行」:
 #   1. 桌面 App      <安装位置>/Claude.app/Contents/MacOS/Claude
@@ -5268,15 +5356,18 @@ scan_nodes() {
         nc_chain=$(awk -F'\t' '$1=="CHAIN"{print $2; exit}' "$raw")
         nc_now=$(date +%s)
         if [ -n "${BASE:-}" ] && [ -d "$BASE" ]; then
-            { printf 'EPOCH=%s\n' "$nc_now"
-              printf 'NOCHOICE=1\n'
-              printf 'NOCHOICE_GROUP=%s\n' "$nc_group"
-              printf 'NOCHOICE_TYPE=%s\n' "$nc_type"
-              printf 'NOCHOICE_MEMBERS=%s\n' "$nc_members"
-              printf 'NOCHOICE_CHAIN=%s\n' "$nc_chain"
-              printf 'SCAN_TIME=%s\n' "$(date '+%Y-%m-%d %H:%M')"
-            } > "$NODE_SCAN_FILE.tmp" 2>/dev/null \
-                && mv "$NODE_SCAN_FILE.tmp" "$NODE_SCAN_FILE" 2>/dev/null
+            if ! { printf 'EPOCH=%s\n' "$nc_now"
+                   printf 'NOCHOICE=1\n'
+                   printf 'NOCHOICE_GROUP=%s\n' "$nc_group"
+                   printf 'NOCHOICE_TYPE=%s\n' "$nc_type"
+                   printf 'NOCHOICE_MEMBERS=%s\n' "$nc_members"
+                   printf 'NOCHOICE_CHAIN=%s\n' "$nc_chain"
+                   printf 'SCAN_TIME=%s\n' "$(date '+%Y-%m-%d %H:%M')"
+                 } > "$NODE_SCAN_FILE.tmp" 2>/dev/null \
+                 || ! mv "$NODE_SCAN_FILE.tmp" "$NODE_SCAN_FILE" 2>/dev/null; then
+                echo "FAIL:写入节点扫描报告失败" >&2
+                rm -rf "$tmp"; return 1
+            fi
         fi
         # node-apply 切完会静默重扫一次,那时不该把整段人话混进应用回执。
         if [ "${NODE_SCAN_QUIET:-0}" != "1" ]; then
@@ -5303,53 +5394,41 @@ scan_nodes() {
     wait
 
     : > "$tmp/ranked"
-    while IFS=$'\t' read -r tag sel leaf ip egress udp; do
+    : > "$tmp/candidates"
+    if ! awk -F'\t' '$1=="NODE" {
+            if (NF != 6) exit 1
+            printf "%s\037%s\037%s\037%s\037%s\037%s\n", $1,$2,$3,$4,$5,$6
+        }' "$raw" > "$tmp/rows"; then
+        echo "FAIL:节点枚举返回格式异常" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    while IFS=$'\037' read -r tag sel leaf ip egress udp; do
         [ "$tag" = "NODE" ] || continue
         candidates=$((candidates + 1))
         score=""; verdict=""; ptype=""; detail=""; cc=""; why=""; eligible=1
         case "$egress" in
-            fronted) why="CDN 前置,出口未知"; eligible=0; unknown_n=$((unknown_n + 1)) ;;
-            domain)  why="入口是域名,出口未知"; eligible=0; unknown_n=$((unknown_n + 1)) ;;
-            missing) why="配置里没有 server"; eligible=0; unknown_n=$((unknown_n + 1)) ;;
             known)
                 if [ -f "$tmp/p_$ip" ]; then
                     IFS='|' read -r score verdict ptype detail cc < "$tmp/p_$ip"
-                fi
-                case "$score" in
-                    # 空分数不再是「取不到」,而是「未评级」这个合法结论(类型证据
-                    # 缺失)。没有量出来的分就没法排名,不参与候选,但话要说对。
-                    ''|*[!0-9]*) why="未评级(类型证据缺失)"; score=""; eligible=0 ;;
-                esac ;;
-            *) why="出口类型未知"; eligible=0 ;;
+                fi ;;
         esac
-        if [ "$eligible" = 1 ]; then
-            case "$verdict" in
-                # 不再把所有 fail 一律叫「风险过高」:分数是信誉分,判定是硬门槛。
-                # 68 分的代理/VPN 节点要写清「硬门槛:代理/VPN 特征(信誉 68 分,
-                # 分数与判定分开)」,既解释高分为何被排除,也不给非代理的 fail 扣错帽子。
-                fail) why="硬门槛:$(purity_fail_reason "$ptype" "${score:-}" "$verdict")"; eligible=0 ;;
-            esac
-        fi
-        if [ "$eligible" = 1 ]; then
-            if [ -z "$cc" ]; then
-                why="国家待验证"; eligible=0
-            elif [ -n "$COUNTRY_TARGET" ] && [ "$cc" != "$COUNTRY_TARGET" ]; then
-                why="国家不符(${cc}≠${COUNTRY_TARGET})"; eligible=0
-            fi
-        fi
-        if [ "$eligible" = 1 ] && [ "$udp" = "0" ] && [ "$wpolicy" != "reject" ]; then
-            why="UDP 未标注"; eligible=0
-        fi
+        why=$(node_candidate_gate "$egress" "$score" "$verdict" "$ptype" "$cc" "$udp" \
+            "$wpolicy" "${COUNTRY_TARGET:-}")
+        [ -n "$why" ] && eligible=0
+        case "$egress" in fronted|domain|missing) unknown_n=$((unknown_n + 1)) ;; esac
         [ "$eligible" = 1 ] && eligible_n=$((eligible_n + 1))
         # 第 9 列是分数区间,给排名表一个参照系。放在最后,前面各列的
         # 序号和 sort 键都不受影响。
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "${score:-}" "$eligible" "$leaf" "$ip" "$cc" "$verdict" "$why" "$sel" \
             "$(purity_band "${score:-}")" >> "$tmp/ranked"
+        printf 'CANDIDATE\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$sel" "$leaf" "$eligible" "$why" "${score:-}" "$ip" "$cc" "$verdict" \
+            "$ptype" "$egress" "$udp" >> "$tmp/candidates"
         if [ "$leaf" = "$current" ]; then
             cur_ip="$ip"; cur_score="${score:-}"
         fi
-    done < "$raw"
+    done < "$tmp/rows"
     # 当前节点没被枚举到(例如它挂在 URLTest 下)时,单独给它打一次分。
     if [ -n "$cur_ip" ] && [ -f "$tmp/p_$cur_ip" ]; then
         IFS='|' read -r score verdict ptype detail cc < "$tmp/p_$cur_ip"
@@ -5357,12 +5436,16 @@ scan_nodes() {
     fi
 
     sort -t$'\t' -k2,2nr -k1,1nr "$tmp/ranked" > "$tmp/sorted"
-    line=$(awk -F'\t' '$2==1 {print; exit}' "$tmp/sorted")
+    line=$(awk -F'\t' '$2==1 {
+        printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n",
+               $1,$2,$3,$4,$5,$6,$7,$8,$9
+        exit
+    }' "$tmp/sorted")
     local top_eligible=0
     if [ -n "$line" ]; then
         # 第 9 列(区间)必须有变量接住:read 的最后一个变量会吞掉剩余整段,
         # 少写一个就会把「优秀」拼进 BEST_SELECTOR,切节点时找不到那个名字。
-        IFS=$'\t' read -r best_score eligible best_leaf best_ip best_cc verdict why best_sel best_band <<<"$line"
+        IFS=$'\037' read -r best_score eligible best_leaf best_ip best_cc verdict why best_sel best_band <<<"$line"
         top_eligible=$best_score
         # 当前节点没量出分数时没有比较基准 —— 拿 0 当基准会把「没查到」包装成
         # 「比当前高 N 分」,和「没查冒充查干净」是同一种错。建议整体清空,
@@ -5417,8 +5500,10 @@ scan_nodes() {
         printf 'ELIGIBLE=%s\n' "$eligible_n"
         printf 'PREFERRED=%s\n' "$pref"
         printf 'PREFERRED_MATCH=%s\n' "$pref_match"
+        cat "$tmp/candidates"
         awk -F'\t' 'NR<=3 {printf "TOP%d=%s|%s|%s|%s|%s\n", NR, $3, $1, $5, $6, $7}' "$tmp/sorted"
-    } > "$NODE_SCAN_FILE.tmp" 2>/dev/null && mv "$NODE_SCAN_FILE.tmp" "$NODE_SCAN_FILE"
+    } > "$NODE_SCAN_FILE.tmp" 2>/dev/null && mv "$NODE_SCAN_FILE.tmp" "$NODE_SCAN_FILE" \
+        || { echo "FAIL:写入节点扫描报告失败" >&2; rm -rf "$tmp"; return 1; }
 
     # node-apply 切完会静默重扫一次刷新报告,那时不该把整段人话混进应用回执。
     if [ "${NODE_SCAN_QUIET:-0}" != "1" ]; then
@@ -5517,33 +5602,38 @@ node_apply() {
     # 可选参数:指定要切的叶子。槽位绑定走这条路 —— 「切到 B 就换 B 绑的那条线」,
     # 而不是「换成本次扫描分数最高的那条」。不给参数时维持原语义(用报告里的 BEST)。
     local want_leaf="${1:-}"
-    local epoch now best="" best_score=0 best_ip="" best_sel="" selector="" current=""
+    local best="" best_score=0 best_ip="" best_cc="" best_sel="" selector="" current=""
+    local candidate="" cand_sel="" cand_leaf=""
     local gate reason tmp raw="" original="" now_leaf="" trace loc="" ip_after="" i verified=0
     [ -f "$NODE_SCAN_FILE" ] || { echo "FAIL:还没有扫描报告,请先运行 node-scan" >&2; return 1; }
-    epoch=$(sed -n 's/^EPOCH=//p' "$NODE_SCAN_FILE" | head -1)
-    now=$(date +%s)
-    case "${epoch:-}" in ''|*[!0-9]*) epoch=0 ;; esac
-    [ $((now - epoch)) -le "$NODE_SCAN_TTL" ] || {
-        echo "FAIL:扫描报告已过期,请先重新扫描" >&2; return 1; }
+
+    # 先过实时报告门禁;扫描期间仍只读,不会因为用户已经开起 Claude 而动线路。
+    IFS='|' read -r gate reason <<<"$(node_gate)"
+    [ "$gate" = "auto-ok" ] || {
+        echo "FAIL:当前有实例在用,按约定只出报告(${reason:-门禁判定失败})" >&2; return 1; }
+
+    # 显式叶子也必须来自本次资格扫描。旧报告过期、订阅变化或纯度结论变化时,
+    # 不能拿「它还在内核里」当授权;扫描失败则 fail-closed。
+    NODE_SCAN_QUIET=1 scan_nodes || { echo "FAIL:应用前节点扫描失败,未切换" >&2; return 1; }
     selector=$(sed -n 's/^SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
     current=$(sed -n 's/^CURRENT=//p' "$NODE_SCAN_FILE" | head -1)
     if [ -n "$want_leaf" ]; then
-        # 绑定节点没有「分数」这回事,分数只用于「谁更值得换」的比较。
         best="$want_leaf"
         best_sel="$selector"
-        best_ip=""
     else
         best=$(sed -n 's/^BEST=//p' "$NODE_SCAN_FILE" | head -1)
         [ -n "$best" ] || { echo "FAIL:当前没有值得切换的更优节点,无需应用" >&2; return 1; }
-        best_score=$(sed -n 's/^BEST_SCORE=//p' "$NODE_SCAN_FILE" | head -1)
-        best_ip=$(sed -n 's/^BEST_IP=//p' "$NODE_SCAN_FILE" | head -1)
         best_sel=$(sed -n 's/^BEST_SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
     fi
-    [ -n "$best_sel" ] || best_sel="$selector"
     [ -n "$best_sel" ] || { echo "FAIL:报告里没有可用的 Selector,请重新扫描" >&2; return 1; }
+    if ! candidate=$(node_report_candidate "$NODE_SCAN_FILE" "$best_sel" "$best"); then
+        return 1
+    fi
+    IFS=$'\t' read -r cand_sel cand_leaf best_score best_ip best_cc <<<"$candidate"
+    best_sel="$cand_sel"
+    best="$cand_leaf"
 
-    # 不信报告里的 GATE:它是扫描那一刻的快照。此刻重新判一次,才不会
-    # 拿一份旧报告在用户已经开起 Claude 之后偷偷换线路。
+    # 不信报告里的 GATE:它是扫描那一刻的快照。PUT 前按此刻真实状态再判一次。
     IFS='|' read -r gate reason <<<"$(node_apply_gate)"
     [ "$gate" = "allowed" ] || {
         echo "FAIL:当前有实例在用,按约定只出报告($reason)" >&2; return 1; }
@@ -5569,7 +5659,7 @@ node_apply() {
                   '$1=="NODE" && $2==s && $3==l {print $4; exit}' "$raw")
     fi
 
-    echo "切换:$original → $best (Selector $best_sel)"
+    echo "切换:$original → $best (Selector $best_sel · 扫描出口 ${best_ip:-未知}/${best_cc:-未知})"
     if ! clash_rules node-select "$best_sel" "$best" >"$tmp/out" 2>&1; then
         echo "FAIL:内核拒绝切换($(head -1 "$tmp/out"))" >&2
         rm -rf "$tmp"; return 1
@@ -5649,6 +5739,7 @@ slot_node_set() {
         sel=$(sed -n 's/^SELECTOR=//p' "$NODE_SCAN_FILE" | head -1)
     fi
     [ -n "$sel" ] || { echo "FAIL:报告里没有可用的 Selector,请先 node-scan"; return 1; }
+    node_report_candidate "$NODE_SCAN_FILE" "$sel" "$leaf" >/dev/null || return 1
     mkdir -p "$SLOT_NODE_DIR" || return 1
     printf '%s\t%s\t%s\n' "$sel" "$leaf" "$(date +%s)" > "$SLOT_NODE_DIR/$slot.tmp" \
         && mv "$SLOT_NODE_DIR/$slot.tmp" "$SLOT_NODE_DIR/$slot" \

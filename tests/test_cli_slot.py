@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -205,7 +206,9 @@ class SlotNodeBindingTests(unittest.TestCase):
         TRASH.mkdir(exist_ok=True)
         cls.functions = "\n".join(
             function_source(name) for name in
-            ("slot_node_show", "slot_node_list", "slot_node_set", "slot_node_clear", "slots")
+            ("node_scan_report_fresh", "node_candidate_gate", "node_report_candidate",
+             "purity_fail_reason", "slot_node_show", "slot_node_list", "slot_node_set",
+             "slot_node_clear", "slots")
         )
 
     def setUp(self):
@@ -214,13 +217,26 @@ class SlotNodeBindingTests(unittest.TestCase):
         self.fixture = Path(self.tmp.name)
         self.slot_node_dir = self.fixture / "slot-node"
         self.scan_file = self.fixture / "node-scan.txt"
-        self.scan_file.write_text("SELECTOR=🧠 AI·干净IP\n", encoding="utf-8")
+        self.write_report()
+
+    def write_report(self):
+        leaves = ["鱼9·日本-东京", "鱼1", "鱼9"] + [f"节点-{slot}" for slot in "ABCDEFGH"]
+        lines = [f"EPOCH={int(time.time())}", "SELECTOR=🧠 AI·干净IP"]
+        lines.extend(
+            f"CANDIDATE\t🧠 AI·干净IP\t{leaf}\t1\t\t88\t192.0.2.2\tUS\tok\tresidential\tknown\t1"
+            for leaf in leaves
+        )
+        self.scan_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def shell(self, body):
         parts = [
             "set -u",
+            f'BASE="{self.fixture}"',
             f'SLOT_NODE_DIR="{self.slot_node_dir}"',
             f'NODE_SCAN_FILE="{self.scan_file}"',
+            'NODE_SCAN_TTL="86400"',
+            'COUNTRY_TARGET="US"',
+            "lease_revoke() { :; }",
             function_source("valid_account"),
             self.functions,
             body,
