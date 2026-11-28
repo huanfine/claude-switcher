@@ -5894,15 +5894,55 @@ self_update() {
         || [ ! -s "$tmpd/SHA256SUMS" ]; then
         echo "FAIL:无法获取校验清单(SHA256SUMS),已中止"; rm -rf "$tmpd"; return 1
     fi
-    bad=0
-    while read -r sum rel; do
-        [ -z "$sum" ] && continue
-        if [ ! -f "$NEW/$rel" ] || [ "$(shasum -a 256 "$NEW/$rel" | awk '{print $1}')" != "$sum" ]; then
-            bad=1; break
-        fi
-    done < "$tmpd/SHA256SUMS"
-    if [ "$bad" -eq 1 ]; then
-        echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; rm -rf "$tmpd"; return 1
+    if ! remote_core_sha=$("${CLAUDE_SWITCHER_PYTHON:-python3}" - "$tmpd/SHA256SUMS" "$NEW" <<'PY'
+import hashlib, re, stat, sys
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+root = Path(sys.argv[2]).resolve()
+required = "core/claude-switch.sh"
+seen = set()
+entries = []
+for number, raw in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+    if not raw or raw.startswith("#"):
+        continue
+    match = re.fullmatch(r"([0-9a-f]{64})  (.+)", raw)
+    if not match:
+        raise SystemExit(f"清单第 {number} 行格式无效")
+    digest, rel = match.groups()
+    parts = Path(rel).parts
+    if (not rel or Path(rel).is_absolute() or rel in seen
+            or any(part in ("", ".", "..") for part in parts)):
+        raise SystemExit(f"清单路径无效或重复: {rel}")
+    seen.add(rel)
+    target = root.joinpath(*parts)
+    cursor = root
+    for part in parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise SystemExit(f"清单路径不得经过符号链接: {rel}")
+    if not target.is_file() or not stat.S_ISREG(target.lstat().st_mode):
+        raise SystemExit(f"清单工件缺失: {rel}")
+    actual = hashlib.sha256(target.read_bytes()).hexdigest()
+    if actual != digest:
+        raise SystemExit(f"工件校验失败: {rel}")
+    entries.append((digest, rel))
+if required not in seen:
+    raise SystemExit("清单缺少 core/claude-switch.sh")
+print(next(digest for digest, rel in entries if rel == required))
+PY
+    ); then
+        echo "FAIL:校验清单无效或工件校验失败,已中止"
+        rm -rf "$tmpd"; return 1
+    fi
+    case "$remote_core_sha" in
+        ''|*[!0-9a-f]*) echo "FAIL:核心工件校验值无效,已中止"; rm -rf "$tmpd"; return 1 ;;
+    esac
+    [ "${#remote_core_sha}" -eq 64 ] || {
+        echo "FAIL:核心工件校验值无效,已中止"; rm -rf "$tmpd"; return 1; }
+    if ! "${BASH:-/bin/bash}" -n "$NEW/core/claude-switch.sh"; then
+        echo "FAIL:远程核心脚本语法检查失败,已中止"
+        rm -rf "$tmpd"; return 1
     fi
 
     # 跳过判断:核心脚本是发布产物、不含环境值,直接整份比对即可
@@ -7686,11 +7726,15 @@ case "$operation" in
     get-client) get_client ;;
     fake-prefix) printf '%s\n' "${FAKE_PREFIX:-198.18.}" ;;
     restart-clash) restart_clash ;;
-    update) lease_revoke; self_update "${2:-}"
-        # App 自更新(阶段二):--auto 时接在核心更新之后,同一份 update.log;
-        # self_update --auto 的 exec 重定向是进程级的,子调用输出自然落日志。
-        # 两个步骤互不阻塞:App 下载失败不影响核心已完成的更新。
-        if [ "${2:-}" = "--auto" ]; then app_self_update --auto ""; fi ;;
+    update)
+        lease_revoke
+        if self_update "${2:-}"; then
+            # 两个步骤互不阻塞:App 下载失败不影响核心已完成的更新。
+            if [ "${2:-}" = "--auto" ]; then app_self_update --auto ""; fi
+        else
+            rc=$?
+            return "$rc"
+        fi ;;
     update-check) self_update --check; app_self_update "" "--check" ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     announcements) announcements_check "${2:-}" ;;  # 公告:check [--force] / read
     update-app) app_self_update "manual" "${2:-}" ;;  # App 自更新:[] 或 --check

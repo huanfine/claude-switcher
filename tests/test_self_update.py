@@ -81,12 +81,24 @@ class SelfUpdateTests(unittest.TestCase):
         self.sums_path = self.root / "SHA256SUMS"
         self.serve_remote(SCRIPT.read_text(encoding="utf-8"))
 
-    def serve_remote(self, content):
-        """把「远端 main」换成给定内容:重写假 zip 与假 SHA256SUMS。"""
+    def serve_remote(self, content, manifest=None):
+        """把「远端 main」换成给定内容;False 表示保留测试手写清单。"""
+        payloads = {"core/claude-switch.sh": content}
+        if manifest is None or manifest is False:
+            paths = ["core/claude-switch.sh"]
+        else:
+            paths = list(manifest)
+            for rel in paths:
+                payloads.setdefault(rel, f"fixture for {rel}\n")
         with zipfile.ZipFile(self.zip_path, "w") as zf:
-            zf.writestr("claude-switcher-main/core/claude-switch.sh", content)
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        self.sums_path.write_text(f"{digest}  core/claude-switch.sh\n", encoding="utf-8")
+            for rel, payload in payloads.items():
+                zf.writestr(f"claude-switcher-main/{rel}", payload)
+        if manifest is not False:
+            lines = []
+            for rel in paths:
+                digest = hashlib.sha256(payloads[rel].encode("utf-8")).hexdigest()
+                lines.append(f"{digest}  {rel}")
+            self.sums_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def run_update(self, *args):
         env = {
@@ -136,6 +148,47 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertEqual(self.bin.read_text(encoding="utf-8"),
                          SCRIPT.read_text(encoding="utf-8"),
                          "远端与本地相同时不该有任何写入")
+
+    def test_manifest_without_core_entry_is_rejected(self):
+        self.serve_remote("if then\n", manifest=["README.md"])
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("core/claude-switch.sh", run.stdout + run.stderr)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"),
+                         SCRIPT.read_text(encoding="utf-8"))
+
+    def test_invalid_remote_syntax_never_replaces_local_core(self):
+        self.serve_remote("if then\n")
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("语法", run.stdout + run.stderr)
+        self.assertEqual(self.bin.read_text(encoding="utf-8"),
+                         SCRIPT.read_text(encoding="utf-8"))
+
+    def test_manifest_rejects_parent_path(self):
+        outside = self.root / "outside"
+        outside.write_text("not-a-release-file", encoding="utf-8")
+        digest = hashlib.sha256(outside.read_bytes()).hexdigest()
+        core = b"if then\n"
+        self.sums_path.write_text(
+            f"{digest}  ../outside\n"
+            f"{hashlib.sha256(core).hexdigest()}  core/claude-switch.sh\n",
+            encoding="utf-8")
+        self.serve_remote(core.decode(), manifest=False)
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("清单", run.stdout + run.stderr)
+
+    def test_manifest_rejects_duplicate_and_malformed_entries(self):
+        remote = SCRIPT.read_text(encoding="utf-8") + "\n# remote\n"
+        self.serve_remote(remote, manifest=False)
+        core_digest = hashlib.sha256(remote.encode("utf-8")).hexdigest()
+        self.sums_path.write_text(
+            f"{core_digest}  core/claude-switch.sh\n"
+            f"{core_digest}  core/claude-switch.sh\n"
+            "not-a-digest  README.md\n", encoding="utf-8")
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
 
 
 # ---- 自检回归对比 ----
