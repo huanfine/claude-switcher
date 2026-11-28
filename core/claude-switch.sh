@@ -5981,14 +5981,71 @@ PY
         baseline=$("${BASH:-/bin/bash}" "$BIN/claude-switch.sh" checkdetail 2>/dev/null || true)
     fi
 
-    # 备份现有核心脚本
-    [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
+    # 同目录候选保证 rename 不跨文件系统;正式核心只由一次原子换装覆盖。
+    candidate=""; rollback=""; old_sha=""; installed=0
+    cleanup_update_files() {
+        [ -z "$candidate" ] || rm -f "$candidate"
+        [ -z "$rollback" ] || rm -f "$rollback"
+        candidate=""; rollback=""
+    }
+    rollback_core() {
+        local reason="$1"
+        if [ "$installed" -eq 1 ]; then
+            if [ -f "$rollback" ]; then
+                mv -f "$rollback" "$BIN/claude-switch.sh" || return 1
+            elif [ -f "$BIN/claude-switch.sh.bak" ]; then
+                cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh" || return 1
+            else
+                return 1
+            fi
+            installed=0
+        fi
+        "${BASH:-/bin/bash}" -n "$BIN/claude-switch.sh" || return 1
+        local restored_sha
+        restored_sha=$(shasum -a 256 "$BIN/claude-switch.sh" | awk '{print $1}')
+        if [ -n "$old_sha" ]; then
+            [ "$restored_sha" = "$old_sha" ] || return 1
+        else
+            [ ! -e "$BIN/claude-switch.sh" ] || return 1
+        fi
+        printf '%s|core|%s\n' "$(date '+%F %T')" "$reason" > "$BASE/update-rollback.txt" || return 1
+        chmod 600 "$BASE/update-rollback.txt" || return 1
+    }
 
-    # 替换核心脚本。环境值已不在脚本里,不再需要回注;但从老版本(环境值写在
-    # 脚本头部)升级时,必须先把它们迁进 env.json,否则升级后代理组名为空,
-    # 规则会被写进错误的组——这类失败是静默的,只能在写入前挡住。
-    cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"
-    chmod +x "$BIN/claude-switch.sh"
+    if [ -L "$BIN/claude-switch.sh.bak" ] || \
+       { [ -e "$BIN/claude-switch.sh.bak" ] && [ ! -f "$BIN/claude-switch.sh.bak" ]; }; then
+        echo "FAIL:旧核心备份路径不是普通文件,已中止"
+        rm -rf "$tmpd"; return 1
+    fi
+    if [ -f "$BIN/claude-switch.sh" ]; then
+        old_sha=$(shasum -a 256 "$BIN/claude-switch.sh" | awk '{print $1}')
+        case "$old_sha" in
+            ''|*[!0-9a-f]*) echo "FAIL:无法读取旧核心校验值,已中止"; rm -rf "$tmpd"; return 1 ;;
+        esac
+        [ "${#old_sha}" -eq 64 ] || { echo "FAIL:旧核心校验值无效,已中止"; rm -rf "$tmpd"; return 1; }
+        cp -p "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak" || {
+            echo "FAIL:备份旧核心失败,已中止"; rm -rf "$tmpd"; return 1; }
+        rollback=$(mktemp "$BIN/claude-switch.sh.rollback.XXXXXX") || {
+            echo "FAIL:创建回滚副本失败,已中止"; rm -rf "$tmpd"; return 1; }
+        cp -p "$BIN/claude-switch.sh" "$rollback" || {
+            echo "FAIL:复制回滚副本失败,已中止"; cleanup_update_files; rm -rf "$tmpd"; return 1; }
+    fi
+    candidate=$(mktemp "$BIN/claude-switch.sh.new.XXXXXX") || {
+        echo "FAIL:创建核心候选文件失败,已中止"; cleanup_update_files; rm -rf "$tmpd"; return 1; }
+    cp "$NEW/core/claude-switch.sh" "$candidate" || {
+        echo "FAIL:复制核心候选失败,已中止"; cleanup_update_files; rm -rf "$tmpd"; return 1; }
+    chmod +x "$candidate" || {
+        echo "FAIL:设置核心候选权限失败,已中止"; cleanup_update_files; rm -rf "$tmpd"; return 1; }
+    "${BASH:-/bin/bash}" -n "$candidate" || {
+        echo "FAIL:核心候选语法检查失败,已中止"; cleanup_update_files; rm -rf "$tmpd"; return 1; }
+    candidate_sha=$(shasum -a 256 "$candidate" | awk '{print $1}')
+    [ "$candidate_sha" = "$remote_core_sha" ] || {
+        echo "FAIL:核心候选校验失败,已中止"; cleanup_update_files; rm -rf "$tmpd"; return 1; }
+    if ! mv -f "$candidate" "$BIN/claude-switch.sh"; then
+        echo "FAIL:原子替换核心失败,已中止"
+        cleanup_update_files; rm -rf "$tmpd"; return 1
+    fi
+    candidate=""; installed=1
     PM=""; PG=""; CT=""; TZV=""; LCT=""
     if [ -f "$BIN/claude-switch.sh.bak" ]; then
         "${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support env-migrate "$BIN/claude-switch.sh.bak" >/dev/null 2>&1 || \
@@ -6025,10 +6082,11 @@ PY
     fi
     # 「无输出」仍然回滚:一行结论都拿不到说明新核心本身起不来,与环境无关。
     if [ -z "$out" ]; then
-        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
-        printf '%s|%s\n' "$(date '+%F %T')" "自检无输出" > "$BASE/update-rollback.txt" 2>/dev/null
-        chmod 600 "$BASE/update-rollback.txt" 2>/dev/null
-        echo "FAIL:新版自检无输出,已自动回滚"
+        if rollback_core "新版自检无输出"; then
+            echo "FAIL:新版自检无输出,已自动回滚"
+        else
+            echo "FAIL:新版自检无输出;回滚未完成,旧核心备份保留在 $BIN/claude-switch.sh.bak"
+        fi
         return 1
     fi
     # 回归判定:逐项比对新核心与基线。只有「基线 ok → 新核心 fail」才回滚;
@@ -6050,13 +6108,16 @@ PY
         [ "$bstate" = "ok" ] && regressed="${regressed}${item}、"
     done <<< "$out"
     if [ -n "$regressed" ]; then
-        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
-        regressed=${regressed%、}
-        printf '%s|%s\n' "$(date '+%F %T')" "新核心让原本 ok 的项失败了:${regressed}" > "$BASE/update-rollback.txt" 2>/dev/null
-        chmod 600 "$BASE/update-rollback.txt" 2>/dev/null
-        echo "FAIL:新核心让原本 ok 的项失败了(${regressed}),已自动回滚"
+        regressed=${regressed%/}
+        reason="新核心让原本 ok 的项失败了:${regressed}"
+        if rollback_core "$reason"; then
+            echo "FAIL:$reason,已自动回滚"
+        else
+            echo "FAIL:$reason;回滚未完成,旧核心备份保留在 $BIN/claude-switch.sh.bak"
+        fi
         return 1
     fi
+    cleanup_update_files
     # 成功即清掉上一次的回滚痕迹:App 靠这个文件的存在展示「上次更新被回滚」。
     rm -f "$BASE/update-rollback.txt" 2>/dev/null
     if [ -n "$new_fails" ]; then

@@ -190,6 +190,57 @@ class SelfUpdateTests(unittest.TestCase):
         run = self.run_update()
         self.assertNotEqual(run.returncode, 0)
 
+    def test_candidate_copy_failure_keeps_old_core(self):
+        fail_cp = self.fakebin / "cp"
+        fail_cp.write_text("""#!/bin/bash
+for arg in "$@"; do
+  case "$arg" in *claude-switch.sh.new.*) exit 41 ;; esac
+done
+exec /bin/cp "$@"
+""", encoding="utf-8")
+        fail_cp.chmod(0o755)
+        self.bin.write_text(inject_checkdetail(
+            SCRIPT.read_text(encoding="utf-8"), ["代理内核=ok"]), encoding="utf-8")
+        self.serve_remote(inject_checkdetail(
+            SCRIPT.read_text(encoding="utf-8") + "\n# remote\n", ["代理内核=ok"]))
+        before = self.bin.read_bytes()
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_bytes(), before)
+        self.assertFalse(list(self.bin.parent.glob("claude-switch.sh.new.*")))
+
+    def test_atomic_rename_failure_keeps_old_core(self):
+        fail_mv = self.fakebin / "mv"
+        fail_mv.write_text("""#!/bin/bash
+for arg in "$@"; do
+  case "$arg" in *claude-switch.sh.new.*) exit 42 ;; esac
+done
+exec /bin/mv "$@"
+""", encoding="utf-8")
+        fail_mv.chmod(0o755)
+        self.bin.write_text(inject_checkdetail(
+            SCRIPT.read_text(encoding="utf-8"), ["代理内核=ok"]), encoding="utf-8")
+        self.serve_remote(inject_checkdetail(
+            SCRIPT.read_text(encoding="utf-8") + "\n# remote\n", ["代理内核=ok"]))
+        before = self.bin.read_bytes()
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_bytes(), before)
+        self.assertFalse(list(self.bin.parent.glob("claude-switch.sh.new.*")))
+
+    def test_backup_symlink_is_rejected_without_touching_target(self):
+        outside = self.root / "outside-backup"
+        outside.write_bytes(b"keep me")
+        backup = self.bin.with_suffix(".sh.bak")
+        backup.symlink_to(outside)
+        self.serve_remote(inject_checkdetail(
+            SCRIPT.read_text(encoding="utf-8") + "\n# remote\n", ["代理内核=ok"]))
+        before = self.bin.read_bytes()
+        run = self.run_update()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(self.bin.read_bytes(), before)
+        self.assertEqual(outside.read_bytes(), b"keep me")
+
 
 # ---- 自检回归对比 ----
 # 2026-11-20~27 他机实测:旧自检 `grep -q '=fail'` 一票否决,地区漂移一项
