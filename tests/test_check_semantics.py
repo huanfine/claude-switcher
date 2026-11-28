@@ -34,7 +34,8 @@ class CheckSemanticsTests(unittest.TestCase):
                         PATH=str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
                         CLAUDE_SWITCHER_PYTHON=sys.executable, PYTHONUTF8="1",
                         # 默认指向不存在的文件:断言不能随开发机上真实的看门狗状态飘
-                        TZ_WATCHDOG_FILE=str(Path(self.tmp.name) / "no-watchdog.sh"))
+                        TZ_WATCHDOG_FILE=str(Path(self.tmp.name) / "no-watchdog.sh"),
+                        TZ_WATCHDOG_TARGET_FILE=str(Path(self.tmp.name) / "no-tz-target"))
         self.stub("pgrep", "exit 0")
         self.stub("ifconfig", "echo 'inet 198.18.0.1'")
         self.stub("curl", '''case "$*" in
@@ -116,7 +117,8 @@ esac''')
         self.assertTrue((value or "").startswith("warn:"), value)
         self.assertIn("America/Los_Angeles", value)
         self.assertIn("改回去", value)
-        self.assertIn("一键修复", value, "只说有问题不给下一步,用户不知道点哪")
+        self.assertIn("安装器", value, "旧看门狗不能再由核心回写,必须刷新 root 模板")
+        self.assertNotIn("点「一键修复」同步", value)
 
     def test_watchdog_target_parsing_accepts_both_quote_styles(self):
         """安装器写 TARGET="x",set-region 同步写 TARGET=x —— 两种都得认。"""
@@ -139,6 +141,30 @@ esac''')
         run = subprocess.run(["/bin/bash", str(self.core()), "checkdetail"], text=True,
                              capture_output=True, env=env, timeout=60)
         self.assertEqual(self.line(run.stdout, "时区"), "ok", run.stdout + run.stderr)
+
+    def test_new_watchdog_uses_root_target_instead_of_embedded_target(self):
+        wd = Path(self.tmp.name) / "tz-watchdog-root.sh"
+        target = Path(self.tmp.name) / "tz-target"
+        wd.write_text('TARGET_FILE="/Library/Application Support/claude-switcher/tz-target"\n'
+                      'TARGET="America/Los_Angeles"\n', encoding="utf-8")
+        target.write_text("America/New_York\n", encoding="utf-8")
+        env = dict(self.env, TZ_WATCHDOG_FILE=str(wd), TZ_WATCHDOG_TARGET_FILE=str(target))
+        run = subprocess.run(["/bin/bash", str(self.core()), "checkdetail"], text=True,
+                             capture_output=True, env=env, timeout=60)
+        self.assertEqual(self.line(run.stdout, "时区"), "ok", run.stdout + run.stderr)
+
+    def test_new_watchdog_with_missing_root_target_is_not_reported_ready(self):
+        wd = Path(self.tmp.name) / "tz-watchdog-missing.sh"
+        target = Path(self.tmp.name) / "missing-tz-target"
+        wd.write_text('TARGET_FILE="/Library/Application Support/claude-switcher/tz-target"\n'
+                      'TARGET="America/New_York"\n', encoding="utf-8")
+        env = dict(self.env, TZ_WATCHDOG_FILE=str(wd), TZ_WATCHDOG_TARGET_FILE=str(target))
+        run = subprocess.run(["/bin/bash", str(self.core()), "checkdetail"], text=True,
+                             capture_output=True, env=env, timeout=60)
+        value = self.line(run.stdout, "时区")
+        self.assertTrue((value or "").startswith("warn:"), value)
+        self.assertIn("巡检目标", value)
+        self.assertIn("一键修复", value)
 
     def test_check_failure_names_both_values(self):
         """check 的 FAIL 串是用户唯一能看到的失败原因,同样要带两边取值。"""

@@ -74,7 +74,124 @@ class DaemonContractTests(unittest.TestCase):
         text = (ROOT / "installer/安装.command").read_text(encoding="utf-8")
         self.assertNotIn('cp "$REPO/daemons/local.claude-bodyguard.plist" '
                          '"$REPO/daemons/local.tz-watchdog.plist" "$H/.local/bin/"', text)
-        self.assertIn("cp '$REPO/daemons/local.claude-bodyguard.plist'", text)
+        self.assertIn('"$repo/daemons/local.claude-bodyguard.plist"', text)
+
+    def test_installer_root_commands_are_not_concatenated_shell_source(self):
+        text = (ROOT / "installer/安装.command").read_text(encoding="utf-8")
+        self.assertIn("sudo /bin/bash -s --", text)
+        self.assertIn("<<'ROOT_INSTALL'", text)
+        self.assertNotIn("SYSCMDS=", text)
+        self.assertNotIn('sudo bash -c "$SYSCMDS"', text)
+
+    def test_core_syncs_root_target_instead_of_rewriting_watchdog(self):
+        text = CORE.read_text(encoding="utf-8")
+        self.assertIn("tz-target", text)
+        self.assertIn("tz_target_sync_command", text)
+        self.assertNotIn("s|^TARGET=.*|TARGET=", text)
+        self.assertNotIn("__TZ_TARGET__", text)
+        self.assertNotIn("__HOME__", text)
+        self.assertNotIn("ENVJSON=", (ROOT / "daemons/tz-watchdog.sh").read_text(encoding="utf-8"))
+
+
+class RootInstallerTests(unittest.TestCase):
+    INSTALLER = ROOT / "installer/安装.command"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="root-installer-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.stage = self.base / "stage dir 'quoted"
+        self.repo = self.base / "repo dir 'quoted"
+        self.logs = self.base / "log dir 'quoted"
+        self.appdir = self.base / "Library/Application Support/claude-switcher"
+        self.daemons = self.base / "Library/LaunchDaemons"
+        self.zoneinfo = self.base / "zoneinfo"
+        self.sentinel = self.base / "injected"
+        self.calls = self.base / "calls"
+        self.bin = self.base / "bin"
+        for path in (self.stage, self.repo, self.bin):
+            path.mkdir()
+        self.daemons.mkdir(parents=True)
+        (self.stage / "claude-bodyguard.sh").write_text("bodyguard\n", encoding="utf-8")
+        (self.stage / "tz-watchdog.sh").write_text("watchdog\n", encoding="utf-8")
+        for name in ("local.claude-bodyguard.plist", "local.tz-watchdog.plist"):
+            (self.repo / "daemons").mkdir(exist_ok=True)
+            (self.repo / "daemons" / name).write_text(name + "\n", encoding="utf-8")
+        zone = self.zoneinfo / "America/New_York"
+        zone.parent.mkdir(parents=True)
+        zone.write_text("test zone\n", encoding="utf-8")
+        for name in ("chown", "launchctl", "dscacheutil", "killall"):
+            self.stub(name)
+        install = self.bin / "install"
+        install.write_text(
+            "#!/bin/bash\nargs=()\nwhile [ \"$#\" -gt 0 ]; do\n"
+            "  case \"$1\" in -o|-g) shift 2 ;; *) args+=(\"$1\"); shift ;; esac\n"
+            "done\nexec /usr/bin/install \"${args[@]}\"\n", encoding="utf-8")
+        install.chmod(0o755)
+        self.stub("systemsetup", absolute=True)
+        self.stub("networksetup", absolute=True)
+
+    def stub(self, name, absolute=False):
+        path = self.bin / name
+        path.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"" + name + " $*\" >> \"$ROOT_CALLS\"\n",
+            encoding="utf-8")
+        path.chmod(0o755)
+
+    def root_body(self):
+        text = self.INSTALLER.read_text(encoding="utf-8")
+        marker = "    sudo /bin/bash -s --"
+        if marker not in text or "<<'ROOT_INSTALL'" not in text:
+            return ""
+        start = text.index(marker)
+        start = text.index("\n", start) + 1
+        end = text.index("\nROOT_INSTALL", start)
+        body = text[start:end]
+        body = body.replace("/Library/Application Support/claude-switcher", str(self.appdir))
+        body = body.replace("/Library/LaunchDaemons", str(self.daemons))
+        body = body.replace("/usr/share/zoneinfo", str(self.zoneinfo))
+        body = body.replace("/usr/sbin/systemsetup", str(self.bin / "systemsetup"))
+        body = body.replace("/usr/sbin/networksetup", str(self.bin / "networksetup"))
+        return body
+
+    def run_root(self, timezone="America/New_York", set_tz="1", services=""):
+        env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.defpath,
+                   ROOT_CALLS=str(self.calls))
+        return subprocess.run(
+            ["/bin/bash", "-s", "--", str(self.stage), str(self.repo), str(self.logs),
+             timezone, set_tz, services],
+            input=self.root_body(), text=True, capture_output=True, env=env, timeout=30)
+
+    def test_special_character_paths_and_services_remain_single_arguments(self):
+        service = "Wi-Fi; touch " + str(self.sentinel)
+        result = self.run_root(services=service + "\nThunderbolt Bridge\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.appdir / "claude-bodyguard.sh").read_text(), "bodyguard\n")
+        self.assertEqual((self.appdir / "tz-watchdog.sh").read_text(), "watchdog\n")
+        self.assertEqual((self.appdir / "tz-target").read_text(), "America/New_York\n")
+        self.assertEqual((self.appdir / "tz-target").stat().st_mode & 0o777, 0o644)
+        self.assertTrue((self.daemons / "local.tz-watchdog.plist").is_file())
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertIn("systemsetup -settimezone America/New_York", calls)
+        self.assertIn("networksetup -setv6off " + service, calls)
+        self.assertIn("networksetup -setv6off Thunderbolt Bridge", calls)
+        self.assertFalse(self.sentinel.exists())
+
+    def test_symlink_install_directory_is_rejected(self):
+        outside = self.base / "outside"
+        outside.mkdir()
+        self.appdir.parent.mkdir(parents=True)
+        self.appdir.symlink_to(outside, target_is_directory=True)
+        result = self.run_root()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_invalid_timezone_is_rejected_before_any_system_change(self):
+        timezone = "America/New_York'; touch " + str(self.sentinel) + "; '"
+        result = self.run_root(timezone=timezone)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.appdir.exists())
+        self.assertFalse(self.sentinel.exists())
 
 
 class EnvValidationTests(unittest.TestCase):
@@ -120,6 +237,19 @@ class EnvValidationTests(unittest.TestCase):
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("timezone", run.stderr)
 
+    def test_valid_iana_timezone_with_hyphen_or_plus_is_accepted(self):
+        for timezone in ("America/Port-au-Prince", "Etc/GMT+5"):
+            with self.subTest(timezone=timezone):
+                self.write_env(timezone=timezone)
+                run = self.run_core("fake-prefix")
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_unknown_timezone_is_rejected(self):
+        self.write_env(timezone="America/No_Such_City")
+        run = self.run_core("fake-prefix")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("timezone", run.stderr)
+
     def test_invalid_fake_range_is_rejected(self):
         self.write_env(fake_ip_range="198.18.0.0/16; id")
         run = self.run_core("fake-prefix")
@@ -133,6 +263,51 @@ class EnvValidationTests(unittest.TestCase):
         base = self.home / ".claude-switcher"
         for path in (base, base / "accounts"):
             self.assertEqual(path.stat().st_mode & 0o777, 0o700, path)
+
+
+class CoreTimezoneTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tz-target-command-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.appdir = self.base / "Application Support/claude-switcher"
+        self.appdir.mkdir(parents=True)
+        self.zoneinfo = self.base / "zoneinfo"
+        zone = self.zoneinfo / "America/New_York"
+        zone.parent.mkdir(parents=True)
+        zone.write_text("test zone\n", encoding="utf-8")
+        text = CORE.read_text(encoding="utf-8")
+        start = text.index("shq() {")
+        end = text.index("\n# 一键修复", start)
+        self.helpers = text[start:end]
+
+    def command(self, target):
+        run = subprocess.run(
+            ["/bin/bash", "-c", self.helpers + '\ntz_target_sync_command "$1"', "--", target],
+            text=True, capture_output=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return (run.stdout
+                .replace("/Library/Application Support/claude-switcher", str(self.appdir))
+                .replace("/usr/share/zoneinfo", str(self.zoneinfo))
+                .replace("chown root:wheel", ":"))
+
+    def test_command_atomically_writes_root_target(self):
+        run = subprocess.run(["/bin/bash", "-c", self.command("America/New_York")],
+                             text=True, capture_output=True, timeout=10, cwd=self.base)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        target = self.appdir / "tz-target"
+        self.assertEqual(target.read_text(encoding="utf-8"), "America/New_York\n")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(list(self.appdir.glob(".tz-target.*")), [])
+
+    def test_command_rejects_injected_timezone_before_writing(self):
+        target = self.appdir / "tz-target"
+        run = subprocess.run(
+            ["/bin/bash", "-c", self.command("America/New_York'; touch injected; '")],
+            text=True, capture_output=True, timeout=10, cwd=self.base)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertFalse(target.exists())
+        self.assertFalse((self.base / "injected").exists())
 
 
 class InstallVersionTests(unittest.TestCase):

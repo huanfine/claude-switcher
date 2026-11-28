@@ -1,26 +1,29 @@
 #!/bin/bash
-# 时区看门狗 (参考模板) —— 安装程序会把两个占位符换成目标时区与用户目录后再安装
-# 作用: 系统时区偏离目标值时自动改回,并记录日志
-#
-# 目标值以 env.json 为唯一来源,脚本里那份 __TZ_TARGET__ 只是「env.json 读不到」时的兜底。
-# 为什么不再烧死:set-region / fix 改的是 env.json 和系统时区,没人记得回来改这里,
-# 结果就是看门狗守着旧目标、每小时把系统时区改回去 —— 用户看到的是「修好了又坏了」。
-TARGET="__TZ_TARGET__"
-ENVJSON="__HOME__/.claude-switcher/env.json"
-# 日志目录由安装器/update 物化。root 守护不再直接往用户可写目录追加:
-# 用户可以把日志换成指向 /etc/... 的符号链接,让 root 跟过去写。
+# 目标只读 root 所有的授权副本;用户可写 env.json 不能改变 root 巡检行为。
+TARGET_FILE="/Library/Application Support/claude-switcher/tz-target"
 LOG="__LOG_DIR__/tz-watchdog.log"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 
-if [ -r "$ENVJSON" ]; then
-    from_env=$(sed -n 's/.*"timezone"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ENVJSON" | head -1)
-    [ -n "$from_env" ] && TARGET="$from_env"
+log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*" >>"$LOG"
+}
+
+if [ ! -f "$TARGET_FILE" ] || [ -L "$TARGET_FILE" ]; then
+    log "时区巡检目标缺失或不是普通文件($TARGET_FILE),本轮不修改系统时区"
+    exit 0
 fi
-# 目标为空时宁可不动:守错目标的看门狗比没有看门狗危害大得多
-[ -n "$TARGET" ] || exit 0
+IFS= read -r TARGET < "$TARGET_FILE" || true
+if ! [[ "$TARGET" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+$ ]] || \
+   [ ! -f "/usr/share/zoneinfo/$TARGET" ]; then
+    log "时区巡检目标无效($TARGET_FILE),本轮不修改系统时区"
+    exit 0
+fi
 
 current=$(readlink /etc/localtime 2>/dev/null)
 if [ "$current" != "/var/db/timezone/zoneinfo/$TARGET" ]; then
-    /usr/sbin/systemsetup -settimezone "$TARGET" >>"$LOG" 2>&1
-    echo "$(date '+%Y-%m-%d %H:%M:%S %Z') 时区异常: [$current] 已自动恢复为 $TARGET" >>"$LOG"
+    if /usr/sbin/systemsetup -settimezone "$TARGET" >>"$LOG" 2>&1; then
+        log "时区异常: [$current] 已自动恢复为 $TARGET"
+    else
+        log "时区异常: [$current] 恢复为 $TARGET 失败"
+    fi
 fi

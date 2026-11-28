@@ -373,8 +373,7 @@ STAGE=$(mktemp -d)
 sed -e "s|__PROXY_MODE__|$MODE|g" -e "s|__FAKE_PREFIX__|$FAKE_PREFIX|g" \
     -e "s|__LOG_DIR__|$LOG_DIR|g" \
     "$REPO/daemons/claude-bodyguard.sh" > "$STAGE/claude-bodyguard.sh"
-sed -e "s|__HOME__|$H|g" -e "s|__TZ_TARGET__|$TZV|g" \
-    -e "s|__LOG_DIR__|$LOG_DIR|g" \
+sed -e "s|__LOG_DIR__|$LOG_DIR|g" \
     "$REPO/daemons/tz-watchdog.sh" > "$STAGE/tz-watchdog.sh"
 chmod +x "$STAGE/claude-bodyguard.sh" "$STAGE/tz-watchdog.sh"
 # 清理旧版本装在用户目录下的守护脚本与 plist(用户可写=提权面)
@@ -475,36 +474,61 @@ if [ -n "$DRYRUN" ]; then
     echo "[演练模式] 跳过系统级配置(守护进程/时区/IPv6)"
     rm -rf "$STAGE"
 else
-    # 守护脚本装入 root 所有的系统目录;同时清理旧版的 root 级自动更新(已改为用户态 LaunchAgent)
-    SYSCMDS="mkdir -p '/Library/Application Support/claude-switcher' '$LOG_DIR';
-        chown root:wheel '/Library/Application Support/claude-switcher' '$LOG_DIR';
-        chmod 755 '/Library/Application Support/claude-switcher' '$LOG_DIR';
-        touch '$LOG_DIR/claude-bodyguard.log' '$LOG_DIR/tz-watchdog.log';
-        chown root:wheel '$LOG_DIR/claude-bodyguard.log' '$LOG_DIR/tz-watchdog.log';
-        chmod 644 '$LOG_DIR/claude-bodyguard.log' '$LOG_DIR/tz-watchdog.log';
-        cp '$STAGE/claude-bodyguard.sh' '$STAGE/tz-watchdog.sh' '/Library/Application Support/claude-switcher/';
-        chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh';
-        chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' '/Library/Application Support/claude-switcher/tz-watchdog.sh';
-        cp '$REPO/daemons/local.claude-bodyguard.plist' '$REPO/daemons/local.tz-watchdog.plist' /Library/LaunchDaemons/;
-        chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
-        chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist /Library/LaunchDaemons/local.tz-watchdog.plist;
-        launchctl bootout system/local.claude-bodyguard 2>/dev/null; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist;
-        launchctl bootout system/local.tz-watchdog 2>/dev/null; launchctl bootstrap system /Library/LaunchDaemons/local.tz-watchdog.plist;
-        launchctl bootout system/local.claude-update 2>/dev/null; rm -f /Library/LaunchDaemons/local.claude-update.plist;"
+    # 动态值只走位置参数,不拼进 root shell 源码;时区在 root 侧再次校验。
     curt=$(readlink /etc/localtime 2>/dev/null)
-    [ "$curt" != "/var/db/timezone/zoneinfo/$TZV" ] && SYSCMDS="$SYSCMDS /usr/sbin/systemsetup -settimezone '$TZV';"
+    SET_TZ=0
+    [ "$curt" != "/var/db/timezone/zoneinfo/$TZV" ] && SET_TZ=1
     # 逐条服务关 IPv6。只关 Wi-Fi 会漏掉 Ethernet / iPhone USB / 雷雳网桥,
     # 换一台以有线网络为主的机器,安装完检查项会直接红。
-    v6="$(ipv6_on_services)"
-    if [ -n "$v6" ]; then
-        while IFS= read -r svc; do
-            [ -n "$svc" ] && SYSCMDS="$SYSCMDS /usr/sbin/networksetup -setv6off $(printf '%q' "$svc");"
-        done <<< "$v6"
-    fi
-    SYSCMDS="$SYSCMDS dscacheutil -flushcache; killall -HUP mDNSResponder"
+    V6_SERVICES="$(ipv6_on_services)"
     echo ""
     echo "接下来需要输入一次开机密码,用于: 安装守护进程(系统目录) + 锁定时区($TZV) + 关闭IPv6"
-    sudo bash -c "$SYSCMDS" && echo "✓ 系统级配置完成" || echo "✗ 系统级配置被取消,可稍后重新运行安装程序"
+    sudo /bin/bash -s -- "$STAGE" "$REPO" "$LOG_DIR" "$TZV" "$SET_TZ" "$V6_SERVICES" <<'ROOT_INSTALL' && echo "✓ 系统级配置完成" || echo "✗ 系统级配置被取消,可稍后重新运行安装程序"
+set -euo pipefail
+stage=$1
+repo=$2
+log_dir=$3
+tz=$4
+set_tz=$5
+v6=$6
+appdir="/Library/Application Support/claude-switcher"
+daemondir="/Library/LaunchDaemons"
+[ -d "$stage" ] && [ ! -L "$stage" ] || { echo "安装暂存目录无效" >&2; exit 1; }
+[[ "$tz" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+$ ]] && \
+    [ -f "/usr/share/zoneinfo/$tz" ] || { echo "目标时区无效" >&2; exit 1; }
+[ ! -L "$appdir" ] && [ ! -L "$log_dir" ] || { echo "安装目录不得是符号链接" >&2; exit 1; }
+install -d -o root -g wheel -m 755 "$appdir" "$log_dir"
+touch "$log_dir/claude-bodyguard.log" "$log_dir/tz-watchdog.log"
+chown root:wheel "$log_dir/claude-bodyguard.log" "$log_dir/tz-watchdog.log"
+chmod 644 "$log_dir/claude-bodyguard.log" "$log_dir/tz-watchdog.log"
+install -o root -g wheel -m 755 "$stage/claude-bodyguard.sh" "$stage/tz-watchdog.sh" "$appdir/"
+target_tmp=$(mktemp "$appdir/.tz-target.XXXXXX")
+trap 'rm -f "$target_tmp"' EXIT
+printf '%s\n' "$tz" > "$target_tmp"
+chown root:wheel "$target_tmp"
+chmod 644 "$target_tmp"
+mv -f "$target_tmp" "$appdir/tz-target"
+trap - EXIT
+install -o root -g wheel -m 644 \
+    "$repo/daemons/local.claude-bodyguard.plist" \
+    "$repo/daemons/local.tz-watchdog.plist" "$daemondir/"
+launchctl bootout system/local.claude-bodyguard 2>/dev/null || true
+launchctl bootstrap system "$daemondir/local.claude-bodyguard.plist"
+launchctl bootout system/local.tz-watchdog 2>/dev/null || true
+launchctl bootstrap system "$daemondir/local.tz-watchdog.plist"
+launchctl bootout system/local.claude-update 2>/dev/null || true
+rm -f "$daemondir/local.claude-update.plist"
+if [ "$set_tz" = 1 ]; then
+    /usr/sbin/systemsetup -settimezone "$tz"
+fi
+while IFS= read -r svc; do
+    if [ -n "$svc" ]; then
+        /usr/sbin/networksetup -setv6off "$svc"
+    fi
+done <<< "$v6"
+dscacheutil -flushcache
+killall -HUP mDNSResponder 2>/dev/null || true
+ROOT_INSTALL
     rm -rf "$STAGE"
 
     # 自动更新:用户态 LaunchAgent(每12小时),不走 root,降低供应链风险

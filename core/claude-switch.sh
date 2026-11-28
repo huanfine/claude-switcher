@@ -2741,6 +2741,11 @@ dns:
     echo "已写入 Merge.yaml(重启客户端后生效)"
 }
 
+valid_timezone() {
+    [[ "$1" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+$ ]] && \
+        [ -f "/usr/share/zoneinfo/$1" ]
+}
+
 # 读取环境层。env.json 缺失 → 用保底值(首次安装与老版本升级都走这条路);
 # env.json 损坏 → 明确报错,不静默降级:环境值错会直接把规则写进错误的代理组。
 load_env() {
@@ -2773,7 +2778,7 @@ load_env() {
                     # 时区会进入管理员命令和 root 看门狗脚本,只接受 IANA 形状;
                     # 不校验就等于把 env.json 当成 root shell 的片段。
                     if [ -n "$value" ]; then
-                        if [[ "$value" =~ ^[A-Za-z_]+/[A-Za-z_]+(/[A-Za-z_]+)?$ ]]; then
+                        if valid_timezone "$value"; then
                             TZ_TARGET="$value"
                         else
                             echo "FAIL:env.json 中的 timezone 无效(应为 Area/City): $value" >&2
@@ -4905,14 +4910,32 @@ tz_current() {
     printf '%s\n' "${tz##*/zoneinfo/}"
 }
 
-# 已安装的时区看门狗守着哪个目标值(读不到就输出空)。
-# 老安装件写的是 TARGET="America/New_York",set-region 同步时写的是不带引号的
-# TARGET=America/New_York,两种都得认,所以剥引号而不是匹配引号。
+# 已安装的时区看门狗格式:root=只读授权副本,legacy=旧脚本内 TARGET。
+tz_watchdog_format() {
+    local f="${1:-${TZ_WATCHDOG_FILE:-/Library/Application Support/claude-switcher/tz-watchdog.sh}}"
+    [ -r "$f" ] || return 0
+    if grep -q '^TARGET_FILE=' "$f" 2>/dev/null; then
+        echo root
+    else
+        echo legacy
+    fi
+}
+
+# 新安装件只读 root 所有的 tz-target;旧安装件兼容解析两种 TARGET= 引号风格。
 tz_watchdog_target() {
     # TZ_WATCHDOG_FILE 只为测试留口:默认读系统安装位置,测试指向临时文件,
     # 否则「看门狗守错目标」这条断言会随开发机的真实安装状态飘。
     local f="${1:-${TZ_WATCHDOG_FILE:-/Library/Application Support/claude-switcher/tz-watchdog.sh}}"
     [ -r "$f" ] || return 0
+    if [ "$(tz_watchdog_format "$f")" = root ]; then
+        local target_file="${TZ_WATCHDOG_TARGET_FILE:-/Library/Application Support/claude-switcher/tz-target}"
+        [ -f "$target_file" ] && [ ! -L "$target_file" ] || return 0
+        local target
+        IFS= read -r target < "$target_file" || true
+        valid_timezone "$target" || return 0
+        printf '%s\n' "$target"
+        return 0
+    fi
     sed -n 's/^TARGET=//p' "$f" 2>/dev/null | head -1 | tr -d '"'
 }
 
@@ -4981,9 +5004,16 @@ checkdetail() {
     else
         # 时区对了还不够:看门狗若守着别的目标,会在 5 分钟内把它改回去,
         # 用户只会看到「修好了又坏了」。这一条以前从来没检查过。
+        wd_format=$(tz_watchdog_format)
         wt=$(tz_watchdog_target)
-        if [ -n "$wt" ] && [ "$wt" != "$TZ_TARGET" ]; then
-            echo "时区=warn:当前值正确,但时区巡检仍守着 $wt · 会自己改回去,点「一键修复」同步"
+        if [ "$wd_format" = root ] && [ -z "$wt" ]; then
+            echo "时区=warn:时区巡检目标缺失或无效 · 点「一键修复」同步 root 授权副本"
+        elif [ -n "$wt" ] && [ "$wt" != "$TZ_TARGET" ]; then
+            if [ "$wd_format" = legacy ]; then
+                echo "时区=warn:当前值正确,但旧版时区巡检仍守着 $wt · 会自己改回去,请重新运行安装器刷新 root 守护"
+            else
+                echo "时区=warn:当前值正确,但时区巡检仍守着 $wt · 会自己改回去,点「一键修复」同步"
+            fi
         else
             echo '时区=ok'
         fi
@@ -5830,6 +5860,10 @@ B64
 # 不能直接用 "$TZ_TARGET":env.json 虽已校验 IANA 形状,但这里仍按不可信输入处理。
 shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
+tz_target_sync_command() {
+    printf "%s" "/bin/bash -c 'set -e; valid_timezone() { [[ \"\$1\" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+\$ ]] && [ -f \"/usr/share/zoneinfo/\$1\" ]; }; valid_timezone \"\$1\"; d=\"/Library/Application Support/claude-switcher\"; [ -d \"\$d\" ] && [ ! -L \"\$d\" ]; t=\$(mktemp \"\$d/.tz-target.XXXXXX\"); trap \"rm -f \\\"\$t\\\"\" EXIT; printf \"%s\\n\" \"\$1\" > \"\$t\"; chown root:wheel \"\$t\"; chmod 644 \"\$t\"; mv -f \"\$t\" \"\$d/tz-target\"; trap - EXIT' -- $(shq "$1")"
+}
+
 # 一键修复:按项自动修复,每步输出结果
 fix() {
     # 只有真的重启过客户端才需要在收尾复测前等路由收敛,见 C 段。
@@ -5923,18 +5957,21 @@ fix() {
     tz=$(tz_current)
     v6=$(ipv6_on_services)
     adminCmds=""
-    [ "$tz" != "$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $(shq "$TZ_TARGET"); "
+    wd_format=$(tz_watchdog_format)
+    wt=$(tz_watchdog_target)
+    if [ "$wd_format" = legacy ] && [ -n "$wt" ] && [ "$wt" != "$TZ_TARGET" ]; then
+        echo "WARN:旧版时区巡检仍守着 $wt,请重新运行安装器刷新 root 守护;本次不改系统时区,避免被旧巡检改回"
+    else
+        [ "$tz" != "$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $(shq "$TZ_TARGET"); "
+        if [ "$wd_format" = root ] && { [ -z "$wt" ] || [ "$wt" != "$TZ_TARGET" ]; }; then
+            adminCmds="${adminCmds}$(tz_target_sync_command "$TZ_TARGET"); "
+        fi
+    fi
     # 逐条服务关 IPv6。只关 Wi-Fi 会漏掉 Ethernet/iPhone USB,检查项也就跟着漏报。
     if [ -n "$v6" ]; then
         while IFS= read -r svc; do
-            [ -n "$svc" ] && adminCmds="${adminCmds}networksetup -setv6off '$svc'; "
+            [ -n "$svc" ] && adminCmds="${adminCmds}networksetup -setv6off $(shq "$svc"); "
         done <<< "$v6"
-    fi
-    # 看门狗是「修完能留住」的唯一保障。它守着旧目标时,上面这行改完 5 分钟内就被改回去,
-    # 用户看到的就是「一键修复没生效」——所以必须和系统时区在同一次授权里一起对齐。
-    wt=$(tz_watchdog_target)
-    if [ -n "$wt" ] && [ "$wt" != "$TZ_TARGET" ]; then
-        adminCmds="${adminCmds}/usr/bin/sed -i '' 's|^TARGET=.*|TARGET='$(shq "$TZ_TARGET")'|' '/Library/Application Support/claude-switcher/tz-watchdog.sh'; "
     fi
     # 装了 plist 却没 bootstrap(重装/系统升级后常见)时,看门狗是死的,一并拉起来
     if [ -f /Library/LaunchDaemons/local.tz-watchdog.plist ] && ! launchctl print system/local.tz-watchdog >/dev/null 2>&1; then
@@ -6215,7 +6252,7 @@ get_client() {
 
 # 地区自适应:按当前出口国家一键重设 国家/时区/地区格式(换了国家节点后运行)
 set_region() {
-    local geo gfile ctry ntz src nlocale rc
+    local geo gfile ctry ntz src nlocale rc wd_format wt adminCmds
     gfile=$(mktemp "${TMPDIR:-/tmp}/claude-geo.XXXXXX" 2>/dev/null) || gfile=""
     GEO_DIAG_FILE="$gfile"
     geo=$(geo_lookup); rc=$?
@@ -6240,6 +6277,16 @@ set_region() {
     [ -n "$ntz" ] || ntz=$(default_tz_for "$ctry")
     [ "$src" = "cloudflare" ] && echo "INFO:时区使用国家默认(可手动改)"
     nlocale=$(locale_for "$ctry")
+    if ! valid_timezone "$ntz"; then
+        echo "FAIL:出口探测返回的时区无效: $ntz"
+        return 1
+    fi
+    wd_format=$(tz_watchdog_format)
+    wt=$(tz_watchdog_target)
+    if [ "$wd_format" = legacy ] && [ -n "$wt" ] && [ "$wt" != "$ntz" ]; then
+        echo "FAIL:旧版时区巡检仍守着 $wt,继续设置会改回旧值 · 请重新运行安装器刷新 root 守护后重试"
+        return 1
+    fi
 
     # 地区目标写 env.json(环境层),不再 sed 改写核心脚本本身
     if ! support env-set "country=$ctry" "timezone=$ntz" "locale=$nlocale" >/dev/null 2>&1; then
@@ -6251,13 +6298,10 @@ set_region() {
     # 地区格式(用户级,无需密码)
     defaults write -g AppleLocale "$nlocale"
 
-    # 时区(需管理员权限,会弹一次授权框);看门狗脚本在 root 目录下,顺道用同一次授权同步目标值
-    WD="/Library/Application Support/claude-switcher/tz-watchdog.sh"
+    # 时区(需管理员权限,会弹一次授权框);新看门狗目标随同一次授权原子同步。
     adminCmds="/usr/sbin/systemsetup -settimezone $(shq "$ntz")"
-    wdsync=0
-    if [ -f "$WD" ] && [ ! -w "$WD" ]; then
-        adminCmds="$adminCmds; /usr/bin/sed -i '' 's|^TARGET=.*|TARGET='$(shq "$ntz")'|' '$WD'"
-        wdsync=1
+    if [ "$wd_format" = root ] && [ "$wt" != "$ntz" ]; then
+        adminCmds="$adminCmds; $(tz_target_sync_command "$ntz")"
     fi
     if ! osascript <<ASEOF >/dev/null 2>&1
 do shell script "$adminCmds" with prompt "set-region 需要管理员权限以锁定时区" with administrator privileges
@@ -6266,9 +6310,9 @@ ASEOF
         echo "FAIL:时区设置被取消或失败(国家/地区格式已更新为 $ctry/$nlocale)"
         return 1
     fi
-    # 看门狗目标同步兜底(可写的老版本安装直接 sed;失败则提示运行安装器刷新)
-    if [ -f "$WD" ] && [ "$wdsync" -eq 0 ]; then
-        sed -i '' "s|^TARGET=.*|TARGET=$ntz|" "$WD" 2>/dev/null || echo "WARN:巡检目标未同步,请运行安装器刷新"
+    if [ "$wd_format" = root ] && [ "$(tz_watchdog_target)" != "$ntz" ]; then
+        echo "FAIL:root 时区巡检目标同步失败 · 请重新运行安装器检查 root 守护"
+        return 1
     fi
 
     echo "OK:region=$ctry tz=$ntz locale=$nlocale source=$src"
@@ -6491,7 +6535,7 @@ PY
         cleanup_update_files; rm -rf "$tmpd"; return 1
     fi
     candidate=""; installed=1
-    PM=""; PG=""; CT=""; TZV=""; LCT=""
+    PM=""; PG=""; CT=""; LCT=""
     if [ -f "$BIN/claude-switch.sh.bak" ]; then
         if ! "${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support env-migrate "$BIN/claude-switch.sh.bak" >/dev/null 2>&1; then
             rollback_update "环境配置迁移失败" || return 1
@@ -6499,18 +6543,15 @@ PY
     fi
     envdump=$("${BASH:-/bin/bash}" "$BIN/claude-switch.sh" _support env 2>/dev/null)
     PM=$(printf '%s\n' "$envdump" | sed -n 's/^proxy_mode=//p')
-    TZV=$(printf '%s\n' "$envdump" | sed -n 's/^timezone=//p')
 
     # 守护进程脚本(root 所有,用户态不可写):与远程模板比对,有差异只提示不自动改
     APPDIR="/Library/Application Support/claude-switcher"
     if [ -f "$APPDIR/claude-bodyguard.sh" ] || [ -f "$APPDIR/tz-watchdog.sh" ]; then
         [ -z "$PM" ] && PM="clash-verge"
-        [ -z "$TZV" ] && TZV="America/New_York"
         sed -e "s|__PROXY_MODE__|$PM|g" -e "s|__FAKE_PREFIX__|${FAKE_PREFIX:-198.18.}|g" \
             -e "s|__LOG_DIR__|/var/log/claude-switcher|g" \
             "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" \
-            -e "s|__LOG_DIR__|/var/log/claude-switcher|g" \
+        sed -e "s|__LOG_DIR__|/var/log/claude-switcher|g" \
             "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
         if ! diff -q "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh" >/dev/null 2>&1 || \
            ! diff -q "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh" >/dev/null 2>&1; then

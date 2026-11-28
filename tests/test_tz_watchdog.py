@@ -1,16 +1,10 @@
-"""时区看门狗:目标值必须以 env.json 为准,不能烧死在脚本里。
+"""root 时区看门狗:只认管理员授权写入的 tz-target,不读用户可写环境。
 
-背景:安装器把 __TZ_TARGET__ 替换成安装当时的目标,之后 set-region / fix 只改
-env.json 和系统时区,没人回来改这份副本。看门狗于是守着旧目标,每 5 分钟把
-系统时区改回去 —— 用户看到的是「一键修复没生效」,而检查项只看系统时区,
-一句话都没提。
-
-夹具把 /etc/localtime 和 /usr/sbin/systemsetup 换成临时路径,不碰真实系统。
+夹具把 /etc/localtime、systemsetup 与 zoneinfo 换成临时路径,不碰真实系统。
 """
 import json
 import os
 from pathlib import Path
-import stat
 import subprocess
 import tempfile
 import unittest
@@ -27,25 +21,33 @@ class TzWatchdogTests(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.home = self.base / "home"
         (self.home / ".claude-switcher").mkdir(parents=True)
-        (self.home / "Library/Logs").mkdir(parents=True)
+        self.log_dir = self.base / "logs"
+        self.log_dir.mkdir()
+        self.zoneinfo = self.base / "zoneinfo"
+        for name in ("America/New_York", "America/Los_Angeles", "Asia/Tokyo"):
+            path = self.zoneinfo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("test zone\n", encoding="utf-8")
+        self.target = self.base / "tz-target"
 
-        # 系统时区指针:真实路径只用来比对字符串,目标存不存在无所谓
         self.localtime = self.base / "localtime"
         os.symlink("/var/db/timezone/zoneinfo/America/Los_Angeles", self.localtime)
-
         self.record = self.base / "systemsetup.log"
         self.fake_systemsetup = self.base / "systemsetup"
         self.fake_systemsetup.write_text(
             "#!/bin/bash\nprintf '%s\\n' \"$*\" >> " + repr(str(self.record)) + "\n",
             encoding="utf-8")
-        self.fake_systemsetup.chmod(self.fake_systemsetup.stat().st_mode | stat.S_IXUSR)
+        self.fake_systemsetup.chmod(0o755)
 
-    def watchdog(self, baked="Asia/Tokyo"):
+    def watchdog(self):
         text = TEMPLATE.read_text(encoding="utf-8")
-        self.assertIn("__TZ_TARGET__", text)
-        self.assertIn("__HOME__", text)
-        text = text.replace("__TZ_TARGET__", baked).replace("__HOME__", str(self.home))
-        text = text.replace("__LOG_DIR__", str(self.home / "Library/Logs"))
+        self.assertNotIn("__TZ_TARGET__", text)
+        self.assertNotIn("__HOME__", text)
+        self.assertIn("__LOG_DIR__", text)
+        text = text.replace("__LOG_DIR__", str(self.log_dir))
+        text = text.replace("/Library/Application Support/claude-switcher/tz-target",
+                            str(self.target))
+        text = text.replace("/usr/share/zoneinfo", str(self.zoneinfo))
         text = text.replace("/usr/sbin/systemsetup", str(self.fake_systemsetup))
         text = text.replace("/etc/localtime", str(self.localtime))
         path = self.base / "tz-watchdog.sh"
@@ -55,61 +57,70 @@ class TzWatchdogTests(unittest.TestCase):
 
     def write_env(self, **values):
         payload = {"proxy_mode": "clash-verge", "proxy_group": "G",
-                   "country": "US", "timezone": "America/New_York",
+                   "country": "US", "timezone": "America/Los_Angeles",
                    "locale": "en_US", "schema": 1}
         payload.update(values)
         (self.home / ".claude-switcher/env.json").write_text(
             json.dumps(payload, indent=2), encoding="utf-8")
 
-    def run_watchdog(self, baked="Asia/Tokyo"):
-        script = self.watchdog(baked)
-        return subprocess.run(["/bin/bash", str(script)], text=True,
+    def run_watchdog(self, target="America/New_York"):
+        if target is not None:
+            self.target.write_text(target + "\n", encoding="utf-8")
+        return subprocess.run(["/bin/bash", str(self.watchdog())], text=True,
                               capture_output=True, timeout=30)
 
     def applied(self):
         if not self.record.exists():
             return []
-        return [line.strip() for line in self.record.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return [line.strip() for line in self.record.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
 
-    # ---- 目标来源 ----
+    def log(self):
+        path = self.log_dir / "tz-watchdog.log"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
-    def test_env_json_wins_over_baked_target(self):
-        """env.json 是唯一真相:烧死的那份只是兜底。"""
-        self.write_env(timezone="America/New_York")
-        self.run_watchdog(baked="Asia/Tokyo")
+    def test_root_target_wins_over_user_env(self):
+        self.write_env(timezone="America/Los_Angeles")
+        result = self.run_watchdog()
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.applied(), ["-settimezone America/New_York"])
 
-    def test_baked_target_used_when_env_missing(self):
-        """env.json 还没生成(首次安装中途)时退回烧死值,不能什么都不做。"""
-        self.run_watchdog(baked="Asia/Tokyo")
-        self.assertEqual(self.applied(), ["-settimezone Asia/Tokyo"])
+    def test_missing_root_target_does_nothing_and_logs(self):
+        self.write_env(timezone="America/Los_Angeles")
+        result = self.run_watchdog(target=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.applied(), [])
+        self.assertIn("tz-target", self.log())
 
-    def test_empty_env_target_falls_back_instead_of_clearing(self):
-        """env.json 里时区为空时不能把系统时区改成空 —— 那会把机器搞坏。"""
-        self.write_env(timezone="")
-        self.run_watchdog(baked="Asia/Tokyo")
-        self.assertEqual(self.applied(), ["-settimezone Asia/Tokyo"])
+    def test_invalid_or_unknown_root_target_is_never_executed(self):
+        for value in ("", "../etc/passwd", "/America/New_York",
+                      "America/New_York;id", "No/Such_Zone", "UTC"):
+            with self.subTest(value=value):
+                if self.record.exists():
+                    self.record.unlink()
+                result = self.run_watchdog(value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.applied(), [])
+                self.assertIn("tz-target", self.log())
 
-    def test_corrupt_env_does_not_block_guard(self):
-        """env.json 坏掉时看门狗仍要工作,不能因为解析失败就放弃纠偏。"""
-        (self.home / ".claude-switcher/env.json").write_text("{ not json", encoding="utf-8")
-        self.run_watchdog(baked="Asia/Tokyo")
-        self.assertEqual(self.applied(), ["-settimezone Asia/Tokyo"])
-
-    # ---- 只在真的偏了才动手 ----
+    def test_symlink_target_is_rejected(self):
+        real = self.base / "user-controlled-target"
+        real.write_text("America/New_York\n", encoding="utf-8")
+        self.target.symlink_to(real)
+        result = self.run_watchdog(target=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.applied(), [])
 
     def test_noop_when_already_on_target(self):
-        self.write_env(timezone="America/Los_Angeles")
+        os.unlink(self.localtime)
+        os.symlink("/var/db/timezone/zoneinfo/America/New_York", self.localtime)
         self.run_watchdog()
-        self.assertEqual(self.applied(), [], "已经对了还去改时区,等于每 5 分钟打扰一次系统")
+        self.assertEqual(self.applied(), [])
 
     def test_logs_the_correction(self):
-        """改了什么必须留痕,否则用户查不到「谁动过我的时区」。"""
-        self.write_env(timezone="America/New_York")
         self.run_watchdog()
-        log = (self.home / "Library/Logs/tz-watchdog.log").read_text(encoding="utf-8")
-        self.assertIn("America/Los_Angeles", log)
-        self.assertIn("America/New_York", log)
+        self.assertIn("America/Los_Angeles", self.log())
+        self.assertIn("America/New_York", self.log())
 
 
 if __name__ == "__main__":
