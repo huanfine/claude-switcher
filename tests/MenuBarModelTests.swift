@@ -680,6 +680,42 @@ struct MenuBarModelTests {
                 let vm = f.vm()
                 vm.loadIncidents()
                 try expect(vm.incidents.isEmpty, "没有记录文件时应为空,不是崩掉")
+            case "update_rollback_legacy_notice":
+                try f.write("update-rollback.txt", "2026-11-28 10:00:00|代理内核退化为 fail\n")
+                let vm = f.vm()
+                vm.updateRollbackPath = f.root.appendingPathComponent("update-rollback.txt").path
+                vm.loadUpdateRollback()
+                try expect(vm.updateRollbackNotice == "上次核心更新被回滚：代理内核退化为 fail。点「检查更新」可手动重试；自动更新仍按既定策略检查",
+                           "两列旧记录不能武断写成自动更新")
+            case "update_rollback_three_column_notice":
+                try f.write("update-rollback.txt", "2026-11-28 10:00:00|core|出口IP|DNS 退化\n")
+                let vm = f.vm()
+                vm.updateRollbackPath = f.root.appendingPathComponent("update-rollback.txt").path
+                vm.loadUpdateRollback()
+                try expect(vm.updateRollbackNotice == "上次核心更新被回滚：出口IP|DNS 退化。点「检查更新」可手动重试；自动更新仍按既定策略检查",
+                           "三列记录要保留原因里的竖线")
+            case "update_rollback_reason_is_bounded":
+                try f.write("update-rollback.txt", "2026-11-28 10:00:00|core|" + String(repeating: "x", count: 1000))
+                let vm = f.vm()
+                vm.updateRollbackPath = f.root.appendingPathComponent("update-rollback.txt").path
+                vm.loadUpdateRollback()
+                guard let notice = vm.updateRollbackNotice else { throw TestFailure(description: "缺少回滚提示") }
+                try expect(notice.count <= 320 && notice.contains("…"), "超长原因必须截断,实际 \(notice.count) 字")
+            case "update_rollback_large_file_ignored":
+                try f.write("update-rollback.txt", String(repeating: "x", count: 65_537))
+                let vm = f.vm()
+                vm.updateRollbackPath = f.root.appendingPathComponent("update-rollback.txt").path
+                vm.loadUpdateRollback()
+                try expect(vm.updateRollbackNotice == nil, "超过 64 KiB 的记录不得整份读入")
+            case "update_rollback_missing_file_clears_notice":
+                try f.write("update-rollback.txt", "2026-11-28 10:00:00|旧原因\n")
+                let vm = f.vm()
+                vm.updateRollbackPath = f.root.appendingPathComponent("update-rollback.txt").path
+                vm.loadUpdateRollback()
+                try expect(vm.updateRollbackNotice != nil, "有效记录应显示提示")
+                try? FileManager.default.removeItem(atPath: vm.updateRollbackPath)
+                vm.loadUpdateRollback()
+                try expect(vm.updateRollbackNotice == nil, "记录删除后必须清掉旧提示")
             case "health_score_gates_on_hard_failure":
                 // 首页那个大数字是用户唯一会看的结论。曾经硬性项全挂还显示 85 分,
                 // 因为分数只按「项数」扣 —— 等于告诉用户「小毛病,能用」。

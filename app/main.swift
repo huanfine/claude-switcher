@@ -610,6 +610,7 @@ final class VM: ObservableObject {
     /// 记录文件位置。生产是固定路径,测试注入到夹具目录 —— 否则跑测试会读到
     /// 本机真实的拦截历史,断言全凭运气。
     var incidentsPath = NSHomeDirectory() + "/.claude-switcher/incidents.log"
+    var updateRollbackPath = NSHomeDirectory() + "/.claude-switcher/update-rollback.txt"
     /// 生态探测的采样流水。脚本写,界面读;文件不存在就当作「还没有采样」。
     var rttPath = NSHomeDirectory() + "/.claude-switcher/rtt.log"
     /// 最近 7 天的探测采样,按时间升序。窗口只取自己需要的区间。
@@ -887,21 +888,30 @@ final class VM: ObservableObject {
         incidents = parsed.reversed()
     }
 
-    /// 读上次更新回滚的痕迹。文件由核心在回滚时写、更新成功时删,
-    /// 所以「文件在」=「最后一次更新尝试失败了」。读不到就清提示,
-    /// 下一次刷新自然跟上核心那边的变化。
+    static func parseUpdateRollbackNotice(_ raw: String) -> String? {
+        guard let line = raw.split(separator: "\n").last(where: {
+            !String($0).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else { return nil }
+        let parts = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        let fields = parts.count >= 3 && parts[1] == "core" ? parts.dropFirst(2) : parts.dropFirst()
+        let reason = fields.joined(separator: "|").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !reason.isEmpty else { return nil }
+        let bounded = reason.count > 240 ? String(reason.prefix(240)) + "…" : reason
+        return "上次核心更新被回滚：\(bounded)。点「检查更新」可手动重试；自动更新仍按既定策略检查"
+    }
+
+    /// 只读最后一条回滚记录;文件损坏、超限或缺失都清掉旧提示。
     func loadUpdateRollback() {
-        let path = NSHomeDirectory() + "/.claude-switcher/update-rollback.txt"
-        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
-              let line = raw.split(separator: "\n").last,
-              !line.isEmpty else {
-            updateRollbackNotice = nil
-            return
-        }
-        // 行格式:时间|原因。原因可能自带细节(哪些项退化了)。
-        let parts = line.split(separator: "|", maxSplits: 1).map(String.init)
-        let reason = parts.count == 2 ? parts[1] : String(line)
-        updateRollbackNotice = "上次自动更新被回滚：\(reason)。点「检查更新」可手动重试，环境修好后会自动恢复更新"
+        updateRollbackNotice = nil
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: updateRollbackPath),
+              attrs[.type] as? FileAttributeType == .typeRegular,
+              ((attrs[.size] as? NSNumber)?.intValue ?? Int.max) <= 65_536,
+              let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: updateRollbackPath)) else { return }
+        defer { try? handle.close() }
+        let data = handle.readData(ofLength: 65_537)
+        guard data.count <= 65_536,
+              let raw = String(data: data, encoding: .utf8) else { return }
+        updateRollbackNotice = Self.parseUpdateRollbackNotice(raw)
     }
 
     func refresh() {

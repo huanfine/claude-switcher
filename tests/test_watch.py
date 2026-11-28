@@ -146,6 +146,7 @@ class WatchLockTests(unittest.TestCase):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
+            proc.wait()
         self.addCleanup(cleanup)
         return proc
 
@@ -167,7 +168,12 @@ class WatchLockTests(unittest.TestCase):
         分配给谁都有可能。只凭 kill -0 成功就下手,迟早杀错人。
         """
         victim = subprocess.Popen(["/bin/sleep", "30"])
-        self.addCleanup(lambda: victim.poll() is None and victim.kill())
+
+        def cleanup_victim():
+            if victim.poll() is None:
+                victim.kill()
+            victim.wait()
+        self.addCleanup(cleanup_victim)
         (self.base / "watch.pid").write_text(str(victim.pid), encoding="utf-8")
         out = self.run_lock("/bin/sleep 30")
         self.assertIsNone(victim.poll(), "无关进程被误杀")
@@ -206,7 +212,12 @@ class WatchLockTests(unittest.TestCase):
         code += helper("watch_lock") + "\n"
         code += 'watch_lock\nwhile :; do /bin/sleep 0.2; done\n'
         proc = subprocess.Popen(["/bin/bash", "-c", code], env=dict(os.environ, LC_ALL="C"))
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+
+        def cleanup_proc():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        self.addCleanup(cleanup_proc)
         pidfile = self.base / "watch.pid"
         for _ in range(60):
             if pidfile.exists():

@@ -11,19 +11,20 @@
 名义上是「账号切换器」，实质是**以出口身份一致性为核心的 fail-closed 门禁系统**：
 让同一个 Claude 账号在任何时刻都只从同一个可信出口身份出现。切换账号只是门禁放行后的一个动作。
 
-规模（不含测试与构建产物）：
+主要载体（不含测试与构建产物）：
 
-| 组成 | 文件 | 行数 |
+| 组成 | 文件 | 职责 |
 |---|---|---|
-| 核心（macOS） | `core/claude-switch.sh` | 6273（bash 115 个函数） |
-| ├ 内嵌 Python | 同文件 4 段 heredoc | 1911 |
-| 界面（macOS） | `app/main.swift` | 5654（VM ≈1780 / Views ≈3460） |
-| Windows | `windows/*.ps1` | 3691 |
-| Linux | `linux/*.sh` | 1129 |
-| Web 检测页 | `docs/app.js` | 1225 |
+| 核心（macOS） | `core/claude-switch.sh` | 探测、门禁、切换、修复与更新 |
+| 泄漏探针（macOS） | `core/stun-probe.py` | 纯 Python STUN，只走 IPv4 |
+| 界面（macOS） | `app/main.swift` | 编排与展示，不内置安全判型 |
+| Windows | `windows/*.ps1` | 独立 PowerShell 核心、WPF 与安装器 |
+| Linux | `linux/*.sh` | 独立 bash 核心、守护与安装器 |
+| Web 检测页 | `docs/app.js` | 浏览器侧环境信息展示 |
 
-内嵌 Python 的四段各自独立、互不依赖：`PY_SUPPORT`(869) 结构化判定与报告、
-`PY_CLASH_RULES`(710) 内核规则、`PY_FLCLASH_REPAIR`(195)、`PY_PROXY_DIAGNOSE`(130)。
+核心内嵌四段彼此独立的 Python：`PY_SUPPORT` 负责结构化判定与报告，
+`PY_CLASH_RULES` 负责内核规则，`PY_FLCLASH_REPAIR` 负责 FlClash 事务修复，
+`PY_PROXY_DIAGNOSE` 负责独立代理诊断。
 
 ## 2. 执行域与权限边界
 
@@ -40,7 +41,7 @@
                │ env.json · checks.json · last-report.json · lease.json
 ┌──────────────▼─────────────────────────────────────────────┐
 │  root 守护 /Library/Application Support/claude-switcher/   │
-│  bodyguard 10s · tz-watchdog 300s（root:wheel 755）         │
+│  bodyguard 10s · tz-watchdog 300s · tz-target（root:wheel） │
 └──────────────┬─────────────────────────────────────────────┘
                │ TUN 网卡 + 置顶规则
 ┌──────────────▼─────────────────────────────────────────────┐
@@ -98,7 +99,7 @@ lease                → claude-switcher-lease/1
 | `bodyguard` | 保镖 | 服务注册 + 脚本归属与权限 | 硬 |
 | `rules` | 规则置顶 | 读运行内核 `/rules` 按索引逐条比对，不是比对磁盘文件 | 硬 |
 | `client_language` / `asn` | 客户端语言 / ASN属性 | defaults 读取 / ASN 归属 | 软 |
-| `ip_purity` | IP纯净度 | 4 源并行 + PTR，类型基线 − 连续扣分；类型只看结构证据 | 软 |
+| `ip_purity` | IP纯净度 | 六个 HTTP 源并行 + PTR；类型证据与风险证据分开判定，按类型基线 − 连续扣分 | 软 |
 | `ecosystem` | 生态可达性 | claude.ai 与 api.anthropic.com 各一次 | 软 |
 | `dns_leak` | DNS泄露 | 上游解析器架构审计（fallback 并发 / 明文上游 / 国内递归，仅 Clash Verge 可读运行配置）+ 内核加密解析实测 | 软 |
 
@@ -124,6 +125,8 @@ lease                → claude-switcher-lease/1
 一个槽位 = 两棵树：桌面版 `accounts/<A-H>/`，Claude Code `cli/<A-H>/home{,.json}`。
 归档是移动语义；载入先写 `.new` 成功后才提交；目标槽位没存档时 `restore_cli` 会清空现场
 （否则新槽位继承上一个账号登录态，等于没隔离）；`.new` / `.previous` 残留一律拒绝覆盖。
+macOS 新归档使用 v2 认证加密：解压前验证 HMAC，再预检并拒绝路径穿越、链接、特殊文件、
+重复成员与超限成员；v1 仅保留迁移导入，并明确提示缺少完整性认证。
 
 节点治理是**只读优先**：扫描不切节点（逐节点实测会污染 iphistory 并触发巡检），
 硬门槛先于评分（国家、Tor/代理、UDP），差距不足 10 分不出 BEST，应用时重新实时判门禁、
@@ -131,10 +134,11 @@ lease                → claude-switcher-lease/1
 
 ## 8. 测试与交付
 
-- 568 项隔离回归：44 个 Python 测试文件中 31 个真执行代码，13 个是静态断言（其中 11 个针对 Windows）。
-- 跨语言编排：`tests/test_menu_bar_model.py` 现场用 `swiftc` 编译 `tests/MenuBarModelTests.swift`（1127 行）再逐场景驱动。
+- Python 隔离回归使用临时 HOME、假 curl 与打桩进程；数量随用例演进，以测试发现结果为准。
+- 跨语言编排：`tests/test_menu_bar_model.py` 现场用 `swiftc` 编译 `tests/MenuBarModelTests.swift`，再逐场景驱动真实 VM。
 - Windows 在 PS 5.1 与 pwsh 7 双壳跑真集成脚本（切换、快照、报告、语言与 ASN）。
-- CI：`checks.yml`（语法 / 回归 / Swift 严格编译 / 哈希 / JS 语法 + Windows 双壳），`release.yml`（打包 + 跨平台门禁）。
+- CI：`checks.yml` 覆盖语法 / 回归 / Swift 严格编译 / 哈希 / JS 语法与 Windows 双壳；
+  `release.yml` 先复用完整 checks，全部通过后才打包与发布，并校验包内运行时工件清单。
 - 抽取式测试：多数用例从真实脚本里切出函数体执行，绝不抄副本。代价是锚点隐式，改名/改注释可能让用例找不到段落。
 
 ## 9. 已知缺口（按严重度）
@@ -162,14 +166,16 @@ lease                → claude-switcher-lease/1
 
 ### P1 · 测试证据强度不均
 
-13/44 是纯静态字符串断言（11 个针对 Windows），钉的是「代码里有这句话」而不是「这段代码做对事」。
-Windows 的 WPF、FlClash、隔离浏览器、加密快照、安装更新仍无真机验收。
+部分用例仍是静态字符串断言，钉的是「代码里有这句话」而不是「这段代码做对事」；
+关键安全路径应优先补执行式回归。Windows 的 WPF、FlClash、隔离浏览器、加密快照、
+安装更新仍无真机验收，隔离集成测试不能替代真机结论。
 
 ### P2 · 时间预算与外部依赖
 
-App 检查硬超时 45 秒；出口采样 10 秒、纯净度四源并行 6 秒、生态可达性 2×8 秒，最坏路径接近上限，
-而分项耗时目前不可观测。纯净度依赖四个第三方免费源（ipinfo 429 已实测），
-三级运营商兜底 + 降级判型 + 5 分钟短 TTL 是缓解，但评分本质是外部信誉的函数，不可复现。
+App 检查硬超时 45 秒；出口采样 10 秒、纯净度六源并行 6 秒、生态可达性 2×8 秒，最坏路径接近上限，
+而分项耗时目前不可观测。纯净度依赖多个第三方免费源（ipinfo 429 已实测），
+类型证据按 IP 缓存、结果统一缓存 24 小时，并对关键风险源的空体做一次重试；
+评分本质仍是外部信誉的函数，不可完全复现。
 
 ### P3 · 其余结构性风险
 

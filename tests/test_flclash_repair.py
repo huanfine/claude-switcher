@@ -1,6 +1,7 @@
 """FlClash SQLite repair regressions using isolated profiles only."""
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 import re
 import sqlite3
@@ -48,7 +49,7 @@ class FlClashRepairTests(unittest.TestCase):
         )
 
     def _create_database(self):
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             db.executescript(
                 """
                 CREATE TABLE profiles (id INTEGER PRIMARY KEY);
@@ -81,7 +82,7 @@ class FlClashRepairTests(unittest.TestCase):
         return self.run_repair("repair", self.home, group, expected=expected)
 
     def rule_rows(self):
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             return db.execute(
                 "SELECT profile_id, rule_action, content, rule_target FROM rules "
                 "ORDER BY rule_action, content"
@@ -124,7 +125,7 @@ class FlClashRepairTests(unittest.TestCase):
         self.assertEqual(self.rule_rows(), [])
 
     def test_future_schema_aborts_without_changes(self):
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute("PRAGMA user_version = 22")
         self.repair(expected=1)
         self.assertEqual(self.rule_rows(), [])

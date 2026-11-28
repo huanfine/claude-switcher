@@ -32,6 +32,9 @@ SCENARIOS = (
     "watch_stale_completion_cannot_restart_after_quit",
     # 拦截记录:界面要能把「上次为什么被停」翻出来
     "incidents_loaded", "incidents_malformed_ignored", "incidents_missing_file",
+    "update_rollback_legacy_notice", "update_rollback_three_column_notice",
+    "update_rollback_reason_is_bounded", "update_rollback_large_file_ignored",
+    "update_rollback_missing_file_clears_notice",
     # 节点扫描报告 → 界面只更新「更优节点」这一行
     "node_scan_report_updates_row",
     # 新核心优先读 JSON；旧核心拒绝 --json 时回退文本
